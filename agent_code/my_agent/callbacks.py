@@ -48,7 +48,16 @@ def act(self, game_state: dict) -> str:
 
     start = time.time()
 
+    field = game_state["field"]
+    coins = game_state["coins"]
+    others_positions = [player[3] for player in game_state["others"]]
+    bombs = game_state["bombs"]
+    explosion_map = game_state["explosion_map"]
     own_position = game_state['self'][3]
+
+    field_shape = field.shape
+
+
     obstacles = get_obstacles(game_state)
     coins = game_state['coins']
 
@@ -59,7 +68,7 @@ def act(self, game_state: dict) -> str:
     if coin_action is not None:
         best_action = coin_action
 
-    self.logger.info(f"Time taken for act: {time.time() - start:.4f} seconds")
+    self.logger.info(f"Time taken for act: {time.time() - start:.6f} seconds")
 
     return best_action
 
