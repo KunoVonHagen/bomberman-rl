@@ -3,6 +3,7 @@ import numpy as np
 from collections import deque
 
 from .pathfinding import A_star_manhattan, manhattan_distance
+from .prediction import predict_explosions
 
 
 def get_closest_coin(
