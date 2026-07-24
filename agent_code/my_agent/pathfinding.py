@@ -1,6 +1,6 @@
-from typing import Tuple, Dict, List, Any
+from typing import Tuple, Dict, Any
 import numpy as np
-
+from collections import deque
 
 def A_star_manhattan(position: Tuple[int, int], target: Tuple[int, int], obstacles: np.typing.NDArray[np.bool_], max_depth: int = float("inf")) -> Tuple[str, int] | None:
     """
@@ -69,8 +69,10 @@ def A_star_manhattan(position: Tuple[int, int], target: Tuple[int, int], obstacl
 
     return None  # No path found
 
+
 def manhattan_distance(position: Tuple[int, int], target: Tuple[int, int]) -> int:
     return abs(position[0] - target[0]) + abs(position[1] - target[1])
+
 
 def reconstruct_path(came_from: Dict[Tuple[int, int], Tuple[int, int]], current: Tuple[int, int]) -> Tuple[str, int] | None:
     """
@@ -102,6 +104,7 @@ def reconstruct_path(came_from: Dict[Tuple[int, int], Tuple[int, int]], current:
 
     return first_move_direction, len(total_path) - 1
 
+
 def get_obstacles(game_state: Dict[str, Any]) -> np.typing.NDArray[np.bool_]:
     """
     Extracts the obstacles from the game state and returns a dictionary of (x,y) -> True if obstacle present at position (x,y), False otherwise.
@@ -127,3 +130,67 @@ def get_obstacles(game_state: Dict[str, Any]) -> np.typing.NDArray[np.bool_]:
         obstacles[(other_x, other_y)] = True
 
     return obstacles
+
+
+def connected_cell_distances(position: Tuple[int, int], obstacles: np.typing.NDArray[np.bool_]) -> np.typing.NDArray[np.bool_]:
+    """
+    Returns an array of the same shape as obstacles, where the value indicates the distance from the given position to
+    each cell, or -1 if the cell is not reachable.
+
+    :param position: The starting position (x, y).
+    :param obstacles: A 2D array representing the game board where True indicates an obstacle.
+    :return: A 2D array of distances from the starting position to each cell, or -1 if not reachable.
+    """
+    height, width = obstacles.shape
+    distance = np.full_like(obstacles, -1, dtype=int)
+    queue = deque([(position, 0)])
+
+    while queue:
+        current_position, current_distance = queue.popleft()
+        x, y = current_position
+        if (0 <= x < width) and (0 <= y < height) and not obstacles[y, x] and distance[y, x] == -1:
+            distance[y, x] = queue[0][1] if queue else 0
+            # Add neighboring cells to the queue
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                neighbor = (x + dx, y + dy)
+                queue.append((neighbor, current_distance + 1))
+    return distance
+
+
+def connected_cells_count(obstacles: np.typing.NDArray[np.bool_]) -> np.typing.NDArray[np.int_]:
+    """
+    Return the full board where the value of each cell is the number of cells reachable from that cell or 0 if it is an
+    obstacle.
+
+    :param obstacles: A 2D array representing the game board where True indicates an obstacle.
+    :return: A 2D array where each cell contains the number of reachable cells from that cell, or 0 if it is an obstacle.
+    """
+
+    result = np.zeros_like(obstacles, dtype=int)
+
+    height, width = obstacles.shape
+    candidates = ~obstacles
+
+    while candidates.any():
+        start = tuple(np.argwhere(candidates)[0])
+        queue = deque([start])
+        visited = np.zeros_like(obstacles, dtype=bool)
+        count = 0
+        while queue:
+            current_position = queue.popleft()
+            x, y = current_position
+
+            if (0 <= x < width) and (0 <= y < height) and not obstacles[y, x] and not visited[y, x]:
+                visited[y, x] = True
+                count += 1
+                # Add neighboring cells to the queue
+                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    neighbor = (x + dx, y + dy)
+                    queue.append(neighbor)
+        result[visited] = count
+        candidates[visited] = False  # Mark these cells as processed
+
+    return result
+
+
+
