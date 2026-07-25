@@ -143,16 +143,20 @@ def connected_cell_distances(position: Tuple[int, int], obstacles: np.typing.NDA
     """
     height, width = obstacles.shape
     distance = np.full_like(obstacles, -1, dtype=int)
+    visited = np.zeros_like(obstacles, dtype=bool)
+    visited[position] = True
     queue = deque([(position, 0)])
 
     while queue:
         current_position, current_distance = queue.popleft()
         x, y = current_position
-        if (0 <= x < width) and (0 <= y < height) and not obstacles[y, x] and distance[y, x] == -1:
-            distance[y, x] = queue[0][1] if queue else 0
-            # Add neighboring cells to the queue
-            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                neighbor = (x + dx, y + dy)
+        distance[x, y] = current_distance
+
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            neighbor = (x + dx, y + dy)
+            nx, ny = neighbor
+            if (0 <= nx < width) and (0 <= ny < height) and not obstacles[nx, ny] and not visited[neighbor]:
+                visited[neighbor] = True
                 queue.append((neighbor, current_distance + 1))
     return distance
 
@@ -173,22 +177,21 @@ def connected_cells_count(obstacles: np.typing.NDArray[np.bool_]) -> np.typing.N
 
     while candidates.any():
         start = tuple(np.argwhere(candidates)[0])
-        queue = deque([start])
         visited = np.zeros_like(obstacles, dtype=bool)
+        visited[start] = True
+        queue = deque([start])
         count = 0
         while queue:
-            current_position = queue.popleft()
-            x, y = current_position
-
-            if (0 <= x < width) and (0 <= y < height) and not obstacles[y, x] and not visited[y, x]:
-                visited[y, x] = True
-                count += 1
-                # Add neighboring cells to the queue
-                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    neighbor = (x + dx, y + dy)
+            x, y = queue.popleft()
+            count += 1
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                neighbor = (x + dx, y + dy)
+                nx, ny = neighbor
+                if (0 <= nx < width) and (0 <= ny < height) and not obstacles[nx, ny] and not visited[neighbor]:
+                    visited[neighbor] = True
                     queue.append(neighbor)
         result[visited] = count
-        candidates[visited] = False  # Mark these cells as processed
+        candidates[visited] = False
 
     return result
 
