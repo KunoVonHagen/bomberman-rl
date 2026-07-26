@@ -117,6 +117,44 @@ def get_safe_square_action(
     return None, None
 
 
+def get_least_bad_action(game_state: dict, legal_actions: list, max_horizon: int = None) -> str | None:
+    """
+    Used only when no legal action passes is_action_safe
+    AND get_safe_square_action finds no reachable safe tile either. Ranks the remaining legal actions by how
+    many ticks pass before that tile catches fire, and picks the one that
+    buys the most time.
+    """
+    if max_horizon is None:
+        max_horizon = BOMB_TIMER + EXPLOSION_TIMER
+
+    field = game_state['field']
+    explosion_map = game_state['explosion_map']
+    own_x, own_y = game_state['self'][3]
+    bombs = list(game_state['bombs'])
+
+    bomb_timer_array = get_bomb_timer_array(bombs, field.shape)
+    danger_by_t = predict_danger_over_time(field, bomb_timer_array, explosion_map, max_horizon)
+
+    def ticks_until_hit(pos):
+        for t in range(max_horizon + 1):
+            if danger_by_t[t][pos]:
+                return t
+        return max_horizon + 1  # never hit within the horizon we simulated
+
+    best_action, best_ticks = None, -1
+    for action in legal_actions:
+        if action == 'BOMB':
+            target = (own_x, own_y)
+        else:
+            dx, dy = ACTIONS_MOVE[action]
+            target = (own_x + dx, own_y + dy)
+        ticks = ticks_until_hit(target)
+        if ticks > best_ticks:
+            best_ticks, best_action = ticks, action
+
+    return best_action
+
+
 def is_action_safe(action: str, game_state: dict, max_horizon: int = None) -> bool:
     """
     Checks whether, after taking `action`, an escape route still exists
