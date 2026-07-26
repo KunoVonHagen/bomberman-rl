@@ -4,7 +4,13 @@ import random
 import time
 
 from .pathfinding import get_obstacles
-from .objectives import get_closest_coin, is_action_safe, get_legal_actions, get_safe_square_action
+from .objectives import (
+    get_closest_coin,
+    is_action_safe,
+    get_legal_actions,
+    get_safe_square_action,
+    get_least_bad_action,
+)
 
 import numpy as np
 
@@ -73,9 +79,12 @@ def act(self, game_state: dict) -> str:
         escape_action, _ = get_safe_square_action(
             own_position, field, bombs, explosion_map, others_positions
         )
-        best_action = escape_action if escape_action in legal_actions else (
-            legal_actions[0] if legal_actions else 'WAIT'
-        )
+        if escape_action in legal_actions:
+            best_action = escape_action
+        elif legal_actions:
+            best_action = get_least_bad_action(game_state, legal_actions)
+        else:
+            best_action = 'WAIT'
 
     coin_action, coin_distance = get_closest_coin(own_position, coins, obstacles)
 
