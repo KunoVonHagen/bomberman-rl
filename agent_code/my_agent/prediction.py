@@ -3,53 +3,74 @@ from typing import List, Tuple
 
 from .settings import BOMB_TIMER, BOMB_POWER, EXPLOSION_TIMER
 
-def predict_explosions(
+def predict_danger_over_time(
         field: np.typing.NDArray[np.int_],
         bombs: np.typing.NDArray[np.int_],
         explosion_map: np.typing.NDArray[np.int_],
-        delta_t: int
-) -> Tuple[np.typing.NDArray[np.int_], np.typing.NDArray[np.int_], np.typing.NDArray[np.int_]]:
-
+        max_horizon: int
+) -> List[np.typing.NDArray[np.bool_]]:
     """
-    Forecasts explosions into the future.
+    Single-pass simulation returning the danger map for every tick t = 0..max_horizon.
 
-    :param field: The game field as a 2D numpy array. -1 for walls, 1 for crates, 0 for empty cells.
-    :param bombs: A 2D numpy array of the same shape as field, where each cell contains the timer of a bomb if present,
-     or 0 otherwise.
-    :param explosion_map: A 2D numpy array of the same shape as field, where each cell contains the remaining time an
-     explosion will last, or 0 if no explosion is present.
-    :param delta_t: The number of time steps to predict into the future.
+    Check-before-decrement order, matching environment.py's update_bombs:
+        if bomb.timer <= 0: explode NOW
+        else: bomb.timer -= 1
+    This makes t=0 (a bomb whose reported timer is already 0, exploding this
+    very tick) a natural first iteration of the loop rather than a special case.
 
-    :return: A tuple of three 2D numpy arrays (predicted_field, predicted_bombs, predicted_explosions).
+    :param field: -1 wall / 1 crate / 0 empty.
+    :param bombs: from get_bomb_timer_array (-1 = no bomb, else timer).
+    :param explosion_map: currently active explosions (remaining duration).
+    :param max_horizon: how many ticks ahead to simulate.
+    :return: list of bool arrays, danger[t][x, y] = True if (x, y) is on fire at tick t.
     """
+    bomb_timers = bombs.copy()
+    active_explosions = explosion_map.copy()
+    danger_snapshots = []
 
-    # Create copies of the input arrays to avoid modifying them
-    predicted_field = field.copy()
-    predicted_bombs = bombs.copy()
-    predicted_explosions = explosion_map.copy()
+    for t in range(max_horizon + 1):
+        # Danger right now, at tick t: explosions already running + bombs at timer 0
+        danger_now = active_explosions > 0
+        zero_cells = np.argwhere(bomb_timers == 0)
+        for x, y in zero_cells:
+            _spread_blast(field, int(x), int(y), danger_now)
+        danger_snapshots.append(danger_now)
 
-    for t in range(delta_t):
-        # Decrease bomb timers
-        predicted_bombs[predicted_bombs > 0] -= 1
+        if t == max_horizon:
+            break
 
-        # Handle explosions
-        exploding_cells = np.where(predicted_bombs == 0)
-        for x, y in zip(*exploding_cells):
-            # Set explosion timer
-            predicted_explosions[x, y] = EXPLOSION_TIMER
+        # Advance state by one tick for the next snapshot
+        new_explosions = np.zeros_like(active_explosions, dtype=bool)
+        for x, y in zero_cells:
+            x, y = int(x), int(y)
+            _spread_blast(field, x, y, new_explosions)
+            bomb_timers[x, y] = -1  # bomb consumed
 
-            # Propagate explosion in all four directions
-            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                for power in range(1, BOMB_POWER + 1):
-                    nx, ny = x + dx * power, y + dy * power
-                    if 0 <= nx < predicted_field.shape[0] and 0 <= ny < predicted_field.shape[1]:
-                        if predicted_field[nx, ny] == -1:  # Wall
-                            break
-                        predicted_explosions[nx, ny] = EXPLOSION_TIMER
-                        if predicted_field[nx, ny] == 1:  # Crate
-                            break
+        active_explosions[active_explosions > 0] -= 1
+        active_explosions[new_explosions] = EXPLOSION_TIMER
+        bomb_timers[bomb_timers > 0] -= 1
 
-        # Decrease explosion timers
-        predicted_explosions[predicted_explosions > 0] -= 1
+    return danger_snapshots
 
-    return predicted_field, predicted_bombs, predicted_explosions
+
+def get_bomb_timer_array(
+        bombs: List[Tuple[Tuple[int, int], int]],
+        field_shape: Tuple[int, int]
+) -> np.typing.NDArray[np.int_]:
+    """Converts game_state['bombs'] into an array. -1 = no bomb, else timer."""
+    arr = np.full(field_shape, -1, dtype=int)
+    for (x, y), t in bombs:
+        arr[x, y] = t
+    return arr
+
+
+def _spread_blast(field, x, y, danger):
+    """Marks the blast of a bomb at (x,y) into `danger` in-place."""
+    danger[x, y] = True
+    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        for power in range(1, BOMB_POWER + 1):
+            nx, ny = x + dx * power, y + dy * power
+            if 0 <= nx < field.shape[0] and 0 <= ny < field.shape[1]:
+                if field[nx, ny] == -1:
+                    break
+                danger[nx, ny] = True

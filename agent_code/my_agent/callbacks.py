@@ -4,7 +4,7 @@ import random
 import time
 
 from .pathfinding import get_obstacles
-from .objectives import get_closest_coin
+from .objectives import get_closest_coin, is_action_safe, get_legal_actions, get_safe_square_action
 
 import numpy as np
 
@@ -50,7 +50,7 @@ def act(self, game_state: dict) -> str:
 
     field = game_state["field"]
     coins = game_state["coins"]
-    others_positions = [player[3] for player in game_state["others"]]
+    others_positions = {player[3] for player in game_state["others"]}
     bombs = game_state["bombs"]
     explosion_map = game_state["explosion_map"]
     own_position = game_state['self'][3]
@@ -60,12 +60,26 @@ def act(self, game_state: dict) -> str:
 
     obstacles = get_obstacles(game_state)
     coins = game_state['coins']
+    obstacles = get_obstacles(game_state)
+    legal_actions = get_legal_actions(game_state)
 
-    best_action = random.choice(["UP", "DOWN", "LEFT", "RIGHT"])
+    safe_actions = [a for a in legal_actions if is_action_safe(a, game_state)]
+
+    if safe_actions:
+        best_action = random.choice(safe_actions)
+    else:
+        # Emergency fallback only: no move passes is_action_safe, so head
+        # for the nearest tile that will eventually be safe.
+        escape_action, _ = get_safe_square_action(
+            own_position, field, bombs, explosion_map, others_positions
+        )
+        best_action = escape_action if escape_action in legal_actions else (
+            legal_actions[0] if legal_actions else 'WAIT'
+        )
 
     coin_action, coin_distance = get_closest_coin(own_position, coins, obstacles)
 
-    if coin_action is not None:
+    if coin_action is not None and coin_action in safe_actions:
         best_action = coin_action
 
     self.logger.info(f"Time taken for act: {time.time() - start:.6f} seconds")
