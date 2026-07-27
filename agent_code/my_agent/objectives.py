@@ -4,7 +4,7 @@ from collections import deque
 
 from .pathfinding import A_star_manhattan, manhattan_distance
 from .prediction import predict_danger_over_time, get_bomb_timer_array
-from .settings import BOMB_TIMER, EXPLOSION_TIMER
+from settings import BOMB_TIMER, EXPLOSION_TIMER
 
 ACTIONS_MOVE = {'UP': (0, -1), 'DOWN': (0, 1), 'LEFT': (-1, 0), 'RIGHT': (1, 0), 'WAIT': (0, 0)}
 

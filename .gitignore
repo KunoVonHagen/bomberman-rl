@@ -111,3 +111,9 @@ screenshots/*.webm
 
 replays/
 results/
+
+# TensorBoard
+*.tfevents.*
+
+# Trained models
+**/models/*.zip
