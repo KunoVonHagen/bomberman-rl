@@ -15,6 +15,7 @@ import events as e
 import settings as s
 from agents import Agent, SequentialAgentBackend
 from fallbacks import pygame
+from agents import RLAgent
 from items import Coin, Explosion, Bomb
 
 WorldArgs = namedtuple("WorldArgs",
@@ -43,6 +44,8 @@ class GenericWorld:
     explosions: List[Explosion]
 
     round_id: str
+
+    user_input: str = "WAIT"
 
     def __init__(self, args: WorldArgs):
         self.args = args
@@ -154,6 +157,20 @@ class GenericWorld:
 
     def send_game_events(self):
         pass
+
+    def step_world(self, actions):
+        self.step += 1
+        self.logger.info(f'STARTING STEP {self.step}')
+
+        for agent, action in actions.items():
+            self.perform_agent_action(agent, action)
+
+        # Progress world elements based
+        self.collect_coins()
+        self.update_explosions()
+        self.update_bombs()
+        self.evaluate_explosions()
+        self.send_game_events()
 
     def do_step(self, user_input='WAIT'):
         assert self.running
@@ -338,12 +355,19 @@ class BombeRLeWorld(GenericWorld):
     def setup_agents(self, agents):
         # Add specified agents and start their subprocesses
         self.agents = []
-        for agent_dir, train in agents:
-            if list([d for d, t in agents]).count(agent_dir) > 1:
-                name = agent_dir + '_' + str(list([a.code_name for a in self.agents]).count(agent_dir))
+        for agent_object in agents:
+            if isinstance(agent_object, tuple):
+                agent_dir, train = agent_object
+
+                if list([ao[0] if isinstance(ao, tuple) else None for ao in agents]).count(agent_dir) > 1:
+                    name = agent_dir + '_' + str(list([a.code_name for a in self.agents]).count(agent_dir))
+                else:
+                    name = agent_dir
+                self.add_agent(agent_dir, name, train=train)
+            elif isinstance(agent_object, Agent) or isinstance(agent_object, RLAgent):
+                self.agents.append(agent_object)
             else:
-                name = agent_dir
-            self.add_agent(agent_dir, name, train=train)
+                raise ValueError(f'Unknown agent type: {agent_object}, expected either a tuple (agent_dir, train), Agent or RLAgent')
 
     def build_arena(self):
         WALL = -1
@@ -394,9 +418,6 @@ class BombeRLeWorld(GenericWorld):
         return arena, coins, active_agents
 
     def get_state_for_agent(self, agent: Agent):
-        if agent.dead:
-            return None
-
         state = {
             'round': self.round,
             'step': self.step,

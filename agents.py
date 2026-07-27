@@ -2,6 +2,7 @@ import importlib
 import logging
 import multiprocessing as mp
 import os
+import pathlib
 import queue
 from collections import defaultdict
 from inspect import signature
@@ -53,7 +54,7 @@ class Agent:
     calling events on its AgentBackend.
     """
 
-    def __init__(self, agent_name, code_name, display_name, train: bool, backend: "AgentBackend", avatar_sprite_desc, bomb_sprite_desc):
+    def __init__(self, agent_name, code_name, display_name, train: bool, backend: "AgentBackend|None", avatar_sprite_desc, bomb_sprite_desc):
         self.backend = backend
 
         # Load custom avatar or standard robot avatar of assigned color
@@ -102,7 +103,8 @@ class Agent:
         self.last_game_state = None
         self.last_action = None
 
-        self.setup()
+        if self.backend:
+            self.setup()
 
     def setup(self):
         # Call setup on backend
@@ -153,9 +155,15 @@ class Agent:
         self.total_score += delta
 
     def process_game_events(self, game_state):
+        if not self.backend:
+            raise RuntimeError("Agent backend is not set. Cannot call method 'process_game_events'")
+
         self.backend.send_event("game_events_occurred", self.last_game_state, self.last_action, game_state, self.events)
 
     def wait_for_game_event_processing(self):
+        if not self.backend:
+            raise RuntimeError("Agent backend is not set. Cannot call method 'wait_for_game_event_processing'")
+
         self.backend.get("game_events_occurred")
 
 #    def process_enemy_game_events(self, enemy_game_state, enemy: "Agent"):
@@ -171,16 +179,27 @@ class Agent:
         self.events = []
 
     def act(self, game_state):
+        if not self.backend:
+            raise RuntimeError("Agent backend is not set. Cannot call method 'act'")
+
         self.backend.send_event("act", game_state)
 
     def wait_for_act(self):
+        if not self.backend:
+            raise RuntimeError("Agent backend is not set. Cannot call method 'wait_for_act'")
+
         action, think_time = self.backend.get_with_time("act")
         self.note_stat("time", think_time)
         self.note_stat("steps")
         self.last_action = action
         return action, think_time
 
+
+
     def round_ended(self):
+        if not self.backend:
+            raise RuntimeError("Agent backend is not set. Cannot call method 'round_ended'")
+
         self.backend.send_event("end_of_round", self.last_game_state, self.last_action, self.events)
         self.backend.get("end_of_round")
 
@@ -223,9 +242,9 @@ class AgentRunner:
         self.wlogger.setLevel(s.LOG_AGENT_WRAPPER)
         self.fake_self.logger = logging.getLogger(self.agent_name + '_code')
         self.fake_self.logger.setLevel(s.LOG_AGENT_CODE)
-        log_dir = f'agent_code/{self.code_name}/logs/'
+        log_dir = pathlib.Path(__file__).parent.absolute() / f'agent_code' / self.agent_name / 'logs'
         if not os.path.exists(log_dir): os.makedirs(log_dir)
-        handler = logging.FileHandler(f'{log_dir}{self.agent_name}.log', mode="w")
+        handler = logging.FileHandler(log_dir / f'{self.agent_name}.log', mode="w")
         handler.setLevel(logging.DEBUG)
         formatter = logging.Formatter('%(asctime)s [%(name)s] %(levelname)s: %(message)s')
         handler.setFormatter(formatter)
@@ -338,3 +357,17 @@ class ProcessAgentBackend(AgentBackend):
 
     def send_event(self, event_name, *event_args):
         self.wta_queue.put((event_name, event_args))
+
+
+class RLAgent(Agent):
+    def __init__(self, name:str):
+        super().__init__(name, "my_agent", name, True, None, "blue", "blue")
+
+    def round_ended(self):
+        pass
+
+    def process_game_events(self, game_state):
+        pass
+
+    def wait_for_game_event_processing(self):
+        pass

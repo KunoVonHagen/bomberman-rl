@@ -1,7 +1,7 @@
 import numpy as np
 from typing import List, Tuple
 
-from .settings import BOMB_TIMER, BOMB_POWER, EXPLOSION_TIMER
+from settings import BOMB_TIMER, BOMB_POWER, EXPLOSION_TIMER
 
 def predict_danger_over_time(
         field: np.typing.NDArray[np.int_],
