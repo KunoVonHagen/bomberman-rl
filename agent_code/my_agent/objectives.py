@@ -2,7 +2,7 @@ from typing import Tuple, List
 import numpy as np
 from collections import deque
 
-from .pathfinding import A_star_manhattan, manhattan_distance
+from .pathfinding import A_star_manhattan, manhattan_distance, connected_cell_distances, count_open_neighbors
 from .prediction import predict_danger_over_time, get_bomb_timer_array
 from settings import BOMB_TIMER, EXPLOSION_TIMER
 
@@ -58,13 +58,99 @@ def get_closest_coin(
     return None, None
 
 
+def get_action_toward_target(
+        own_position: Tuple[int, int],
+        targets: List[Tuple[int, int]],
+        obstacles: np.typing.NDArray[np.bool_]
+) -> Tuple[str | None, int | None]:
+
+    if not targets:
+        return None, None
+
+    target_set = set(targets)
+
+    ACTION_MOVEMENT_MAPPING = {
+        "UP": (0, -1),
+        "DOWN": (0, 1),
+        "LEFT": (-1, 0),
+        "RIGHT": (1, 0),
+    }
+
+    visited = np.zeros_like(obstacles, dtype=bool)
+    visited[own_position] = True
+    queue = deque([(own_position, 0, None)])
+
+    while queue:
+        current_position, distance, first_move = queue.popleft()
+
+        if current_position in target_set:
+            return first_move, distance
+
+        elif obstacles[current_position]:
+            continue
+
+        x, y = current_position
+        for action in ["UP", "DOWN", "LEFT", "RIGHT"]:
+            dx, dy = ACTION_MOVEMENT_MAPPING[action]
+            neighbor = (x + dx, y + dy)
+
+            if (0 <= neighbor[0] < obstacles.shape[0] and
+                0 <= neighbor[1] < obstacles.shape[1] and
+                not visited[neighbor]):
+
+                visited[neighbor] = True
+                queue.append((neighbor, distance + 1, first_move if first_move is not None else action))
+
+    return None, None
+
+
+def get_opponent_reach_maps(
+        others_positions: List[Tuple[int, int]],
+        field: np.typing.NDArray[np.int_],
+        bombs: list
+) -> List[np.typing.NDArray[np.int_]]:
+
+    bomb_positions = {xy for xy, t in bombs}
+    obstacles = (field != 0)
+    for bx, by in bomb_positions:
+        obstacles[bx, by] = True
+    return [connected_cell_distances(pos, obstacles) for pos in others_positions]
+
+
+def is_tile_contested(x: int, y: int, t: int, opponent_reach_maps: List[np.typing.NDArray[np.int_]]) -> bool:
+
+    for reach_map in opponent_reach_maps:
+        d = reach_map[x, y]
+        if 0 <= d <= t:
+            return True
+    return False
+
+
+def is_currently_safe(
+        own_position: Tuple[int, int],
+        field: np.typing.NDArray[np.int_],
+        bombs: list,
+        explosion_map: np.typing.NDArray[np.int_],
+        max_horizon: int = None,
+) -> bool:
+
+    if max_horizon is None:
+        max_horizon = BOMB_TIMER + EXPLOSION_TIMER
+    bomb_timer_array = get_bomb_timer_array(bombs, field.shape)
+    danger_by_t = predict_danger_over_time(field, bomb_timer_array, explosion_map, max_horizon)
+    x, y = own_position
+    return not any(danger_by_t[t][x, y] for t in range(max_horizon + 1))
+
+
 def get_safe_square_action(
         own_position: Tuple[int, int],
         field: np.typing.NDArray[np.int_],
         bombs: list,
         explosion_map: np.typing.NDArray[np.int_],
         other_positions: List[Tuple[int, int]],
-        max_horizon: int = None
+        max_horizon: int = None,
+        avoid_contested: bool = False,
+        avoid_pockets: bool = True
 ) -> Tuple[str | None, int | None]:
     """
     BFS toward the closest tile that is permanently safe from the tick
@@ -83,6 +169,10 @@ def get_safe_square_action(
     for ox, oy in other_positions:
         obstacles[ox, oy] = True
 
+    opponent_reach_maps = (
+        get_opponent_reach_maps(other_positions, field, bombs) if avoid_contested else None
+    )
+
     def permanently_safe_from(x, y, t):
         return not any(danger_by_t[tt][x, y] for tt in range(t, max_horizon + 1))
 
@@ -91,6 +181,7 @@ def get_safe_square_action(
 
     visited = {(own_position, 0)}
     queue = deque([(own_position, 0, None)])
+    pocket_fallback = None  # first permanently-safe-but-pocket (move, ticks) found, if any
 
     while queue:
         (x, y), t, first_move = queue.popleft()
@@ -105,16 +196,22 @@ def get_safe_square_action(
             nt = t + 1
             if danger_by_t[nt][nx, ny]:
                 continue
+            if avoid_contested and is_tile_contested(nx, ny, nt, opponent_reach_maps):
+                continue
             state = ((nx, ny), nt)
             if state in visited:
                 continue
             visited.add(state)
             move = first_move if first_move is not None else action
             if permanently_safe_from(nx, ny, nt):
+                if avoid_pockets and count_open_neighbors((nx, ny), field) < 2:
+                    if pocket_fallback is None:
+                        pocket_fallback = (move, nt)
+                    continue
                 return move, nt
             queue.append((state[0], nt, move))
 
-    return None, None
+    return pocket_fallback if pocket_fallback is not None else (None, None)
 
 
 def get_least_bad_action(game_state: dict, legal_actions: list, max_horizon: int = None) -> str | None:
@@ -155,7 +252,14 @@ def get_least_bad_action(game_state: dict, legal_actions: list, max_horizon: int
     return best_action
 
 
-def is_action_safe(action: str, game_state: dict, max_horizon: int = None) -> bool:
+def is_action_safe(
+        action: str,
+        game_state: dict,
+        max_horizon: int = None,
+        avoid_contested: bool = False,
+        tick_offset: int = 0,
+        require_non_pocket_escape: bool = False
+) -> bool:
     """
     Checks whether, after taking `action`, an escape route still exists
     that gets the agent out of every future explosion in time.
@@ -190,6 +294,10 @@ def is_action_safe(action: str, game_state: dict, max_horizon: int = None) -> bo
     for (ox, oy) in other_positions:
         obstacles[ox, oy] = True
 
+    opponent_reach_maps = (
+        get_opponent_reach_maps(list(other_positions), field, bombs) if avoid_contested else None
+    )
+
     danger_by_t = predict_danger_over_time(field, bomb_timer_array, explosion_map, max_horizon)
 
     if danger_by_t[0][start_pos]:
@@ -201,7 +309,13 @@ def is_action_safe(action: str, game_state: dict, max_horizon: int = None) -> bo
     if danger_by_t[1][start_pos]:
         return False
 
-    if permanently_safe_from(*start_pos, 1):
+    if avoid_contested and is_tile_contested(*start_pos, 1 + tick_offset, opponent_reach_maps):
+        return False
+
+    def is_acceptable(x, y):
+        return not (require_non_pocket_escape and count_open_neighbors((x, y), field) < 2)
+
+    if permanently_safe_from(*start_pos, 1) and is_acceptable(*start_pos):
         return True
 
     visited = {(start_pos, 1)}
@@ -220,12 +334,16 @@ def is_action_safe(action: str, game_state: dict, max_horizon: int = None) -> bo
             nt = t + 1
             if danger_by_t[nt][nx, ny]:
                 continue
+            if avoid_contested and is_tile_contested(nx, ny, nt + tick_offset, opponent_reach_maps):
+                continue
             state = ((nx, ny), nt)
             if state in visited:
                 continue
             visited.add(state)
             if permanently_safe_from(nx, ny, nt):
-                return True
+                if is_acceptable(nx, ny):
+                    return True
+                continue
             queue.append(state)
 
     return False

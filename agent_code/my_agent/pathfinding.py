@@ -132,6 +132,17 @@ def get_obstacles(game_state: Dict[str, Any]) -> np.typing.NDArray[np.bool_]:
     return obstacles
 
 
+def count_open_neighbors(position: Tuple[int, int], field: np.typing.NDArray[np.int_]) -> int:
+
+    x, y = position
+    count = 0
+    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        nx, ny = x + dx, y + dy
+        if 0 <= nx < field.shape[0] and 0 <= ny < field.shape[1] and field[nx, ny] == 0:
+            count += 1
+    return count
+
+
 def connected_cell_distances(position: Tuple[int, int], obstacles: np.typing.NDArray[np.bool_]) -> np.typing.NDArray[np.bool_]:
     """
     Returns an array of the same shape as obstacles, where the value indicates the distance from the given position to

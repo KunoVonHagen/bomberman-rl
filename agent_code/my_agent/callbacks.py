@@ -6,11 +6,15 @@ import time
 from .pathfinding import get_obstacles
 from .objectives import (
     get_closest_coin,
+    get_action_toward_target,
     is_action_safe,
+    is_currently_safe,
     get_legal_actions,
     get_safe_square_action,
     get_least_bad_action,
 )
+
+from .strategy import evaluate_bomb_placement, find_trap_targets, get_best_crate_targets
 
 import numpy as np
 
@@ -55,37 +59,80 @@ def act(self, game_state: dict) -> str:
     start = time.time()
 
     field = game_state["field"]
+    crates = list(zip(*np.where(field == 1)))
     coins = game_state["coins"]
-    others_positions = {player[3] for player in game_state["others"]}
     bombs = game_state["bombs"]
     explosion_map = game_state["explosion_map"]
     own_position = game_state['self'][3]
+    others_positions = {player[3] for player in game_state["others"]}
 
-    coins = game_state['coins']
     obstacles = get_obstacles(game_state)
     legal_actions = get_legal_actions(game_state)
-
     safe_actions = [a for a in legal_actions if is_action_safe(a, game_state)]
+    movement_actions = [a for a in safe_actions if a != 'BOMB']
 
-    if safe_actions:
-        best_action = random.choice(safe_actions)
-    else:
-        # Emergency fallback only: no move passes is_action_safe, so head
-        # for the nearest tile that will eventually be safe.
-        escape_action, _ = get_safe_square_action(
-            own_position, field, bombs, explosion_map, others_positions
+    bombs_active = len(bombs) > 0
+    in_immediate_danger = bombs_active and not is_currently_safe(own_position, field, bombs, explosion_map)
+
+    if bombs_active:
+        self.logger.info(
+            f"Step-Diagnose: pos={own_position} bombs={bombs} others={list(others_positions)} "
+            f"legal_actions={legal_actions} safe_actions={safe_actions} in_immediate_danger={in_immediate_danger}"
         )
+
+    if not safe_actions:
+        escape_action, _ = get_safe_square_action(
+            own_position, field, bombs, explosion_map, others_positions, avoid_contested=True
+        )
+        if escape_action is None or escape_action not in legal_actions:
+            escape_action, _ = get_safe_square_action(own_position, field, bombs, explosion_map, others_positions)
         if escape_action in legal_actions:
             best_action = escape_action
         elif legal_actions:
-            best_action = get_least_bad_action(game_state, legal_actions)
+            fallback_actions = [a for a in legal_actions if a != 'BOMB'] or legal_actions
+            best_action = get_least_bad_action(game_state, fallback_actions)
         else:
             best_action = 'WAIT'
+    elif in_immediate_danger:
+        escape_action, _ = get_safe_square_action(
+            own_position, field, bombs, explosion_map, others_positions, avoid_contested=True
+        )
+        if escape_action is None or escape_action not in movement_actions:
+            escape_action, _ = get_safe_square_action(own_position, field, bombs, explosion_map, others_positions)
+        if escape_action is not None and escape_action in movement_actions:
+            best_action = escape_action
+        elif movement_actions:
+            best_action = random.choice(movement_actions)
+        else:
+            best_action = 'WAIT'
+    else:
+        best_action = random.choice(movement_actions) if movement_actions else 'WAIT'
 
     coin_action, coin_distance = get_closest_coin(own_position, coins, obstacles)
 
-    if coin_action is not None and coin_action in safe_actions:
-        best_action = coin_action
+    crate_targets = get_best_crate_targets(crates, field)
+    crate_action, crate_distance = get_action_toward_target(own_position, crate_targets, obstacles)
+
+    trap_targets = find_trap_targets(game_state, max_escape_routes=1)
+    trapped_positions = {t['position'] for t in trap_targets}
+    hunt_action, hunt_distance = get_action_toward_target(
+        own_position, list(trapped_positions), obstacles
+    )
+    HUNT_RANGE = 6
+
+    if not in_immediate_danger:
+        if (hunt_action is not None and hunt_action in movement_actions
+                and hunt_distance is not None and hunt_distance <= HUNT_RANGE):
+            best_action = hunt_action
+        elif coin_action is not None and coin_action in movement_actions:
+            best_action = coin_action
+        elif crate_action is not None and crate_action in movement_actions:
+            best_action = crate_action
+
+    if 'BOMB' in safe_actions:
+        bomb_eval = evaluate_bomb_placement(game_state, trapped_positions=trapped_positions)
+        if bomb_eval['should_bomb'] and (bomb_eval['opponents_hit'] or coin_action is None or coin_distance > 3):
+            best_action = 'BOMB'
 
     self.logger.info(f"Time taken for act: {time.time() - start:.6f} seconds")
 
