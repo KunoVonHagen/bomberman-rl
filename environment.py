@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import pickle
 import subprocess
 from collections import namedtuple
@@ -47,8 +48,9 @@ class GenericWorld:
 
     user_input: str = "WAIT"
 
-    def __init__(self, args: WorldArgs):
+    def __init__(self, args: WorldArgs, logging: bool = False):
         self.args = args
+        self.logging = logging
         self.setup_logging()
 
         self.colors = list(s.AGENT_COLORS)
@@ -61,20 +63,24 @@ class GenericWorld:
     def setup_logging(self):
         self.logger = logging.getLogger('BombeRLeWorld')
         self.logger.setLevel(s.LOG_GAME)
+        os.makedirs(self.args.log_dir, exist_ok=True)
         handler = logging.FileHandler(f'{self.args.log_dir}/game.log', mode="w")
         handler.setLevel(logging.DEBUG)
         formatter = logging.Formatter('%(asctime)s [%(name)s] %(levelname)s: %(message)s')
         handler.setFormatter(formatter)
         self.logger.addHandler(handler)
-        self.logger.info('Initializing game world')
+        if self.logging:
+            self.logger.info('Initializing game world')
 
     def new_round(self):
         if self.running:
-            self.logger.warning('New round requested while still running')
+            if self.logging:
+                self.logger.warning('New round requested while still running')
             self.end_round()
 
         new_round = self.round + 1
-        self.logger.info(f'STARTING ROUND #{new_round}')
+        if self.logging:
+            self.logger.info(f'STARTING ROUND #{new_round}')
 
         # Bookkeeping
         self.step = 0
@@ -143,7 +149,8 @@ class GenericWorld:
             agent.x += 1
             agent.add_event(e.MOVED_RIGHT)
         elif action == 'BOMB' and agent.bombs_left:
-            self.logger.info(f'Agent <{agent.name}> drops bomb at {(agent.x, agent.y)}')
+            if self.logging:
+                self.logger.info(f'Agent <{agent.name}> drops bomb at {(agent.x, agent.y)}')
             self.bombs.append(Bomb((agent.x, agent.y), agent, s.BOMB_TIMER, s.BOMB_POWER, agent.bomb_sprite))
             agent.bombs_left = False
             agent.add_event(e.BOMB_DROPPED)
@@ -160,10 +167,20 @@ class GenericWorld:
 
     def step_world(self, actions):
         self.step += 1
-        self.logger.info(f'STARTING STEP {self.step}')
+        if self.logging:
+            self.logger.info(f'STARTING STEP {self.step}')
 
-        for agent, action in actions.items():
-            self.perform_agent_action(agent, action)
+        perm = self.rng.permutation(len(self.active_agents))
+        self.replay['permutations'].append(perm)
+
+        for i in perm:
+            a = self.active_agents[i]
+            action = actions[a]
+            if self.logging:
+                self.logger.debug(f'Agent <{a.name}> chose action {action}')
+
+            self.replay['actions'][a.name].append(action)
+            self.perform_agent_action(a, action)
 
         # Progress world elements based
         self.collect_coins()
@@ -176,10 +193,12 @@ class GenericWorld:
         assert self.running
 
         self.step += 1
-        self.logger.info(f'STARTING STEP {self.step}')
+        if self.logging:
+            self.logger.info(f'STARTING STEP {self.step}')
 
         self.user_input = user_input
-        self.logger.debug(f'User input: {self.user_input}')
+        if self.logging:
+            self.logger.debug(f'User input: {self.user_input}')
 
         self.poll_and_run_agents()
 
@@ -199,7 +218,8 @@ class GenericWorld:
                 for a in self.active_agents:
                     if a.x == coin.x and a.y == coin.y:
                         coin.collectable = False
-                        self.logger.info(f'Agent <{a.name}> picked up coin at {(a.x, a.y)} and receives 1 point')
+                        if self.logging:
+                            self.logger.info(f'Agent <{a.name}> picked up coin at {(a.x, a.y)} and receives 1 point')
                         a.update_score(s.REWARD_COIN)
                         a.add_event(e.COIN_COLLECTED)
                         a.trophies.append(Trophy.coin_trophy)
@@ -227,7 +247,8 @@ class GenericWorld:
         for bomb in self.bombs:
             if bomb.timer <= 0:
                 # Explode when timer is finished
-                self.logger.info(f'Agent <{bomb.owner.name}>\'s bomb at {(bomb.x, bomb.y)} explodes')
+                if self.logging:
+                    self.logger.info(f'Agent <{bomb.owner.name}>\'s bomb at {(bomb.x, bomb.y)} explodes')
                 bomb.owner.add_event(e.BOMB_EXPLODED)
                 blast_coords = bomb.get_blast_coords(self.arena)
 
@@ -240,7 +261,8 @@ class GenericWorld:
                         for c in self.coins:
                             if (c.x, c.y) == (x, y):
                                 c.collectable = True
-                                self.logger.info(f'Coin found at {(x, y)}')
+                                if self.logging:
+                                    self.logger.info(f'Coin found at {(x, y)}')
                                 bomb.owner.add_event(e.COIN_FOUND)
 
                 # Create explosion
@@ -264,12 +286,14 @@ class GenericWorld:
                         agents_hit.add(a)
                         # Note who killed whom, adjust scores
                         if a is explosion.owner:
-                            self.logger.info(f'Agent <{a.name}> blown up by own bomb')
+                            if self.logging:
+                                self.logger.info(f'Agent <{a.name}> blown up by own bomb')
                             a.add_event(e.KILLED_SELF)
                             explosion.owner.trophies.append(Trophy.suicide_trophy)
                         else:
-                            self.logger.info(f'Agent <{a.name}> blown up by agent <{explosion.owner.name}>\'s bomb')
-                            self.logger.info(f'Agent <{explosion.owner.name}> receives 1 point')
+                            if self.logging:
+                                self.logger.info(f'Agent <{a.name}> blown up by agent <{explosion.owner.name}>\'s bomb')
+                                self.logger.info(f'Agent <{explosion.owner.name}> receives 1 point')
                             explosion.owner.update_score(s.REWARD_KILL)
                             explosion.owner.add_event(e.KILLED_OPPONENT)
                             explosion.owner.trophies.append(pygame.transform.smoothscale(a.avatar, (15, 15)))
@@ -300,23 +324,27 @@ class GenericWorld:
     def time_to_stop(self):
         # Check round stopping criteria
         if len(self.active_agents) == 0:
-            self.logger.info(f'No agent left alive, wrap up round')
+            if self.logging:
+                self.logger.info(f'No agent left alive, wrap up round')
             return True
 
         if (len(self.active_agents) == 1
                 and (self.arena == 1).sum() == 0
                 and all([not c.collectable for c in self.coins])
                 and len(self.bombs) + len(self.explosions) == 0):
-            self.logger.info(f'One agent left alive with nothing to do, wrap up round')
+            if self.logging:
+                self.logger.info(f'One agent left alive with nothing to do, wrap up round')
             return True
 
         if any(a.train for a in self.agents) and not self.args.continue_without_training:
             if not any([a.train for a in self.active_agents]):
-                self.logger.info('No training agent left alive, wrap up round')
+                if self.logging:
+                    self.logger.info('No training agent left alive, wrap up round')
                 return True
 
         if self.step >= s.MAX_STEPS:
-            self.logger.info('Maximum number of steps reached, wrap up round')
+            if self.logging:
+                self.logger.info('Maximum number of steps reached, wrap up round')
             return True
 
         return False
@@ -346,9 +374,10 @@ class GenericWorld:
 
 
 class BombeRLeWorld(GenericWorld):
-    def __init__(self, args: WorldArgs, agents):
-        super().__init__(args)
+    def __init__(self, args: WorldArgs, agents, logging: bool = True):
+        super().__init__(args, logging)
 
+        self.logging = logging
         self.rng = np.random.default_rng(args.seed)
         self.setup_agents(agents)
 
@@ -464,19 +493,22 @@ class BombeRLeWorld(GenericWorld):
                     # Agents with errors cannot continue
                     action = "ERROR"
                     think_time = float("inf")
-
-                self.logger.info(f'Agent <{a.name}> chose action {action} in {think_time:.2f}s.')
+                if self.logging:
+                    self.logger.info(f'Agent <{a.name}> chose action {action} in {think_time:.2f}s.')
                 if think_time > a.available_think_time:
                     next_think_time = a.base_timeout - (think_time - a.available_think_time)
-                    self.logger.warning(f'Agent <{a.name}> exceeded think time by {think_time - a.available_think_time:.2f}s. Setting action to "WAIT" and decreasing available time for next round to {next_think_time:.2f}s.')
+                    if self.logging:
+                        self.logger.warning(f'Agent <{a.name}> exceeded think time by {think_time - a.available_think_time:.2f}s. Setting action to "WAIT" and decreasing available time for next round to {next_think_time:.2f}s.')
                     action = "WAIT"
                     a.trophies.append(Trophy.time_trophy)
                     a.available_think_time = next_think_time
                 else:
-                    self.logger.info(f'Agent <{a.name}> stayed within acceptable think time.')
+                    if self.logging:
+                        self.logger.info(f'Agent <{a.name}> stayed within acceptable think time.')
                     a.available_think_time = a.base_timeout
             else:
-                self.logger.info(f'Skipping agent <{a.name}> because of last slow think time.')
+                if self.logging:
+                    self.logger.info(f'Skipping agent <{a.name}> because of last slow think time.')
                 a.available_think_time += a.base_timeout
                 action = "WAIT"
 
@@ -505,7 +537,8 @@ class BombeRLeWorld(GenericWorld):
     def end_round(self):
         super().end_round()
 
-        self.logger.info(f'WRAPPING UP ROUND #{self.round}')
+        if self.logging:
+            self.logger.info(f'WRAPPING UP ROUND #{self.round}')
         # Clean up survivors
         for a in self.active_agents:
             a.add_event(e.SURVIVED_ROUND)
@@ -524,10 +557,12 @@ class BombeRLeWorld(GenericWorld):
 
     def end(self):
         super().end()
-        self.logger.info('SHUT DOWN')
+        if self.logging:
+            self.logger.info('SHUT DOWN')
         for a in self.agents:
             # Send exit message to shut down agent
-            self.logger.debug(f'Sending exit message to agent <{a.name}>')
+            if self.logging:
+                self.logger.debug(f'Sending exit message to agent <{a.name}>')
             # todo multiprocessing shutdown
 
 

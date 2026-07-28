@@ -61,10 +61,6 @@ def act(self, game_state: dict) -> str:
     explosion_map = game_state["explosion_map"]
     own_position = game_state['self'][3]
 
-    field_shape = field.shape
-
-
-    obstacles = get_obstacles(game_state)
     coins = game_state['coins']
     obstacles = get_obstacles(game_state)
     legal_actions = get_legal_actions(game_state)
