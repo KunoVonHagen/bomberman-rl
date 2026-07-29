@@ -46,6 +46,9 @@ def setup(self):
             self.model = pickle.load(file)
 
 
+
+# TODO: Implement a central class that unifies all the feature computation needed for the rule-based agent to speed up dramatically
+# TODO: Use the observations produced by the BombermanGymEnv and converted to by game_state_to_observation in input_processing.py to speed up due to conversion to maps and prepare features to be used as PPO inputs
 def act(self, game_state: dict) -> str:
     """
     Your agent should parse the input, think, and take a decision.
