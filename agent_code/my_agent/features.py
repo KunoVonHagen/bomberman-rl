@@ -179,18 +179,18 @@ EVENT_REWARDS = {
     e.MOVED_RIGHT: 0,
     e.MOVED_UP: 0,
     e.MOVED_DOWN: 0,
-    e.WAITED: -0.01,
+    e.WAITED: -0.001,
     e.INVALID_ACTION: -0.2,
 
-    e.BOMB_DROPPED: 0.05,
-    e.BOMB_EXPLODED: 0,
+    e.BOMB_DROPPED: 0.,
+    e.BOMB_EXPLODED: 0.5,
 
-    e.CRATE_DESTROYED: 0.2,
-    e.COIN_FOUND: 0.3,
-    e.COIN_COLLECTED: 1.0,
+    e.CRATE_DESTROYED: 0.3,
+    e.COIN_FOUND: 0,
+    e.COIN_COLLECTED: 5.0,
 
-    e.KILLED_OPPONENT: 5.0,
-    e.KILLED_SELF: -8.0,
+    e.KILLED_OPPONENT: 10.0,
+    e.KILLED_SELF: -0.0,
 
     e.GOT_KILLED: -5.0,
     e.OPPONENT_ELIMINATED: 0,
@@ -199,13 +199,13 @@ EVENT_REWARDS = {
 
 FEATURE_REWARDS = {
     # Coin distance
-    2: lambda x:  1/(MAX_DISTANCE*x) * 0.02,
+    2: lambda x:  1/(MAX_DISTANCE*x) * 0.02 * 0,
 
     # Crate distance
-    5: lambda x: 1/(MAX_DISTANCE*x) * 0.005,
+    5: lambda x: 1/(MAX_DISTANCE*x) * 0.005 * 0,
 
     # Safe tile distance
-    11: lambda x: 1/(MAX_DISTANCE*x) * 0.05,
+    11: lambda x: 1/(MAX_DISTANCE*x) * 0.05 * 0,
 
     # Standing in danger
     22: lambda x: x * (-0.05),
@@ -216,10 +216,10 @@ FEATURE_DIFF_REWARDS = {
     2: -0.01,
 
     # Movement towards crate
-    5: -0.001,
+    5: -0.005,
 
     # Movement towards safe tile
-    11: -0.02,
+    11: 0,
 }
 
 SIMPLE_EVENT_REWARDS = {

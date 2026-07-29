@@ -8,6 +8,8 @@ import settings as s
 from environment import BombeRLeWorld, WorldArgs, Trophy
 from items import Bomb
 
+import events as e
+
 from agent_code.my_agent.features import get_features, FEATURES_DIM, EVENT_REWARDS, FEATURE_REWARDS, FEATURE_DIFF_REWARDS, SIMPLE_EVENT_REWARDS
 
 
@@ -336,11 +338,13 @@ class BombermanGymEnv(gym.Env):
     def shaped_reward(self):
         reward = 0
 
+        if self.agent.dead:
+            return -10
+
+
         for event in self.agent.events:
             reward += EVENT_REWARDS.get(event, 0)
 
-        if not self.agent.dead:
-            reward -= 0.001 # Incentivize ending the game
 
         visited_count = np.sum(self.visited)
         new_visited = visited_count - self.previous_visited_count
@@ -355,7 +359,7 @@ class BombermanGymEnv(gym.Env):
             reward += reward * feature_diff[feature_diff_index]
 
         if new_visited > 0:
-            reward += 0.001
+            reward += 0.02
 
         return reward
 
