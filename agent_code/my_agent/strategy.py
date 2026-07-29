@@ -1,9 +1,7 @@
 from typing import Tuple, List, Dict
 import numpy as np
-from collections import deque
 
 from .objectives import is_action_safe
-from .prediction import get_bomb_timer_array
 from .pathfinding import connected_cell_distances
 from settings import BOMB_TIMER, BOMB_POWER, EXPLOSION_TIMER
 
