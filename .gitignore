@@ -117,3 +117,6 @@ results/
 
 # Trained models
 **/models/*.zip
+
+# Behavioral Cloning Training Data
+**/*transitions*.pkl
