@@ -1,10 +1,9 @@
-import time
-
 from gym_environment import BombermanGymEnv
 from environment import WorldArgs
 
+import time
+import numpy as np
 import os
-import pathlib
 import torch.nn as nn
 import gymnasium as gym
 import torch
@@ -14,7 +13,99 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNorm
 from stable_baselines3.common.env_util import make_vec_env
 from multiprocessing import freeze_support
 from datetime import datetime
+from imitation.data.types import Transitions, DictObs
+from imitation.algorithms import bc
+from input_processing import observation_to_game_state
+from agent_code.my_agent.callbacks import act as expert_act, setup as expert_setup
+import tqdm
+import pickle
+import pathlib
 
+class ExpertPolicy:
+    def __init__(self, env):
+        self.env = env
+        expert_setup(env.agent)
+
+    def predict(self, observation, state=None, episode_start=None, deterministic=True):
+        game_state = observation_to_game_state(observation)
+        action = expert_act(self.env.agent, game_state)
+        action = BombermanGymEnv.ACTION_INDICES[action]
+        return action, state
+
+def expert_transitions(
+        env: BombermanGymEnv,
+        n_episodes: int,
+        regenerate: bool = True,
+):
+    """
+    Generate expert transitions using the provided expert callback.
+
+    :param env: The environment in which to generate transitions.
+    :param expert_setup: The function to set up the agen
+    :param expert_act: A callback function that takes the current observation and returns an action.
+    :param n_episodes: The number of episodes to generate.
+    :return: A list of (observation, action) tuples representing the expert transitions.
+    """
+
+    PICKLE_PATH = pathlib.Path(__file__).parent / "expert_transitions.pkl"
+
+    if not regenerate and os.path.exists(PICKLE_PATH):
+        with open(PICKLE_PATH, "rb") as f:
+            transitions = pickle.load(f)
+        return transitions
+    
+    if expert_setup is not None:
+        expert_setup(env.agent)
+
+    all_obs = []
+    all_next_obs = []
+    all_actions = []
+    all_dones = []
+
+    for episode in tqdm.tqdm(range(n_episodes), desc="Generating expert transitions"):
+        obs, _ = env.reset()
+        done = False
+
+        while not done:
+            game_state = observation_to_game_state(obs)
+            action = expert_act(env.agent, game_state)
+            action = BombermanGymEnv.ACTION_INDICES[action]
+
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+
+            all_obs.append(obs)
+            all_next_obs.append(next_obs)
+            all_actions.append(action)
+            all_dones.append(done)
+
+            obs = next_obs
+
+    obs = DictObs({
+        "grid_tensor": np.stack([o["grid_tensor"] for o in all_obs]),
+        "features": np.stack([o["features"] for o in all_obs]),
+    })
+
+    next_obs = DictObs({
+        "grid_tensor": np.stack([o["grid_tensor"] for o in all_next_obs]),
+        "features": np.stack([o["features"] for o in all_next_obs]),
+    })
+
+    transitions = Transitions(
+        obs=obs,
+        acts=np.array(all_actions),
+        next_obs=next_obs,
+        dones=np.array(all_dones, dtype=bool),
+        infos=np.array([{}] * len(all_actions), dtype=object),
+    )
+
+    with open(PICKLE_PATH, "wb") as f:
+        pickle.dump(transitions, f)
+
+    return transitions
+    
+    
+        
 
 class BombermanCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Dict,
@@ -50,10 +141,10 @@ class BombermanCNN(BaseFeaturesExtractor):
         )
 
         self.combined_fc = nn.Sequential(
-            nn.Linear(n_cnn_flatten + 64, 512),
+            nn.Linear(n_cnn_flatten + 64, 256),
             nn.ReLU(),
 
-            nn.Linear(512, features_dim),
+            nn.Linear(256, features_dim),
             nn.ReLU()
         )
 
@@ -67,7 +158,7 @@ class BombermanCNN(BaseFeaturesExtractor):
         combined_input = torch.cat((cnn_output, features_output), dim=1)
         return self.combined_fc(combined_input)
 
-classic_env_args = WorldArgs(
+CLASSIC_ENV_ARGS = WorldArgs(
     scenario="classic",
     seed=None,
     silence_errors=True,
@@ -85,7 +176,7 @@ classic_env_args = WorldArgs(
 )
 
 
-def get_model(N_STEPS, BATCH_SIZE, env):
+def get_model(env, PPO_PARAMS):
     policy_kwargs = dict(
         features_extractor_class=BombermanCNN,
     )
@@ -96,12 +187,7 @@ def get_model(N_STEPS, BATCH_SIZE, env):
         policy_kwargs=policy_kwargs,
         tensorboard_log="./tensorboard_log",
         verbose=1,
-        n_epochs=4,
-        n_steps=N_STEPS,
-        batch_size=BATCH_SIZE,
-        learning_rate=lambda progress: progress * 3e-4 + (1-progress) * 1e-4,
-        ent_coef=0.005,
-        gamma=0.999
+        **PPO_PARAMS
     )
 
     return model
@@ -109,7 +195,7 @@ def get_model(N_STEPS, BATCH_SIZE, env):
 
 def get_env(N_ENVS, opponents):
     env = make_vec_env(
-        lambda: BombermanGymEnv(classic_env_args, opponents=opponents),
+        lambda: BombermanGymEnv(CLASSIC_ENV_ARGS, opponents=opponents),
         n_envs=N_ENVS,
         vec_env_cls=SubprocVecEnv
     )
@@ -164,7 +250,7 @@ def run_epoch(N_STEPS, N_ENVS, epoch, model, opponents, training_start=None):
 
 
 def env_step_test(TEST_ROUNDS):
-    env = BombermanGymEnv(classic_env_args, opponents=[])
+    env = BombermanGymEnv(CLASSIC_ENV_ARGS, opponents=[])
 
     total_start_time = time.time()
 
@@ -197,32 +283,65 @@ def env_step_test(TEST_ROUNDS):
     print(f"Average steps per second: {total_steps / total_duration:.2f}")
 
 
+def get_demo_environment(opponents):
+    env = BombermanGymEnv(CLASSIC_ENV_ARGS, opponents=opponents)
+    return env
 
-def main(N_ENVS, N_STEPS, BATCH_SIZE, TOTAL_EPOCHS, opponents):
+
+def main(N_ENVS, TOTAL_EPOCHS, N_DEMONSTRATION_EPISODES, opponents, PPO_PARAMS):
     freeze_support()
     env = get_env(N_ENVS, opponents)
-    model = get_model(N_STEPS, BATCH_SIZE, env)
+    model = get_model(env, PPO_PARAMS)
 
     training_start = f"{datetime.now():%Y%m%d-%H%M%S}"
+    """
+    demo_env = get_demo_environment(opponents)
+
+    transitions = expert_transitions(
+        env=demo_env,
+        n_episodes=N_DEMONSTRATION_EPISODES
+    )
+
+    bc_trainer = bc.BC(
+        observation_space=demo_env.observation_space,
+        action_space=demo_env.action_space,
+        demonstrations=transitions,
+        policy=model.policy,
+        rng=np.random.default_rng(),
+    )
+
+    bc_trainer.train(n_epochs=10)
+
+    model.save(f"models/ppo_bomberman_bc_{training_start}")
+    play_test_game(model, opponents)
+    """
 
     for epoch in range(TOTAL_EPOCHS):
-        run_epoch(N_STEPS, N_ENVS, epoch, model, opponents, training_start)
-
-
-
+        run_epoch(PPO_PARAMS["n_steps"], N_ENVS, epoch, model, opponents, training_start)
 
 
 if __name__ == "__main__":
-    N_STEPS = 512
-    N_ENVS = 12
-    BATCH_SIZE = 64
-    TOTAL_EPOCHS = 1 + 50_000_000 // (N_STEPS * N_ENVS)
+    PPO_PARAMS = {
+        "learning_rate": 3e-4,
+        "n_steps": 512,
+        "batch_size": 256,
+        "n_epochs": 4,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "clip_range": 0.2,
+        "clip_range_vf": None,
+        "ent_coef": 0.01,
+        "vf_coef": 0.5,
+        "target_kl": 0.03,
+    }
 
+    N_DEMONSTRATION_EPISODES = 1000
+
+    N_ENVS = 24
+    TOTAL_EPOCHS = 1 + 50_000_000 // (PPO_PARAMS["n_steps"] * N_ENVS)
     opponents = []
 
-    env_step_test(10)
-
-    main(N_ENVS, N_STEPS, BATCH_SIZE, TOTAL_EPOCHS, opponents)
+    main(N_ENVS, TOTAL_EPOCHS, N_DEMONSTRATION_EPISODES, opponents, PPO_PARAMS)
 
 
 

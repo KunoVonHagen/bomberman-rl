@@ -2,6 +2,10 @@ from typing import Tuple, List
 import numpy as np
 from collections import deque
 
+import events as e
+
+MAX_DISTANCE = 16+16
+
 def get_closest_target_directions_and_distances(
         start_cell: Tuple[int, int],
         target_planes: np.typing.NDArray[np.bool_],
@@ -21,7 +25,7 @@ def get_closest_target_directions_and_distances(
 
     n_target_planes = target_planes.shape[0]
     found_targets = np.zeros(n_target_planes, dtype=bool)
-    results = [((0, 0), 0)] * n_target_planes
+    results = [((0, 0), MAX_DISTANCE)] * n_target_planes
 
     queue = deque([(start_cell, [((None, None), 0)] * n_target_planes)])
     visited = set()
@@ -58,7 +62,6 @@ def get_closest_target_directions_and_distances(
 
                 queue.append((neighbor, new_path_to_targets))
 
-    MAX_DISTANCE = 16+16
     for target_index in range(n_target_planes):
         if not found_targets[target_index]:
             results[target_index] = ((0, 0), MAX_DISTANCE)
@@ -106,7 +109,7 @@ def cell_attributes(
 
 
 FEATURES_DIM = 3 * 4 + 12 * 5  # 3 targets (coin, crate, enemy, safe) with direction and distance + 12 attributes for self and each neighbor
-def get_features(grid_tensor: np.typing.NDArray[np.int_]):
+def get_features(grid_tensor: np.typing.NDArray[np.int_]) -> np.typing.NDArray[np.float32]:
     """
     Extract features from the observation array.
 
@@ -169,3 +172,75 @@ def get_features(grid_tensor: np.typing.NDArray[np.int_]):
         features.extend(cell_attributes(neighbor_cell, grid_tensor))
 
     return np.array(features, dtype=np.float32)
+
+
+EVENT_REWARDS = {
+    e.MOVED_LEFT: 0,
+    e.MOVED_RIGHT: 0,
+    e.MOVED_UP: 0,
+    e.MOVED_DOWN: 0,
+    e.WAITED: -0.01,
+    e.INVALID_ACTION: -0.2,
+
+    e.BOMB_DROPPED: 0.05,
+    e.BOMB_EXPLODED: 0,
+
+    e.CRATE_DESTROYED: 0.2,
+    e.COIN_FOUND: 0.3,
+    e.COIN_COLLECTED: 1.0,
+
+    e.KILLED_OPPONENT: 5.0,
+    e.KILLED_SELF: -8.0,
+
+    e.GOT_KILLED: -5.0,
+    e.OPPONENT_ELIMINATED: 0,
+    e.SURVIVED_ROUND: 0.0,
+}
+
+FEATURE_REWARDS = {
+    # Coin distance
+    2: lambda x:  1/(MAX_DISTANCE*x) * 0.02,
+
+    # Crate distance
+    5: lambda x: 1/(MAX_DISTANCE*x) * 0.005,
+
+    # Safe tile distance
+    11: lambda x: 1/(MAX_DISTANCE*x) * 0.05,
+
+    # Standing in danger
+    22: lambda x: x * (-0.05),
+}
+
+FEATURE_DIFF_REWARDS = {
+    # Movement towards coin (negative -> closer)
+    2: -0.01,
+
+    # Movement towards crate
+    5: -0.001,
+
+    # Movement towards safe tile
+    11: -0.02,
+}
+
+SIMPLE_EVENT_REWARDS = {
+    e.MOVED_LEFT: 0,
+    e.MOVED_RIGHT: 0,
+    e.MOVED_UP: 0,
+    e.MOVED_DOWN: 0,
+    e.WAITED: 0,
+    e.INVALID_ACTION: -1,
+
+    e.BOMB_DROPPED: 0,
+    e.BOMB_EXPLODED: 0,
+
+    e.CRATE_DESTROYED: 0,
+    e.COIN_FOUND: 0,
+    e.COIN_COLLECTED: 1,
+
+    e.KILLED_OPPONENT: 5,
+    e.KILLED_SELF: 0,
+
+    e.GOT_KILLED: 0,
+    e.OPPONENT_ELIMINATED: 0,
+    e.SURVIVED_ROUND: 0,
+}

@@ -362,6 +362,7 @@ class ProcessAgentBackend(AgentBackend):
 class RLAgent(Agent):
     def __init__(self, name:str):
         super().__init__(name, "my_agent", name, True, None, "blue", "blue")
+        self.logger = RLAgentLogger()
 
     def round_ended(self):
         pass
@@ -371,3 +372,13 @@ class RLAgent(Agent):
 
     def wait_for_game_event_processing(self):
         pass
+
+class RLAgentLogger:
+    def info(self, *args, **kwargs):
+        pass
+    def debug(self, *args, **kwargs):
+        pass
+    def warning(self, *args, **kwargs):
+        pass
+
+
