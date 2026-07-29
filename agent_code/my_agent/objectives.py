@@ -2,7 +2,7 @@ from typing import Tuple, List
 import numpy as np
 from collections import deque
 
-from .pathfinding import A_star_manhattan, manhattan_distance, connected_cell_distances, count_open_neighbors
+from .pathfinding import connected_cell_distances, count_open_neighbors
 from .prediction import predict_danger_over_time, get_bomb_timer_array
 from settings import BOMB_TIMER, EXPLOSION_TIMER
 
