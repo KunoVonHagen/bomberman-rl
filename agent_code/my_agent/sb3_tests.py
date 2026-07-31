@@ -5,9 +5,13 @@ import time
 import numpy as np
 import os
 import torch.nn as nn
+import torch.nn.functional as F
+import torch_directml
 import gymnasium as gym
 import torch
-from stable_baselines3 import PPO
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.maskable.utils import get_action_masks
+from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.env_util import make_vec_env
@@ -36,6 +40,7 @@ def dagger_collect(
     env: BombermanGymEnv,
     policy,
     n_episodes: int,
+    cutoff_step: float = 400.
 ):
     """
     Collect demonstrations using the current policy for exploration while
@@ -55,13 +60,13 @@ def dagger_collect(
         obs, _ = env.reset()
         done = False
 
-        while not done:
+        while not done and env.world.step < cutoff_step:
 
             # Current policy decides where we go
             policy_action, _ = policy.predict(obs, deterministic=True)
 
             # Expert labels this state
-            game_state = observation_to_game_state(obs)
+            game_state = env.world.get_state_for_agent(env.agent)
             expert_action = expert_act(env.agent, game_state)
             expert_action = BombermanGymEnv.ACTION_INDICES[expert_action]
 
@@ -131,7 +136,7 @@ def merge_transitions(old, new):
 
 class BombermanCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Dict,
-                 features_dim: int = 256):
+                 features_dim: int = 128):
 
         super().__init__(observation_space, features_dim)
 
@@ -139,6 +144,7 @@ class BombermanCNN(BaseFeaturesExtractor):
         feature_space = observation_space["features"]
 
         n_input_channels = grid_space.shape[0]
+        n_residuals = grid_space.shape[0] * grid_space.shape[1] * grid_space.shape[2]
 
         self.cnn = nn.Sequential(
             nn.Conv2d(n_input_channels, 32, 3, padding=1),
@@ -147,22 +153,18 @@ class BombermanCNN(BaseFeaturesExtractor):
             nn.Conv2d(32, 64, 3, padding=1),
             nn.ReLU(),
 
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4,4)),
 
-            nn.Flatten()
+            nn.Flatten(),
         )
 
         with torch.no_grad():
             sample = torch.zeros(1, *grid_space.shape, dtype=torch.float32)
             n_cnn_flatten = self.cnn(sample).shape[1]
 
-        self.cnn_fc = nn.Sequential(
-            nn.Linear(n_cnn_flatten, 256),
+        self.grid_fc = nn.Sequential(
+            nn.Linear(n_cnn_flatten, 128),
             nn.ReLU(),
-
-            nn.Linear(256, 256),
-            nn.ReLU()
         )
 
         self.features_preprocess_fc = nn.Sequential(
@@ -171,24 +173,26 @@ class BombermanCNN(BaseFeaturesExtractor):
         )
 
         self.combined_fc = nn.Sequential(
-            nn.Linear(n_cnn_flatten + 64, 256),
-            nn.ReLU(),
-
-            nn.Linear(256, features_dim),
+            nn.Linear(128 + 64, features_dim),
             nn.ReLU()
         )
 
     def forward(self, observations: dict) -> torch.Tensor:
-        grid_tensor = observations["grid_tensor"].float()
-        #features = observations["features"].float()
+        grid_tensor = observations["grid_tensor"].float()  # (B, C, H, W)
+        features = observations["features"].float() # (B, F)
 
-        cnn_output = self.cnn(grid_tensor)
-        #features_output = self.features_preprocess_fc(features)
+        cnn_out = self.cnn(grid_tensor)  # (B, n_cnn_flatten)
+        #flattened_grid_tensor = torch.flatten(grid_tensor, 1)
+        #cnn_plus_residuals = torch.concatenate([cnn_out, flattened_grid_tensor], dim=1)
+        cnn_fc_out = self.grid_fc(cnn_out)
 
-        #combined_input = torch.cat((cnn_output, features_output), dim=1)
-        #return self.combined_fc(combined_input)
+        features_fc_out = self.features_preprocess_fc(features)
 
-        return self.cnn_fc(cnn_output)
+        combined = torch.cat([cnn_fc_out, features_fc_out], dim=1)
+        combined_out = self.combined_fc(combined)
+
+        return combined_out
+
 
 CLASSIC_ENV_ARGS = WorldArgs(
     scenario="classic",
@@ -213,7 +217,7 @@ def get_model(env, PPO_PARAMS):
         features_extractor_class=BombermanCNN,
     )
 
-    model = PPO(
+    model = MaskablePPO(
         "MultiInputPolicy",
         env,
         policy_kwargs=policy_kwargs,
@@ -224,10 +228,12 @@ def get_model(env, PPO_PARAMS):
 
     return model
 
+def mask_fn(env):
+    return env.action_masks()
 
 def get_env(N_ENVS, opponents):
     env = make_vec_env(
-        lambda: BombermanGymEnv(CLASSIC_ENV_ARGS, opponents=opponents),
+        lambda: ActionMasker(BombermanGymEnv(CLASSIC_ENV_ARGS, opponents=opponents), mask_fn),
         n_envs=N_ENVS,
         vec_env_cls=SubprocVecEnv
     )
@@ -258,11 +264,13 @@ def play_test_game(model, opponents):
         replay=False,
         continue_without_training=False
     )
+
     test_env = BombermanGymEnv(test_env_args, opponents=opponents)
     grid_tensor, _ = test_env.reset()
     done = False
     while not done:
-        action, _ = model.predict(grid_tensor, deterministic=True)
+        action_masks = get_action_masks(test_env)
+        action, _ = model.predict(grid_tensor, deterministic=True, action_masks=action_masks)
         grid_tensor, reward, terminated, truncated, info = test_env.step(action)
         done = terminated or truncated
         test_env.render()
@@ -342,36 +350,43 @@ def main(N_ENVS, TOTAL_EPOCHS, N_DEMONSTRATION_EPISODES, opponents, PPO_PARAMS):
             training_start,
         )
 
-        # Collect states visited by the improved policy
-        new_data = dagger_collect(
-            demo_env,
-            model,
-            N_DEMONSTRATION_EPISODES,
-        )
+        """
+        avg_reward = model.logger.name_to_value.get("rollout/ep_rew_mean", 0)
+        if avg_reward < .1:
+            dagger_step_cutoff = model.logger.name_to_value.get("rollout/ep_length_mean", 400) * 1.2
 
-        dataset = merge_transitions(dataset, new_data)
+            # Collect states visited by the improved policy
+            new_data = dagger_collect(
+                demo_env,
+                model,
+                N_DEMONSTRATION_EPISODES,
+                dagger_step_cutoff
+            )
 
-        bc_trainer = bc.BC(
-            observation_space=demo_env.observation_space,
-            action_space=demo_env.action_space,
-            demonstrations=dataset,
-            policy=model.policy,
-            rng=np.random.default_rng(),
-        )
+            dataset = merge_transitions(dataset, new_data)
 
-        bc_trainer.train(
-            n_epochs=2,
-        )
+            bc_trainer = bc.BC(
+                observation_space=demo_env.observation_space,
+                action_space=demo_env.action_space,
+                demonstrations=dataset,
+                policy=model.policy,
+                rng=np.random.default_rng(),
+            )
+
+            bc_trainer.train(
+                n_epochs=4,
+            )
+        """
 
 
 if __name__ == "__main__":
     PPO_PARAMS = {
         "learning_rate": 3e-4,
-        "n_steps": 512,
+        "n_steps": 1024,
         "batch_size": 256,
         "n_epochs": 4,
         "gamma": 0.999,
-        "gae_lambda": 0.95,
+        "gae_lambda": 0.97,
         "clip_range": 0.2,
         "clip_range_vf": None,
         "ent_coef": 0.01,
@@ -379,9 +394,9 @@ if __name__ == "__main__":
         "target_kl": 0.03,
     }
 
-    N_DEMONSTRATION_EPISODES = 10
+    N_DEMONSTRATION_EPISODES = 50
 
-    N_ENVS = 24
+    N_ENVS = 64
     TOTAL_EPOCHS = 1 + 50_000_000 // (PPO_PARAMS["n_steps"] * N_ENVS)
     opponents = []
 

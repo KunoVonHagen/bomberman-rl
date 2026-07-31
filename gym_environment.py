@@ -1,9 +1,9 @@
-from typing import List, Tuple
+from typing import List, Tuple, Callable
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-from agents import RLAgent
+from agents import RLAgent, Agent
 import settings as s
 from environment import BombeRLeWorld, WorldArgs, Trophy
 from items import Bomb
@@ -38,26 +38,28 @@ class BombermanGymEnv(gym.Env):
     def __init__(
         self,
         args: WorldArgs,
-        opponents: List[Tuple[str, bool]],
+        opponents: List[Tuple[Callable[[Agent], None], Callable[[Agent, dict], str|None]]],
         reward_fn=None,
         render_mode=None,
     ):
         super().__init__()
 
         self.agent = RLAgent("RLAgent")
-        self.world = BombeRLeWorld(args, [self.agent] + opponents)
-        self.opponents = [a for a in self.world.agents if a != self.agent]
+        self.opponents = [(RLAgent(f"OpponentAgent{i}"), setup_fn, act_fn) for i, (setup_fn, act_fn) in enumerate(opponents)]
+        self.world = BombeRLeWorld(args, [self.agent] + [opponent_object[0] for opponent_object in self.opponents])
         self.render_mode = render_mode
 
         self.reward_fn = reward_fn or self.shaped_reward
 
         self.world.new_round()
 
-        H, W = self.world.arena.shape
+        self.width, self.height = self.world.arena.shape
+        self.center_x = self.width // 2
+        self.center_y = self.height // 2
 
         self.n_observation_layers = 8 + 2 * s.BOMB_TIMER + s.EXPLOSION_TIMER
 
-        self.grid_tensor = np.zeros((self.n_observation_layers, H, W), dtype=np.float32)
+        self.grid_tensor = np.zeros((self.n_observation_layers, self.width, self.height), dtype=np.float32)
         self.features = np.array([])
 
         # Observation Space:
@@ -136,42 +138,12 @@ class BombermanGymEnv(gym.Env):
         return obs, info
 
     def get_opponents_actions(self):
-        for a in self.opponents:
+        for a, _, act_fn in self.opponents:
             state = self.world.get_state_for_agent(a)
             a.store_game_state(state)
             a.reset_game_events()
-            if a.available_think_time > 0:
-                a.act(state)
 
-            # Give agents time to decide
-
-        for i in range(len(self.opponents)):
-            a = self.opponents[i]
-            if a.available_think_time > 0:
-                try:
-                    action, think_time = a.wait_for_act()
-                except KeyboardInterrupt:
-                    # Stop the game
-                    raise
-                except:
-                    if not self.world.args.silence_errors:
-                        raise
-                    # Agents with errors cannot continue
-                    action = "ERROR"
-                    think_time = float("inf")
-
-                if think_time > a.available_think_time:
-                    next_think_time = a.base_timeout - (think_time - a.available_think_time)
-                    action = "WAIT"
-                    a.trophies.append(Trophy.time_trophy)
-                    a.available_think_time = next_think_time
-                else:
-                    a.available_think_time = a.base_timeout
-            else:
-                a.available_think_time += a.base_timeout
-                action = "WAIT"
-
-            self.agent_actions[a] = action
+            self.agent_actions[a] = act_fn(a, state)
 
 
     def step(self, action):
@@ -267,7 +239,7 @@ class BombermanGymEnv(gym.Env):
 
                     raise ValueError(f"Game state computation differs from correct game state in field 'others [{opponent_index}][{important_index}]'")
 
-    def _get_grid_tensor(self):
+    def _get_grid_tensor(self, center=True):
         self.grid_tensor.fill(0)
 
         # walls
@@ -288,7 +260,7 @@ class BombermanGymEnv(gym.Env):
         self.grid_tensor[4] = self.PRECOMPUTED_BLAST_MAP.get((self.agent.x, self.agent.y), np.zeros_like(self.world.arena, dtype=np.int8))
 
         # enemies
-        for enemy in self.opponents:
+        for enemy, _, _ in self.opponents:
             # positions
             self.grid_tensor[5, enemy.x, enemy.y] = 1
 
@@ -316,6 +288,35 @@ class BombermanGymEnv(gym.Env):
                 for x, y in explosion.blast_coords:
                     self.grid_tensor[7 + 2*s.BOMB_TIMER + explosion.timer, x, y] = 1
 
+        # Make tensor egocentric, needs to be disabled if conversion back to game_state dict is needed
+        if center:
+            centered_tensor = np.zeros_like(self.grid_tensor)
+
+            center_x = self.width // 2
+            center_y = self.height // 2
+
+            dx = center_x - self.agent.x
+            dy = center_y - self.agent.y
+
+            # Source region
+            src_x0 = max(0, -dx)
+            src_x1 = min(self.width, self.width - dx)
+            src_y0 = max(0, -dy)
+            src_y1 = min(self.height, self.height - dy)
+
+            # Destination region
+            dst_x0 = max(0, dx)
+            dst_x1 = dst_x0 + (src_x1 - src_x0)
+            dst_y0 = max(0, dy)
+            dst_y1 = dst_y0 + (src_y1 - src_y0)
+
+            centered_tensor[:, dst_x0:dst_x1, dst_y0:dst_y1] = \
+                self.grid_tensor[:, src_x0:src_x1, src_y0:src_y1]
+
+            return centered_tensor
+
+
+
         return self.grid_tensor
 
     def _get_info(self):
@@ -334,32 +335,89 @@ class BombermanGymEnv(gym.Env):
 
         return reward
 
+    def action_masks(self):
+        mask = np.ones(6, dtype=bool)
+
+        x, y = self.agent.x, self.agent.y
+
+        # UP
+        if not self.world.tile_is_free(x, y - 1):
+            mask[0] = False
+
+        # RIGHT
+        if not self.world.tile_is_free(x + 1, y):
+            mask[1] = False
+
+        # DOWN
+        if not self.world.tile_is_free(x, y + 1):
+            mask[2] = False
+
+        # LEFT
+        if not self.world.tile_is_free(x - 1, y):
+            mask[3] = False
+
+        # WAIT always valid
+        mask[4] = True
+
+        # BOMB
+        if not self.agent.bombs_left:
+            mask[5] = False
+
+        return mask
+
+
+    def is_walkable(self, x, y):
+        # wall
+        if self.world.arena[x, y] != 0:
+            return False
+
+        # bomb occupying tile
+        if any(b.x == x and b.y == y for b in self.world.bombs):
+            return False
+
+        # other agents
+        if any(a.x == x and a.y == y and not a.dead
+               for a in self.world.agents):
+            return False
+
+        return True
+
 
     def shaped_reward(self):
         reward = 0
 
-        if self.agent.dead:
-            return -10
+        #if self.agent.dead:
+        #    return -10
 
+
+        disable_coin_away_movement_penalty = False
 
         for event in self.agent.events:
+            if event == e.COIN_COLLECTED:
+                disable_coin_away_movement_penalty = True
+
             reward += EVENT_REWARDS.get(event, 0)
+
 
 
         visited_count = np.sum(self.visited)
         new_visited = visited_count - self.previous_visited_count
         self.previous_visited_count = visited_count
+        
+        if new_visited > 0:
+            reward += 0.02
+
 
         feature_diff = np.sign(self.features - self.previous_features)
 
         for feature_index, reward_function in FEATURE_REWARDS.items():
             reward += reward_function(self.features[feature_index])
 
-        for feature_diff_index, reward in FEATURE_DIFF_REWARDS.items():
-            reward += reward * feature_diff[feature_diff_index]
-
-        if new_visited > 0:
-            reward += 0.02
+        for feature_diff_index, diff_reward in FEATURE_DIFF_REWARDS.items():
+            if feature_diff_index == 2 and disable_coin_away_movement_penalty:
+                reward += abs(diff_reward)
+                continue
+            reward += diff_reward * feature_diff[feature_diff_index]
 
         return reward
 
