@@ -179,11 +179,11 @@ EVENT_REWARDS = {
     e.MOVED_RIGHT: 0,
     e.MOVED_UP: 0,
     e.MOVED_DOWN: 0,
-    e.WAITED: -0.001,
+    e.WAITED: -0.01,
     e.INVALID_ACTION: -0.2,
 
-    e.BOMB_DROPPED: 0.,
-    e.BOMB_EXPLODED: 0.5,
+    e.BOMB_DROPPED: 0,
+    e.BOMB_EXPLODED: 0.,
 
     e.CRATE_DESTROYED: 0.3,
     e.COIN_FOUND: 0,
@@ -213,10 +213,10 @@ FEATURE_REWARDS = {
 
 FEATURE_DIFF_REWARDS = {
     # Movement towards coin (negative -> closer)
-    2: -0.01,
+    2: -0.3,
 
     # Movement towards crate
-    5: -0.005,
+    5: -0.1,
 
     # Movement towards safe tile
     11: 0,
