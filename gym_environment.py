@@ -1,69 +1,4 @@
-"""
-Fast, self-contained Gymnasium environment for training Bomberman RL agents.
-
-THIS MODULE WAS FULLY GENERATED USING CLAUDE SONNET 5. SINCE ALL
-
-This module intentionally does NOT depend on environment.py / agents.py / items.py.
-Those modules exist to support the full game (GUI rendering via pygame, replay
-recording, per-agent subprocess/multiprocessing backends, file logging, ...),
-none of which is needed -- or wanted -- in a tight training loop. Pulling them
-in costs real time and memory for every environment instance (pygame image
-loads, log file handles, defaultdict bookkeeping, replay dict growth) and,
-more importantly, the original gym_environment.py re-derived the *entire*
-observation tensor and a fresh copy of the game-state dict for every single
-agent on every single step, even though almost none of that data changes
-between one agent's turn and the next.
-
-Design of this rewrite:
-
-  * No pygame, no logging, no multiprocessing, no replay recording. Agents
-    are represented by a tiny `AgentHandle` (a handful of plain attributes)
-    instead of the full `agents.Agent`, which used to load two 30x30 sprite
-    images per agent just to sit unused in headless training.
-
-  * Game *logic* (movement rules, bomb/explosion timing, coin collection,
-    scoring, kill attribution, round-end conditions) is a straight,
-    behavior-preserving port of GenericWorld/BombeRLeWorld from
-    environment.py. Every quirk of the original (e.g. an agent overlapped by
-    two simultaneous explosions gets scored against twice; bomb-danger
-    channels are overwritten rather than merged when two bombs share a
-    countdown value; dead opponents keep occupying their last cell on the
-    observation tensor because the original code never filtered them out)
-    is preserved on purpose.
-
-  * The `game_state` dict handed to agent callbacks has the exact same shape
-    as `BombeRLeWorld.get_state_for_agent`. The expensive parts of building
-    it (`field`, `explosion_map`, `bombs`, `coins`) are computed *once per
-    step* and shared across every agent's dict instead of being rebuilt from
-    scratch per agent.
-
-  * The observation tensor is a persistent buffer, not reallocated every
-    step. Layers that rarely change (walls -- never; crates and coins --
-    only at the handful of cells that are actually destroyed/collected;
-    the acting agent's own position) are updated incrementally with O(1)
-    point writes instead of being rebuilt via a full-array scan. Layers that
-    are inherently "shift every tick" (bomb position/danger channels change
-    index every time a bomb's timer ticks down; explosion channels the same)
-    or that combine several small entities (enemy positions/union danger
-    zone/can-place-bomb) are still recomputed each step, but only over the
-    handful of active bombs/explosions/agents -- never via `np.where` over
-    the whole arena, and never after a `tensor.fill(0)` of all 19+ layers.
-
-  * Blast propagation only ever depends on the (static) wall layout, never
-    on crates, so the blast-coordinate/blast-map lookup tables are computed
-    exactly once, from the wall pattern alone, before the first round is
-    even generated -- and reused for the lifetime of the environment.
-
-NOTE on returned buffers: `obs["grid_tensor"]` and `obs["features"]` are
-views into buffers owned by this environment and are mutated in place on the
-next `step()`/`reset()` call. This avoids an allocation + full copy every
-single step. Downstream code that needs to retain an observation across
-steps (e.g. for logging) should copy it explicitly (`obs["grid_tensor"].copy()`).
-Standard RL libraries (SB3, etc.) already copy observations into their own
-rollout/replay buffers immediately, so this is safe for normal training use.
-"""
-
-from collections import namedtuple
+from collections import namedtuple, deque
 from typing import List, Tuple, Callable, Optional, Dict, Any
 
 import gymnasium as gym
@@ -82,9 +17,7 @@ from agent_code.my_agent.features import (
     SIMPLE_EVENT_REWARDS,
 )
 
-# Kept for drop-in compatibility with callers that construct
-# `WorldArgs(...)` for this environment. Deliberately *not* imported from
-# environment.py, since importing that module pulls in pygame/agents/items.
+# Kept for drop-in compatibility with callers that construct WorldArgs(...).
 WorldArgs = namedtuple(
     "WorldArgs",
     ["no_gui", "fps", "turn_based", "update_interval", "save_replay", "replay",
@@ -93,15 +26,8 @@ WorldArgs = namedtuple(
 )
 
 
-# ---------------------------------------------------------------------------
-# Lightweight stand-ins for agents.Agent / agents.RLAgent and
-# items.Coin / items.Bomb / items.Explosion.
-# ---------------------------------------------------------------------------
-
 class _NullLogger:
-    """No-op logger, API-compatible with the `self.logger` opponent callback
-    code expects (mirrors agents.RLAgentLogger, minus the RLAgent/Agent
-    machinery around it)."""
+    """No-op logger, API-compatible with `self.logger`."""
     __slots__ = ()
 
     def info(self, *args, **kwargs):
@@ -118,9 +44,8 @@ _NULL_LOGGER = _NullLogger()
 
 
 class AgentHandle:
-    """Minimal per-agent record. Carries only what the game logic, the
-    game_state dict, and the reward computation actually use -- no sprites,
-    no per-agent log files, no lifetime statistics dict."""
+    """Minimal per-agent record: only what game logic, game_state, and
+    reward computation actually use."""
 
     __slots__ = ("name", "train", "logger", "x", "y", "score", "total_score",
                  "bombs_left", "dead", "events")
@@ -152,34 +77,47 @@ class AgentHandle:
         self.events = []
 
 
+ACTIONS = [
+    "UP",
+    "RIGHT",
+    "DOWN",
+    "LEFT",
+    "WAIT",
+    "BOMB",
+]
+
+ACTION_INDICES = {
+    "UP": 0,
+    "RIGHT": 1,
+    "DOWN": 2,
+    "LEFT": 3,
+    "WAIT": 4,
+    "BOMB": 5,
+    None: 4,
+}
+
+_EXPLOSION_STAGE1_TICKS = 2
+
+WALL_LAYER, CRATE_LAYER, COIN_LAYER, SELF_LAYER, SELF_BLAST_LAYER, OPPONENT_LAYER, OPPONENT_DANGER_LAYER, BOMBS_LEFT_LAYER = range(8)
+_BASE_LAYERS = 8 + 2 * s.BOMB_TIMER + s.EXPLOSION_TIMER
+
+DANGER_MAP_LAYERS = [_BASE_LAYERS + t for t in range(s.BOMB_TIMER + s.EXPLOSION_TIMER)]
+OCCUPIED_MAP_LAYERS = [DANGER_MAP_LAYERS[-1] + 1 + t for t in range(s.BOMB_TIMER + s.EXPLOSION_TIMER + 1)]
+SELF_DISTANCE_LAYER = OCCUPIED_MAP_LAYERS[-1] + 1
+OPPONENTS_LEAST_DISTANCE_LAYER = SELF_DISTANCE_LAYER + 1
+CRATE_POTENTIAL_LAYER = OPPONENTS_LEAST_DISTANCE_LAYER + 1
+DANGER_ONSET_LAYER = CRATE_POTENTIAL_LAYER + 1
+DANGER_CLEAR_LAYER = DANGER_ONSET_LAYER + 1
+MOBILITY_LAYER = DANGER_CLEAR_LAYER + 1
+CRATE_DISTANCE_LAYER = MOBILITY_LAYER + 1
+COIN_DISTANCE_LAYER = CRATE_DISTANCE_LAYER + 1
+
+NUM_LAYERS = COIN_DISTANCE_LAYER + 1
+
+
+
 class BombermanGymEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
-
-    ACTIONS = [
-        "UP",
-        "RIGHT",
-        "DOWN",
-        "LEFT",
-        "WAIT",
-        "BOMB",
-    ]
-
-    ACTION_INDICES = {
-        "UP": 0,
-        "RIGHT": 1,
-        "DOWN": 2,
-        "LEFT": 3,
-        "WAIT": 4,
-        "BOMB": 5,
-        None: 4,
-    }
-
-    # Explosion stage-1 ("smoke", no-longer-dangerous) duration. In the
-    # original items.Explosion this comes from `len(Explosion.ASSETS[1])`
-    # (2 animation frames) -- a rendering constant that the original game
-    # loop nonetheless used to drive real explosion lifetime. Reproduced
-    # here as an explicit constant since we no longer load any sprites.
-    _EXPLOSION_STAGE1_TICKS = 2
 
     def __init__(
         self,
@@ -193,14 +131,10 @@ class BombermanGymEnv(gym.Env):
         self.rng = np.random.default_rng(args.seed)
         self.render_mode = render_mode
 
-        # -- Agents ----------------------------------------------------
         self.agent = AgentHandle("RLAgent")
         self.opponent_handles: List[AgentHandle] = []
         self.opponent_act_fns: List[Callable] = []
         for i, (setup_fn, act_fn) in enumerate(opponents):
-            # NOTE: mirrors the original gym_environment.py, which stored
-            # `setup_fn` but never called it. Preserved as-is rather than
-            # silently changing opponent-initialization behavior.
             self.opponent_handles.append(AgentHandle(f"OpponentAgent{i}"))
             self.opponent_act_fns.append(act_fn)
         self.all_agents: List[AgentHandle] = [self.agent] + self.opponent_handles
@@ -209,25 +143,24 @@ class BombermanGymEnv(gym.Env):
 
         self.reward_fn = reward_fn or self.shaped_reward
 
-        # -- Board dimensions -------------------------------------------
         self.width, self.height = s.COLS, s.ROWS
         self.center_x = self.width // 2
         self.center_y = self.height // 2
 
-        self.n_observation_layers = 8 + 2 * s.BOMB_TIMER + s.EXPLOSION_TIMER
+        self.n_observation_layers = NUM_LAYERS
         self._BT = s.BOMB_TIMER
         self._ET = s.EXPLOSION_TIMER
 
-        # Persistent buffers -- allocated once, mutated in place forever.
         self.grid_tensor = np.zeros((self.n_observation_layers, self.width, self.height), dtype=np.float32)
         self._centered_tensor = np.zeros_like(self.grid_tensor)
         self.features = np.zeros(FEATURES_DIM, dtype=np.float32)
 
+        """
         self.observation_space = spaces.Dict({
             "grid_tensor": spaces.Box(
-                low=0,
-                high=1,
-                shape=(self.n_observation_layers, 17, 17),
+                low=-1,
+                high=self.width * self.height,
+                shape=(self.n_observation_layers, self.width, self.height),
                 dtype=np.float32,
             ),
             "features": spaces.Box(
@@ -237,15 +170,18 @@ class BombermanGymEnv(gym.Env):
                 dtype=np.float32,
             ),
         })
-        self.action_space = spaces.Discrete(len(self.ACTIONS))
+        """
+        self.observation_space = spaces.Box(
+            low=-1,
+            high=self.width * self.height,
+            shape=(self.n_observation_layers, self.width, self.height),
+            dtype=np.float32,
+        )
+        self.action_space = spaces.Discrete(len(ACTIONS))
 
-        # -- Static blast lookup tables -----------------------------------
-        # Blast propagation only stops at walls, never at crates, so this
-        # only depends on the (deterministic, RNG-independent) wall layout
-        # and can be computed once, before any round exists, and reused
-        # forever -- crate destruction never invalidates it.
         wall_mask = self._build_wall_mask()
         self._wall_layer = np.where(wall_mask == -1, 1.0, 0.0).astype(np.float32)
+        self._wall_bool = self._wall_layer.astype(bool)
         self._empty_map = np.zeros((self.width, self.height), dtype=np.float32)
         self.PRECOMPUTED_BLAST_COORDS: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
         self.PRECOMPUTED_BLAST_MAP: Dict[Tuple[int, int], np.ndarray] = {}
@@ -258,7 +194,10 @@ class BombermanGymEnv(gym.Env):
             bmap[list(xs_), list(ys_)] = 1.0
             self.PRECOMPUTED_BLAST_MAP[(x, y)] = bmap
 
-        # -- Round-scoped state, (re)initialised in new_round() -----------
+        self._blast_tensor = np.zeros((self.width, self.height, self.width, self.height), dtype=np.float32)
+        for (bx, by), bmap in self.PRECOMPUTED_BLAST_MAP.items():
+            self._blast_tensor[bx, by] = bmap
+
         self.round = 0
         self.step_count = 0
         self.arena = np.zeros((self.width, self.height), dtype=np.int8)
@@ -267,7 +206,6 @@ class BombermanGymEnv(gym.Env):
         self.bombs: List[dict] = []
         self.explosions: List[dict] = []
 
-        # Reward-shaping auxiliaries.
         self.previous_visited_count = 1
         self.visited = np.zeros((self.width, self.height), dtype=bool)
         self.previous_features = None
@@ -276,14 +214,8 @@ class BombermanGymEnv(gym.Env):
 
         self.new_round()
 
-    # ------------------------------------------------------------------
-    # Static-layout / blast precomputation helpers
-    # ------------------------------------------------------------------
-
     def _build_wall_mask(self) -> np.ndarray:
-        """Reproduces the wall portion of BombeRLeWorld.build_arena. Walls
-        never depend on the RNG or on crate placement, so this is computed
-        once and never touched again."""
+        """Wall portion of BombeRLeWorld.build_arena (RNG-independent)."""
         WALL = -1
         arena = np.zeros((s.COLS, s.ROWS), dtype=np.int8)
         arena[:1, :] = WALL
@@ -296,8 +228,7 @@ class BombermanGymEnv(gym.Env):
 
     @staticmethod
     def _compute_blast_coords(x, y, wall_mask, power) -> List[Tuple[int, int]]:
-        """Reproduces items.Bomb.get_blast_coords without needing a Bomb
-        object (and therefore without needing to import items.py / pygame)."""
+        """Reproduces items.Bomb.get_blast_coords without a Bomb object."""
         coords = [(x, y)]
         for i in range(1, power + 1):
             if wall_mask[x + i, y] == -1:
@@ -317,13 +248,8 @@ class BombermanGymEnv(gym.Env):
             coords.append((x, y - i))
         return coords
 
-    # ------------------------------------------------------------------
-    # Round setup
-    # ------------------------------------------------------------------
-
     def _generate_round_layout(self):
-        """Reproduces BombeRLeWorld.build_arena (crate placement, coin
-        placement, start-position clearing, start-position assignment)."""
+        """Reproduces BombeRLeWorld.build_arena (crates, coins, start positions)."""
         WALL, FREE, CRATE = -1, 0, 1
         arena = self._build_wall_mask().copy()
 
@@ -365,7 +291,7 @@ class BombermanGymEnv(gym.Env):
             handle.x, handle.y = int(x), int(y)
             handle.dead = False
             handle.score = 0
-            handle.total_score = handle.total_score  # persists across rounds, like Agent.total_score
+            handle.total_score = handle.total_score
             handle.bombs_left = True
             handle.events = []
 
@@ -378,54 +304,46 @@ class BombermanGymEnv(gym.Env):
         self.previous_features = None
         self.agent_actions = {}
 
-    # ------------------------------------------------------------------
-    # Observation tensor maintenance
-    # ------------------------------------------------------------------
-
     def _rebuild_full_grid_tensor(self):
-        """Full rebuild -- only ever called once per round (not once per
-        step), so its cost is amortized over the whole round."""
+        """Full rebuild -- only once per round, cost amortized over the round."""
         gt = self.grid_tensor
         gt.fill(0)
-        gt[0] = self._wall_layer
-        gt[1] = np.where(self.arena == 1, 1.0, 0.0)
+        gt[WALL_LAYER] = self._wall_layer
+        gt[CRATE_LAYER] = np.where(self.arena == 1, 1.0, 0.0)
         collectable_idx = np.nonzero(self.coins_collectable)[0]
         for ci in collectable_idx:
             x, y = self.coins_xy[ci]
-            gt[2, x, y] = 1.0
-        gt[3, self.agent.x, self.agent.y] = 1.0
+            gt[COIN_LAYER, x, y] = 1.0
+        gt[SELF_LAYER, self.agent.x, self.agent.y] = 1.0
         self._refresh_dynamic_layers()
+        self._init_crate_potential()
+        self._refresh_forecast_layers()
 
     def _refresh_dynamic_layers(self):
-        """Recomputes only the channels whose content is inherently
-        collective (all enemies) or inherently shifts every tick (bomb
-        timer channels, explosion timer channels). Walls/crates/coins/self
-        position (layers 0-3) are maintained incrementally elsewhere and
-        are *not* touched here."""
+        """Recomputes channels that are inherently collective (all enemies)
+        or shift every tick (bomb/explosion timer channels). Walls/crates/
+        coins/self position are maintained incrementally elsewhere."""
         gt = self.grid_tensor
         BT = self._BT
 
-        gt[4:].fill(0)
+        gt[4:_BASE_LAYERS].fill(0)
 
         ax, ay = self.agent.x, self.agent.y
-        gt[4] = self.PRECOMPUTED_BLAST_MAP.get((ax, ay), self._empty_map)
+        gt[SELF_BLAST_LAYER] = self.PRECOMPUTED_BLAST_MAP.get((ax, ay), self._empty_map)
 
         for h in self.opponent_handles:
             ex_, ey_ = h.x, h.y
-            gt[5, ex_, ey_] = 1.0
-            gt[6] += self.PRECOMPUTED_BLAST_MAP.get((ex_, ey_), self._empty_map)
-            gt[7, ex_, ey_] = 1.0 if h.bombs_left else 0.0
+            gt[OPPONENT_LAYER, ex_, ey_] = 1.0
+            gt[OPPONENT_DANGER_LAYER] += self.PRECOMPUTED_BLAST_MAP.get((ex_, ey_), self._empty_map)
+            gt[BOMBS_LEFT_LAYER, ex_, ey_] = 1.0 if h.bombs_left else 0.0
 
-        gt[6] = np.where(gt[6] > 0, 1.0, 0.0)
-        gt[7, ax, ay] = 1.0 if self.agent.bombs_left else 0.0
+        gt[OPPONENT_DANGER_LAYER] = np.where(gt[OPPONENT_DANGER_LAYER] > 0, 1.0, 0.0)
+        gt[BOMBS_LEFT_LAYER, ax, ay] = 1.0 if self.agent.bombs_left else 0.0
 
         for b in self.bombs:
             pos_ch = 8 + b["timer"]
             danger_ch = 8 + BT + b["timer"]
             gt[pos_ch, b["x"], b["y"]] = 1.0
-            # Overwrite (not accumulate), matching the original: if two
-            # bombs share a countdown value, only the last one processed
-            # is reflected in that channel.
             gt[danger_ch] = self.PRECOMPUTED_BLAST_MAP.get((b["x"], b["y"]), self._empty_map)
 
         for ex in self.explosions:
@@ -433,6 +351,164 @@ class BombermanGymEnv(gym.Env):
                 ch = 7 + 2 * BT + ex["timer"]
                 for (x, y) in ex["coords"]:
                     gt[ch, x, y] = 1.0
+
+    def _init_crate_potential(self):
+        """Full recompute -- only once per round. Kept current afterwards by
+        incremental subtraction in `_update_bombs`."""
+        self.grid_tensor[CRATE_POTENTIAL_LAYER] = np.einsum(
+            "xyij,ij->xy", self._blast_tensor, self.grid_tensor[CRATE_LAYER]
+        )
+
+    def _compute_danger_forecast(self):
+        """danger[t] = cells dangerous t steps from now, assuming no new
+        bombs. Iterates only over currently active bombs/explosions."""
+        gt = self.grid_tensor
+        T = self._BT + self._ET
+        active_explosions = [ex for ex in self.explosions if ex["stage"] == 0]
+
+        if not self.bombs and not active_explosions:
+            gt[DANGER_MAP_LAYERS[0]:DANGER_MAP_LAYERS[-1] + 1] = 0.0
+            return
+
+        for t in range(T):
+            danger = np.zeros((self.width, self.height), dtype=np.float32)
+            for ex in active_explosions:
+                if ex["timer"] - t > 0:
+                    for (x, y) in ex["coords"]:
+                        danger[x, y] = 1.0
+            for b in self.bombs:
+                if b["timer"] <= t < b["timer"] + self._ET:
+                    np.maximum(danger, self.PRECOMPUTED_BLAST_MAP.get((b["x"], b["y"]), self._empty_map), out=danger)
+            gt[DANGER_MAP_LAYERS[t]] = danger
+
+    def _compute_occupancy_forecast(self):
+        """occ[t] = walls | surviving crates | pending bombs | danger, at t
+        steps from now. Needs danger[t] computed first."""
+        gt = self.grid_tensor
+        T = self._BT + self._ET
+
+        if not self.bombs and not self.explosions:
+            static = (self._wall_bool | gt[CRATE_LAYER].astype(bool)).astype(np.float32)
+            for layer in OCCUPIED_MAP_LAYERS:
+                gt[layer] = static
+            return
+
+        remaining_crates = gt[CRATE_LAYER].astype(bool).copy()
+        for t in range(T):
+            danger_t = gt[DANGER_MAP_LAYERS[t]].astype(bool)
+            remaining_crates &= ~danger_t
+
+            occ = self._wall_bool | remaining_crates
+            for b in self.bombs:
+                if b["timer"] >= t:
+                    occ[b["x"], b["y"]] = True
+            occ |= danger_t
+
+            gt[OCCUPIED_MAP_LAYERS[t]] = occ.astype(np.float32)
+
+        gt[OCCUPIED_MAP_LAYERS[-1]] = (self._wall_bool | remaining_crates).astype(np.float32)
+
+    def _time_aware_bfs(self, starts, out_layer):
+        """Earliest arrival time at every cell, respecting the occupancy
+        forecast (four moves + wait)."""
+        T = len(OCCUPIED_MAP_LAYERS) - 1
+        W, H = self.width, self.height
+        gt = self.grid_tensor
+
+        dist = np.full((W, H), -1, dtype=np.float32)
+        visited = np.zeros((W, H, T + 1), dtype=bool)
+        q = deque()
+
+        for x, y in starts:
+            if gt[OCCUPIED_MAP_LAYERS[0], x, y]:
+                continue
+            visited[x, y, 0] = True
+            dist[x, y] = 0
+            q.append((x, y, 0))
+
+        while q:
+            x, y, t = q.popleft()
+            next_t = min(t + 1, T)
+            occ = gt[OCCUPIED_MAP_LAYERS[next_t]]
+
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1), (x, y)):
+                if not (0 <= nx < W and 0 <= ny < H):
+                    continue
+                if occ[nx, ny] or visited[nx, ny, next_t]:
+                    continue
+                visited[nx, ny, next_t] = True
+                if dist[nx, ny] == -1:
+                    dist[nx, ny] = next_t
+                q.append((nx, ny, next_t))
+
+        gt[out_layer] = dist
+
+    def _compute_danger_summary(self):
+        """Onset/clear timestep of the danger forecast, per cell (-1 = never)."""
+        gt = self.grid_tensor
+        stack = gt[DANGER_MAP_LAYERS[0]:DANGER_MAP_LAYERS[-1] + 1]
+        ever = stack.any(axis=0)
+
+        onset = np.argmax(stack, axis=0)
+        gt[DANGER_ONSET_LAYER] = np.where(ever, onset, -1)
+
+        T = stack.shape[0]
+        last_from_end = np.argmax(stack[::-1], axis=0)
+        gt[DANGER_CLEAR_LAYER] = np.where(ever, T - last_from_end, -1)
+
+    def _compute_mobility(self):
+        """Free 4-neighbor count under final occupancy."""
+        gt = self.grid_tensor
+        free = 1.0 - gt[OCCUPIED_MAP_LAYERS[-1]]
+        m = np.zeros_like(free)
+        m[1:, :] += free[:-1, :]
+        m[:-1, :] += free[1:, :]
+        m[:, 1:] += free[:, :-1]
+        m[:, :-1] += free[:, 1:]
+        gt[MOBILITY_LAYER] = m
+
+    def _multi_source_bfs(self, targets: np.ndarray, occ: np.ndarray) -> np.ndarray:
+        """Static (non-time-aware) BFS distance from every cell to the
+        nearest True cell in `targets`, under fixed occupancy `occ`."""
+        W, H = self.width, self.height
+        dist = np.full((W, H), -1, dtype=np.float32)
+        q = deque()
+
+        for x, y in np.argwhere(targets):
+            dist[x, y] = 0
+            q.append((int(x), int(y)))
+
+        while q:
+            x, y = q.popleft()
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if not (0 <= nx < W and 0 <= ny < H):
+                    continue
+                if occ[nx, ny] or dist[nx, ny] != -1:
+                    continue
+                dist[nx, ny] = dist[x, y] + 1
+                q.append((nx, ny))
+
+        return dist
+
+    def _compute_distance_fields(self):
+        gt = self.grid_tensor
+        occ_now = gt[OCCUPIED_MAP_LAYERS[0]].astype(bool)
+
+        crate_targets = (gt[CRATE_POTENTIAL_LAYER] > 0) & ~occ_now
+        gt[CRATE_DISTANCE_LAYER] = self._multi_source_bfs(crate_targets, occ_now)
+
+        coin_targets = gt[COIN_LAYER].astype(bool)
+        gt[COIN_DISTANCE_LAYER] = self._multi_source_bfs(coin_targets, occ_now)
+
+    def _refresh_forecast_layers(self):
+        self._compute_danger_forecast()
+        self._compute_occupancy_forecast()
+        self._time_aware_bfs([(self.agent.x, self.agent.y)], SELF_DISTANCE_LAYER)
+        opponent_positions = [(h.x, h.y) for h in self.opponent_handles if not h.dead]
+        self._time_aware_bfs(opponent_positions, OPPONENTS_LEAST_DISTANCE_LAYER)
+        self._compute_danger_summary()
+        self._compute_mobility()
+        self._compute_distance_fields()
 
     def _get_centered_tensor(self) -> np.ndarray:
         dx = self.center_x - self.agent.x
@@ -452,10 +528,6 @@ class BombermanGymEnv(gym.Env):
         self._centered_tensor[:, dst_x0:dst_x1, dst_y0:dst_y1] = \
             self.grid_tensor[:, src_x0:src_x1, src_y0:src_y1]
         return self._centered_tensor
-
-    # ------------------------------------------------------------------
-    # Gym API
-    # ------------------------------------------------------------------
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -477,41 +549,36 @@ class BombermanGymEnv(gym.Env):
         self.previous_features = self.features
         self.step_count += 1
 
-        # -- 1) Decide every agent's action using the PRE-step state ------
         shared = self._build_shared_state()
         actions = {}
         for handle, act_fn in zip(self.opponent_handles, self.opponent_act_fns):
             handle.reset_game_events()
             if handle.dead:
-                # Dead agents' actions are never applied -- skip the call
-                # entirely rather than computing and discarding it.
                 continue
             state = self._agent_state_dict(handle, shared)
             actions[handle] = act_fn(handle, state)
 
         self.agent.reset_game_events()
-        actions[self.agent] = self.ACTIONS[action]
+        actions[self.agent] = ACTIONS[action]
         self.agent_actions = actions
 
-        # -- 2) Apply actions in random turn order -------------------------
         order = self.rng.permutation(len(self.active_agents))
         for i in order:
             a = self.active_agents[i]
             act = actions.get(a, "WAIT")
             self._perform_agent_action(a, act)
 
-        # -- 3) Progress world elements (same order as step_world) --------
         self._collect_coins()
         self._update_explosions()
         self._update_bombs()
         self._evaluate_explosions()
 
-        # -- 4) Refresh only the channels that can have changed ------------
         self._refresh_dynamic_layers()
+        self._refresh_forecast_layers()
 
         grid_tensor = self._get_centered_tensor()
-        self.features = get_features(grid_tensor)
-        obs = {"grid_tensor": grid_tensor, "features": self.features}
+        #self.features = get_features(grid_tensor)
+        #obs = {"grid_tensor": grid_tensor, "features": self.features}
 
         self.visited[self.agent.x, self.agent.y] = True
 
@@ -522,15 +589,10 @@ class BombermanGymEnv(gym.Env):
 
         info = self._get_info()
 
-        return obs, reward, terminated, truncated, info
-
-    # ------------------------------------------------------------------
-    # Game-state dict construction (shared across agents per step)
-    # ------------------------------------------------------------------
+        return grid_tensor, reward, terminated, truncated, info
 
     def _build_shared_state(self) -> Dict[str, Any]:
-        """Computes the parts of the game_state dict that are identical for
-        every agent exactly once per step, instead of once per agent."""
+        """Parts of game_state identical for every agent, built once per step."""
         field = np.array(self.arena)
 
         explosion_map = np.zeros(self.arena.shape, dtype=np.float64)
@@ -569,14 +631,8 @@ class BombermanGymEnv(gym.Env):
         }
 
     def get_state_for_agent(self, handle: AgentHandle) -> dict:
-        """Public single-agent accessor, kept for API parity with
-        BombeRLeWorld.get_state_for_agent (e.g. used by
-        check_game_state_conversion_accuracy)."""
+        """Public single-agent accessor, API parity with BombeRLeWorld."""
         return self._agent_state_dict(handle, self._build_shared_state())
-
-    # ------------------------------------------------------------------
-    # Core game logic (behavior-preserving port of GenericWorld)
-    # ------------------------------------------------------------------
 
     def _tile_is_free(self, x, y) -> bool:
         if self.arena[x, y] != 0:
@@ -591,8 +647,8 @@ class BombermanGymEnv(gym.Env):
 
     def _move_agent(self, handle: AgentHandle, new_x, new_y):
         if handle is self.agent:
-            self.grid_tensor[3, handle.x, handle.y] = 0.0
-            self.grid_tensor[3, new_x, new_y] = 1.0
+            self.grid_tensor[SELF_LAYER, handle.x, handle.y] = 0.0
+            self.grid_tensor[SELF_LAYER, new_x, new_y] = 1.0
         handle.x, handle.y = new_x, new_y
 
     def _place_bomb(self, agent: AgentHandle):
@@ -632,7 +688,7 @@ class BombermanGymEnv(gym.Env):
             if len(matches):
                 handle = self.active_agents[int(matches[0])]
                 self.coins_collectable[ci] = False
-                self.grid_tensor[2, cx, cy] = 0.0
+                self.grid_tensor[COIN_LAYER, cx, cy] = 0.0
                 handle.update_score(s.REWARD_COIN)
                 handle.add_event(e.COIN_COLLECTED)
 
@@ -645,7 +701,7 @@ class BombermanGymEnv(gym.Env):
             if ex["timer"] <= 0:
                 ex["stage"] += 1
                 if ex["stage"] == 1:
-                    ex["timer"] = self._EXPLOSION_STAGE1_TICKS
+                    ex["timer"] = _EXPLOSION_STAGE1_TICKS
                     ex["owner"].bombs_left = True
                 else:
                     ex["stage"] = None
@@ -666,7 +722,8 @@ class BombermanGymEnv(gym.Env):
                 for (x, y) in blast:
                     if self.arena[x, y] == 1:
                         self.arena[x, y] = 0
-                        self.grid_tensor[1, x, y] = 0.0
+                        self.grid_tensor[CRATE_LAYER, x, y] = 0.0
+                        self.grid_tensor[CRATE_POTENTIAL_LAYER] -= self._blast_tensor[:, :, x, y]
                         owner.add_event(e.CRATE_DESTROYED)
                         if len(self.coins_xy):
                             coin_matches = np.nonzero(
@@ -675,7 +732,7 @@ class BombermanGymEnv(gym.Env):
                             for ci in coin_matches:
                                 if not self.coins_collectable[ci]:
                                     self.coins_collectable[ci] = True
-                                    self.grid_tensor[2, x, y] = 1.0
+                                    self.grid_tensor[COIN_LAYER, x, y] = 1.0
                                     owner.add_event(e.COIN_FOUND)
 
                 self.explosions.append({
@@ -714,10 +771,6 @@ class BombermanGymEnv(gym.Env):
             a.add_event(e.GOT_KILLED)
             for other in self.active_agents:
                 other.add_event(e.OPPONENT_ELIMINATED)
-
-    # ------------------------------------------------------------------
-    # Misc helpers / API parity with the original gym_environment.py
-    # ------------------------------------------------------------------
 
     def check_game_state_conversion_accuracy(self, obs):
         from agent_code.my_agent.input_processing import observation_to_game_state
