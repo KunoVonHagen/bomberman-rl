@@ -24,6 +24,7 @@ from agent_code.my_agent.callbacks import act as expert_act, setup as expert_set
 import tqdm
 import pickle
 import pathlib
+from model import BombermanFeatureExtractor
 
 class ExpertPolicy:
     def __init__(self, env):
@@ -214,7 +215,7 @@ CLASSIC_ENV_ARGS = WorldArgs(
 
 def get_model(env, PPO_PARAMS):
     policy_kwargs = dict(
-        features_extractor_class=BombermanCNN,
+        features_extractor_class=BombermanFeatureExtractor,
     )
 
     model = MaskablePPO(
@@ -382,8 +383,8 @@ def main(N_ENVS, TOTAL_EPOCHS, N_DEMONSTRATION_EPISODES, opponents, PPO_PARAMS):
 if __name__ == "__main__":
     PPO_PARAMS = {
         "learning_rate": 3e-4,
-        "n_steps": 1024,
-        "batch_size": 256,
+        "n_steps": 512,
+        "batch_size": 64,
         "n_epochs": 4,
         "gamma": 0.999,
         "gae_lambda": 0.97,
@@ -396,7 +397,7 @@ if __name__ == "__main__":
 
     N_DEMONSTRATION_EPISODES = 50
 
-    N_ENVS = 64
+    N_ENVS = 16
     TOTAL_EPOCHS = 1 + 50_000_000 // (PPO_PARAMS["n_steps"] * N_ENVS)
     opponents = []
 

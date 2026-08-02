@@ -72,6 +72,6 @@ def benchmark_environment(num_episodes=100, opponents=None):
 
 if __name__ == "__main__":
     benchmark_environment(
-        num_episodes=500,
-        opponents=[(my_agent_setup, my_agent_act)]*3
+        num_episodes=10000,
+        opponents=[(my_agent_setup, my_agent_act)]*0
     )
