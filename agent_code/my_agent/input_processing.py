@@ -1,7 +1,5 @@
 import numpy as np
 import settings as s
-from features import get_features
-
 
 def observation_to_game_state(obs):
     grid = obs["grid_tensor"]
@@ -118,5 +116,5 @@ def game_state_to_observation(game_state, precomputed_blast_map):
 
     return {
         "grid_tensor": grid,
-        "features": get_features(grid),
+        "features": [],
     }

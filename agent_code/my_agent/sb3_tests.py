@@ -1,33 +1,37 @@
-from gym_environment import BombermanGymEnv
+from agent_code.my_agent.gym_environment import BombermanGymEnv
 from environment import WorldArgs
 
 import time
 import numpy as np
 import os
-import torch.nn as nn
-import torch.nn.functional as F
-import torch_directml
-import gymnasium as gym
 import torch
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
 from sb3_contrib.common.wrappers import ActionMasker
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.env_util import make_vec_env
 from multiprocessing import freeze_support
 from datetime import datetime
 from imitation.data.types import Transitions, DictObs
-from imitation.algorithms import bc
 from input_processing import observation_to_game_state
 from agent_code.my_agent.callbacks import act as expert_act, setup as expert_setup
 import tqdm
-import pickle
 import pathlib
 from model import BombermanFeatureExtractor
 
 
-LAYER_CONFIG = ["base", "timer_channels"]#, "forecast", "danger_summary", "mobility"]
+LAYER_CONFIG = [
+    "base",
+    "timer_channels",
+    #"forecast",
+    #"self_distance",
+    #"opponent_distance",
+    #"crate_potential",
+    #"danger_summary",
+    #"mobility",
+    #"crate_distance",
+    #"coin_distance"
+]
 
 
 class ExpertPolicy:
@@ -136,67 +140,6 @@ def merge_transitions(old, new):
         dones=np.concatenate([old.dones, new.dones]),
         infos=np.concatenate([old.infos, new.infos]),
     )
-    
-        
-
-class BombermanCNN(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Dict,
-                 features_dim: int = 128):
-
-        super().__init__(observation_space, features_dim)
-
-        grid_space = observation_space["grid_tensor"]
-        feature_space = observation_space["features"]
-
-        n_input_channels = grid_space.shape[0]
-        n_residuals = grid_space.shape[0] * grid_space.shape[1] * grid_space.shape[2]
-
-        self.cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 32, 3, padding=1),
-            nn.ReLU(),
-
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-
-            nn.AdaptiveAvgPool2d((4,4)),
-
-            nn.Flatten(),
-        )
-
-        with torch.no_grad():
-            sample = torch.zeros(1, *grid_space.shape, dtype=torch.float32)
-            n_cnn_flatten = self.cnn(sample).shape[1]
-
-        self.grid_fc = nn.Sequential(
-            nn.Linear(n_cnn_flatten, 128),
-            nn.ReLU(),
-        )
-
-        self.features_preprocess_fc = nn.Sequential(
-            nn.Linear(feature_space.shape[0], 64),
-            nn.ReLU()
-        )
-
-        self.combined_fc = nn.Sequential(
-            nn.Linear(128 + 64, features_dim),
-            nn.ReLU()
-        )
-
-    def forward(self, observations: dict) -> torch.Tensor:
-        grid_tensor = observations["grid_tensor"].float()  # (B, C, H, W)
-        features = observations["features"].float() # (B, F)
-
-        cnn_out = self.cnn(grid_tensor)  # (B, n_cnn_flatten)
-        #flattened_grid_tensor = torch.flatten(grid_tensor, 1)
-        #cnn_plus_residuals = torch.concatenate([cnn_out, flattened_grid_tensor], dim=1)
-        cnn_fc_out = self.grid_fc(cnn_out)
-
-        features_fc_out = self.features_preprocess_fc(features)
-
-        combined = torch.cat([cnn_fc_out, features_fc_out], dim=1)
-        combined_out = self.combined_fc(combined)
-
-        return combined_out
 
 
 CLASSIC_ENV_ARGS = WorldArgs(
@@ -223,7 +166,7 @@ def get_model(env, PPO_PARAMS):
     )
 
     model = MaskablePPO(
-        "CnnPolicy",
+        "MultiInputPolicy",
         env,
         policy_kwargs=policy_kwargs,
         tensorboard_log="./tensorboard_log",
@@ -245,11 +188,6 @@ def get_env(N_ENVS, opponents):
         ), mask_fn),
         n_envs=N_ENVS,
         vec_env_cls=SubprocVecEnv
-    )
-    env = VecNormalize(
-        env,
-        norm_obs=False,
-        norm_reward=True
     )
 
     return env
@@ -288,7 +226,7 @@ def play_test_game(model, opponents):
 
 def run_epoch(N_STEPS, N_ENVS, epoch, model, opponents, training_start=None):
     model.learn(
-        total_timesteps=N_STEPS * N_ENVS,
+        total_timesteps=N_STEPS * N_ENVS * 16,
         reset_num_timesteps=False,
         tb_log_name=f"PPO_{training_start}" if training_start else "PPO"
     )
@@ -348,7 +286,7 @@ def main(N_ENVS, TOTAL_EPOCHS, N_DEMONSTRATION_EPISODES, opponents, PPO_PARAMS):
 
     dataset = None
 
-    for epoch in range(TOTAL_EPOCHS):
+    for epoch in range(TOTAL_EPOCHS // 16 + 1):
         # PPO improvement
         run_epoch(
             PPO_PARAMS["n_steps"],
@@ -391,8 +329,8 @@ def main(N_ENVS, TOTAL_EPOCHS, N_DEMONSTRATION_EPISODES, opponents, PPO_PARAMS):
 if __name__ == "__main__":
     PPO_PARAMS = {
         "learning_rate": 3e-4,
-        "n_steps": 1024,
-        "batch_size": 256,
+        "n_steps": 512,
+        "batch_size": 2048,
         "n_epochs": 4,
         "gamma": 0.999,
         "gae_lambda": 0.97,
@@ -400,12 +338,12 @@ if __name__ == "__main__":
         "clip_range_vf": None,
         "ent_coef": 0.01,
         "vf_coef": 0.5,
-        "target_kl": 0.03,
+        "target_kl": 0.05,
     }
 
     N_DEMONSTRATION_EPISODES = 50
 
-    N_ENVS = 64
+    N_ENVS = 16
     TOTAL_EPOCHS = 1 + 50_000_000 // (PPO_PARAMS["n_steps"] * N_ENVS)
     opponents = []
 

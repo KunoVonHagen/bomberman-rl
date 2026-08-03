@@ -156,6 +156,37 @@ LAYER_GROUP_DEPENDENCIES: Dict[str, List[str]] = {
 
 ALL_LAYER_GROUPS: Tuple[str, ...] = tuple(LAYER_GROUPS.keys())
 
+(
+    FEATURE_SELF_X,
+    FEATURE_SELF_Y,
+    FEATURE_BOMBS_LEFT,
+    FEATURE_STEP_PROGRESS,
+    FEATURE_COIN_DISTANCE,
+    FEATURE_CRATE_DISTANCE,
+    FEATURE_OPPONENT_DISTANCE,
+    FEATURE_BOMB_DANGER,
+    FEATURE_MOBILITY,
+    FEATURE_OPPONENTS_ALIVE,
+    FEATURE_COINS_REMAINING,
+    FEATURE_CRATES_REMAINING,
+) = range(12)
+
+FEATURE_NAMES: Tuple[str, ...] = (
+    "self_x",
+    "self_y",
+    "bombs_left",
+    "step_progress",
+    "coin_distance",
+    "crate_distance",
+    "opponent_distance",
+    "bomb_danger",
+    "mobility",
+    "opponents_alive",
+    "coins_remaining",
+    "crates_remaining",
+)
+NUM_FEATURES = len(FEATURE_NAMES)
+
 
 def resolve_layer_groups(requested: Optional[Iterable[str]]) -> Set[str]:
     """Expand a requested set of group names into the full set needed,
@@ -351,9 +382,23 @@ class BombermanGymEnv(gym.Env):
               always included.
             Disabling a group both skips its (sometimes expensive) per-step
             computation and removes its layers from the returned
-            observation tensor, so `observation_space` shrinks accordingly.
-            Use this to trade off precomputed features (which make learning
-            easier) against raw stepping speed.
+            `grid_tensor`, so `observation_space["grid_tensor"]` shrinks
+            accordingly. Use this to trade off precomputed spatial layers
+            (which make learning easier but cost fps) against raw stepping
+            speed.
+
+            Independently of `layer_config`, every observation also
+            includes a `features` vector: a fixed-size, always-fully-
+            populated set of cheap global scalars (own position, bomb
+            danger, distances to the nearest coin/crate/opponent, mobility,
+            remaining coins/crates/opponents, etc. -- see `feature_names()`
+            for the exact ordering). None of these require computing any
+            high-complexity spatial layer in full, so they're available
+            unchanged no matter which groups are enabled -- including
+            `layer_config=[]`. A few opportunistically reuse a
+            high-complexity layer's result when it's already been computed,
+            so they may end up correlated with those layers, but they never
+            depend on them being present.
         """
         super().__init__()
         self.args = args
@@ -420,28 +465,20 @@ class BombermanGymEnv(gym.Env):
         self._ms_bfs_qx = np.empty(max_nodes_ms, dtype=np.int32)
         self._ms_bfs_qy = np.empty(max_nodes_ms, dtype=np.int32)
 
-        """
         self.observation_space = spaces.Dict({
             "grid_tensor": spaces.Box(
-                low=-1,
-                high=1,
-                shape=(self.n_observation_layers, self.width, self.height),
+                low=-1.0,
+                high=1.0,
+                shape=(self.n_output_layers, self.width, self.height),
                 dtype=np.float32,
             ),
             "features": spaces.Box(
-                low=-1,
-                high=1,
-                shape=(FEATURES_DIM,),
+                low=-1.0,
+                high=1.0,
+                shape=(NUM_FEATURES,),
                 dtype=np.float32,
             ),
         })
-        """
-        self.observation_space = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(self.n_output_layers, self.width, self.height),
-            dtype=np.float32,
-        )
         self.action_space = spaces.Discrete(len(ACTIONS))
 
         wall_mask = self._build_wall_mask()
@@ -467,6 +504,10 @@ class BombermanGymEnv(gym.Env):
         self.previous_visited_count = 1
         self.visited = np.zeros((self.width, self.height), dtype=bool)
         self.previous_features = None
+        self._features = np.zeros(NUM_FEATURES, dtype=np.float32)
+        self._initial_crate_count = 0
+        self._initial_coin_count = 0
+        self._initial_n_opponents = len(self.opponent_handles)
 
         self._prev_coin_dist: Optional[float] = None
         self._prev_crate_dist: Optional[float] = None
@@ -480,6 +521,14 @@ class BombermanGymEnv(gym.Env):
     def available_layer_groups() -> Dict[str, List[int]]:
         """Introspection helper: group name -> internal layer indices."""
         return dict(LAYER_GROUPS)
+
+    @staticmethod
+    def feature_names() -> Tuple[str, ...]:
+        """Introspection helper: ordering of the `features` vector returned
+        alongside `grid_tensor` in every observation. Unlike the spatial
+        layer groups, this vector is always present in full -- it isn't
+        affected by `layer_config`."""
+        return FEATURE_NAMES
 
     def _build_wall_mask(self) -> np.ndarray:
         """Wall portion of BombeRLeWorld.build_arena (RNG-independent)."""
@@ -553,6 +602,9 @@ class BombermanGymEnv(gym.Env):
         self.arena = arena
         self.coins_xy = np.array(coins_xy, dtype=np.int64) if coins_xy else np.zeros((0, 2), dtype=np.int64)
         self.coins_collectable = np.array(coins_collectable, dtype=bool) if coins_collectable else np.zeros((0,), dtype=bool)
+
+        self._initial_crate_count = int(np.sum(arena == 1))
+        self._initial_coin_count = int(self.coins_collectable.sum())
 
         for handle, (x, y) in zip(self.all_agents, positions):
             handle.x, handle.y = int(x), int(y)
@@ -845,8 +897,10 @@ class BombermanGymEnv(gym.Env):
 
         grid_tensor = self._normalize_observation(self._get_centered_tensor())
         grid_tensor = self._select_output_layers(grid_tensor)
+        features = self._compute_global_features()
+        obs = {"grid_tensor": grid_tensor, "features": features}
         info = self._get_info()
-        return grid_tensor, info
+        return obs, info
 
     def step(self, action):
         self.step_count += 1
@@ -880,6 +934,8 @@ class BombermanGymEnv(gym.Env):
 
         grid_tensor = self._normalize_observation(self._get_centered_tensor())
         grid_tensor = self._select_output_layers(grid_tensor)
+        features = self._compute_global_features()
+        obs = {"grid_tensor": grid_tensor, "features": features}
 
         self.visited[self.agent.x, self.agent.y] = True
 
@@ -890,7 +946,7 @@ class BombermanGymEnv(gym.Env):
 
         info = self._get_info()
 
-        return grid_tensor, reward, terminated, truncated, info
+        return obs, reward, terminated, truncated, info
 
     def _build_shared_state(self) -> Dict[str, Any]:
         """Parts of game_state identical for every agent, built once per step."""
@@ -1090,8 +1146,10 @@ class BombermanGymEnv(gym.Env):
 
         from agent_code.my_agent.input_processing import observation_to_game_state
 
+        grid_tensor = obs["grid_tensor"] if isinstance(obs, dict) else obs
+
         correct_game_state = self.get_state_for_agent(self.agent)
-        computed_game_state = observation_to_game_state(obs)
+        computed_game_state = observation_to_game_state(grid_tensor)
 
         for important_key in ["field", "explosion_map"]:
             if not np.array_equal(correct_game_state[important_key], computed_game_state[important_key]):
@@ -1202,6 +1260,103 @@ class BombermanGymEnv(gym.Env):
                 if urgency > worst:
                     worst = urgency
         return worst
+
+    def _mobility_now(self) -> float:
+        """Count (0-4) of the agent's immediately-walkable orthogonal
+        neighbour tiles. O(1) -- checks the four neighbours directly via
+        `_tile_is_free`; does not require the (forecast-dependent, only
+        available when the 'mobility' group is enabled) MOBILITY_LAYER."""
+        x, y = self.agent.x, self.agent.y
+        count = 0
+        for (nx, ny) in ((x, y - 1), (x, y + 1), (x - 1, y), (x + 1, y)):
+            if self._tile_is_free(nx, ny):
+                count += 1
+        return float(count)
+
+    def _nearest_opponent_distance(self) -> float:
+        """Manhattan distance from the agent to the nearest living
+        opponent, ignoring obstacles. O(#opponents). -1.0 if none are
+        alive (including games with no opponents at all)."""
+        alive = [h for h in self.opponent_handles if not h.dead]
+        if not alive:
+            return -1.0
+        d = min(abs(h.x - self.agent.x) + abs(h.y - self.agent.y) for h in alive)
+        return float(d)
+
+    def _compute_global_features(self) -> np.ndarray:
+        """Cheap, always-on numeric summary of global game state.
+
+        Every entry is O(1) or O(#agents / #bombs / #coins / #crates) --
+        never a full-grid BFS or forecast sweep -- so this method returns a
+        complete, meaningful feature vector regardless of `layer_config`
+        (including `layer_config=[]`, where every high-complexity spatial
+        layer is disabled). A couple of entries (coin/crate distance)
+        opportunistically reuse an already-computed time-aware BFS layer
+        when its group happens to be enabled, but fall back to an equally
+        cheap raw Manhattan estimate otherwise -- so they're never a hard
+        dependency on the expensive layers, just occasionally correlated
+        with them.
+
+        Every value is scaled to sit inside [-1, 1] for easy consumption by
+        a neural net: fixed-range quantities (position, elapsed time,
+        danger, mobility, remaining coins/crates/opponents) are simple
+        fractions in [0, 1]; open-ended distances use the same "-1 means
+        not applicable / none left, otherwise a clipped fraction of the
+        board size in [0, 1]" sentinel convention already used for the
+        distance-like grid layers in `_normalize_observation`.
+        """
+        f = self._features
+        W1 = max(self.width - 1, 1)
+        H1 = max(self.height - 1, 1)
+
+        f[FEATURE_SELF_X] = 2.0 * self.agent.x / W1 - 1.0
+        f[FEATURE_SELF_Y] = 2.0 * self.agent.y / H1 - 1.0
+
+        f[FEATURE_BOMBS_LEFT] = 1.0 if self.agent.bombs_left else 0.0
+
+        f[FEATURE_STEP_PROGRESS] = np.clip(self.step_count / s.MAX_STEPS, 0.0, 1.0)
+
+        coin_dist = self._coin_distance_now()
+        f[FEATURE_COIN_DISTANCE] = (
+            -1.0 if coin_dist < 0 else np.clip(coin_dist / self._DIST_MAX, 0.0, 1.0)
+        )
+
+        crate_dist = self._crate_distance_now()
+        f[FEATURE_CRATE_DISTANCE] = (
+            -1.0 if crate_dist < 0 else np.clip(crate_dist / self._DIST_MAX, 0.0, 1.0)
+        )
+
+        opp_dist = self._nearest_opponent_distance()
+        f[FEATURE_OPPONENT_DISTANCE] = (
+            -1.0 if opp_dist < 0 else np.clip(opp_dist / self._DIST_MAX, 0.0, 1.0)
+        )
+
+        f[FEATURE_BOMB_DANGER] = self._bomb_danger_now()
+
+        f[FEATURE_MOBILITY] = self._mobility_now() / 4.0
+
+        if self._initial_n_opponents > 0:
+            n_alive = sum(1 for h in self.opponent_handles if not h.dead)
+            f[FEATURE_OPPONENTS_ALIVE] = n_alive / self._initial_n_opponents
+        else:
+            f[FEATURE_OPPONENTS_ALIVE] = 0.0
+
+        if self._initial_coin_count > 0:
+            f[FEATURE_COINS_REMAINING] = (
+                float(self.coins_collectable.sum()) / self._initial_coin_count
+            )
+        else:
+            f[FEATURE_COINS_REMAINING] = 0.0
+
+        if self._initial_crate_count > 0:
+            f[FEATURE_CRATES_REMAINING] = (
+                float(np.sum(self.arena == 1)) / self._initial_crate_count
+            )
+        else:
+            f[FEATURE_CRATES_REMAINING] = 0.0
+
+        self.previous_features = f.copy()
+        return f
 
     def shaped_reward(self):
         reward = 0.0
