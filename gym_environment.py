@@ -273,6 +273,11 @@ class BombermanGymEnv(gym.Env):
         self._BT = s.BOMB_TIMER
         self._ET = s.EXPLOSION_TIMER
 
+
+        self._T_HORIZON = float(self._BT + self._ET)
+        self._CRATE_POTENTIAL_MAX = float(4 * s.BOMB_POWER)
+        self._DIST_MAX = float(self.width * self.height)
+
         self.grid_tensor = np.zeros((self.n_observation_layers, self.width, self.height), dtype=np.float32)
         self._centered_tensor = np.zeros_like(self.grid_tensor)
         self.features = np.zeros(FEATURES_DIM, dtype=np.float32)
@@ -281,7 +286,7 @@ class BombermanGymEnv(gym.Env):
         self.observation_space = spaces.Dict({
             "grid_tensor": spaces.Box(
                 low=-1,
-                high=self.width * self.height,
+                high=1,
                 shape=(self.n_observation_layers, self.width, self.height),
                 dtype=np.float32,
             ),
@@ -294,8 +299,8 @@ class BombermanGymEnv(gym.Env):
         })
         """
         self.observation_space = spaces.Box(
-            low=-1,
-            high=self.width * self.height,
+            low=-1.0,
+            high=1.0,
             shape=(self.n_observation_layers, self.width, self.height),
             dtype=np.float32,
         )
@@ -624,6 +629,52 @@ class BombermanGymEnv(gym.Env):
             self.grid_tensor[:, src_x0:src_x1, src_y0:src_y1]
         return self._centered_tensor
 
+    def _normalize_observation(self, tensor: np.ndarray) -> np.ndarray:
+        """Rescale every layer onto a common, network-friendly range.
+
+        This is applied only to the tensor that leaves the environment
+        (the already-copied centered tensor) -- ``self.grid_tensor`` itself
+        stays in raw units, since some layers (e.g. CRATE_POTENTIAL_LAYER)
+        are read/updated incrementally elsewhere in raw form.
+
+        Layer groups:
+          - Indicator / occupancy / per-timer channels (walls, crates,
+            coins, self, self-blast, opponents, opponent-danger,
+            bombs-left, bomb/explosion timer channels, the danger-forecast
+            stack, the occupancy-forecast stack): already strictly {0, 1}.
+            Left untouched -> range [0, 1].
+          - Time-to-reach layers (self/opponents distance, danger onset,
+            danger clear): raw values are -1 ("never"/unreachable) or
+            0..T where T is the forecast horizon. Rescaled so reachable
+            values land in [0, 1] and the sentinel stays at -1 -> [-1, 1].
+          - Crate potential (small non-negative integer count): divided by
+            the max crates a single bomb can destroy, clipped -> [0, 1].
+          - Mobility (0-4 free neighbours): divided by 4 -> [0, 1].
+          - Static BFS distance to nearest crate/coin: same -1 sentinel
+            treatment, divided by a safe upper bound on path length,
+            clipped -> [-1, 1].
+        """
+        T = self._T_HORIZON
+
+        for layer in (SELF_DISTANCE_LAYER, OPPONENTS_LEAST_DISTANCE_LAYER,
+                      DANGER_ONSET_LAYER, DANGER_CLEAR_LAYER):
+            raw = tensor[layer]
+            tensor[layer] = np.where(raw < 0, -1.0, raw / T)
+
+        tensor[CRATE_POTENTIAL_LAYER] = np.clip(
+            tensor[CRATE_POTENTIAL_LAYER] / self._CRATE_POTENTIAL_MAX, 0.0, 1.0
+        )
+
+        tensor[MOBILITY_LAYER] = tensor[MOBILITY_LAYER] / 4.0
+
+        for layer in (CRATE_DISTANCE_LAYER, COIN_DISTANCE_LAYER):
+            raw = tensor[layer]
+            tensor[layer] = np.where(
+                raw < 0, -1.0, np.clip(raw / self._DIST_MAX, 0.0, 1.0)
+            )
+
+        return tensor
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
@@ -634,7 +685,7 @@ class BombermanGymEnv(gym.Env):
 
         self.new_round()
 
-        grid_tensor = self._get_centered_tensor()
+        grid_tensor = self._normalize_observation(self._get_centered_tensor())
         #self.features = get_features(grid_tensor)
         #obs = {"grid_tensor": grid_tensor, "features": self.features}
         info = self._get_info()
@@ -671,7 +722,7 @@ class BombermanGymEnv(gym.Env):
         self._refresh_dynamic_layers()
         self._refresh_forecast_layers()
 
-        grid_tensor = self._get_centered_tensor()
+        grid_tensor = self._normalize_observation(self._get_centered_tensor())
         #self.features = get_features(grid_tensor)
         #obs = {"grid_tensor": grid_tensor, "features": self.features}
 
