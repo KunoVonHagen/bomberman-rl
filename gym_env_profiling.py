@@ -29,7 +29,11 @@ def benchmark_environment(num_episodes=100, opponents=None):
     if opponents is None:
         opponents = []
 
-    env = BombermanGymEnv(CLASSIC_ENV_ARGS, opponents=opponents)
+    env = BombermanGymEnv(
+        CLASSIC_ENV_ARGS,
+        opponents=opponents,
+        layer_config=["base", "timer_channels"]#, "forecast", "danger_summary", "mobility"]
+    )
 
     total_steps = 0
     total_time = 0.0
@@ -72,6 +76,6 @@ def benchmark_environment(num_episodes=100, opponents=None):
 
 if __name__ == "__main__":
     benchmark_environment(
-        num_episodes=10000,
+        num_episodes=5000,
         opponents=[(my_agent_setup, my_agent_act)]*0
     )

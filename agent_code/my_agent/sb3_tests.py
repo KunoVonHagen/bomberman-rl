@@ -26,6 +26,10 @@ import pickle
 import pathlib
 from model import BombermanFeatureExtractor
 
+
+LAYER_CONFIG = ["base", "timer_channels"]#, "forecast", "danger_summary", "mobility"]
+
+
 class ExpertPolicy:
     def __init__(self, env):
         self.env = env
@@ -219,7 +223,7 @@ def get_model(env, PPO_PARAMS):
     )
 
     model = MaskablePPO(
-        "MultiInputPolicy",
+        "CnnPolicy",
         env,
         policy_kwargs=policy_kwargs,
         tensorboard_log="./tensorboard_log",
@@ -234,7 +238,11 @@ def mask_fn(env):
 
 def get_env(N_ENVS, opponents):
     env = make_vec_env(
-        lambda: ActionMasker(BombermanGymEnv(CLASSIC_ENV_ARGS, opponents=opponents), mask_fn),
+        lambda: ActionMasker(BombermanGymEnv(
+            CLASSIC_ENV_ARGS,
+            opponents=opponents,
+            layer_config=LAYER_CONFIG
+        ), mask_fn),
         n_envs=N_ENVS,
         vec_env_cls=SubprocVecEnv
     )
@@ -266,7 +274,7 @@ def play_test_game(model, opponents):
         continue_without_training=False
     )
 
-    test_env = BombermanGymEnv(test_env_args, opponents=opponents)
+    test_env = BombermanGymEnv(test_env_args, opponents=opponents, layer_config=LAYER_CONFIG)
     grid_tensor, _ = test_env.reset()
     done = False
     while not done:
@@ -280,18 +288,18 @@ def play_test_game(model, opponents):
 
 def run_epoch(N_STEPS, N_ENVS, epoch, model, opponents, training_start=None):
     model.learn(
-        total_timesteps=N_STEPS * N_ENVS + 1,
+        total_timesteps=N_STEPS * N_ENVS,
         reset_num_timesteps=False,
         tb_log_name=f"PPO_{training_start}" if training_start else "PPO"
     )
 
-    play_test_game(model, opponents)
+    #play_test_game(model, opponents)
 
     model.save(f"models/ppo_bomberman_{(epoch + 1) * N_STEPS * N_ENVS}")
 
 
 def env_step_test(TEST_ROUNDS):
-    env = BombermanGymEnv(CLASSIC_ENV_ARGS, opponents=[])
+    env = BombermanGymEnv(CLASSIC_ENV_ARGS, opponents=[], layer_config=LAYER_CONFIG)
 
     total_start_time = time.time()
 
@@ -325,7 +333,7 @@ def env_step_test(TEST_ROUNDS):
 
 
 def get_demo_environment(opponents):
-    env = BombermanGymEnv(CLASSIC_ENV_ARGS, opponents=opponents)
+    env = BombermanGymEnv(CLASSIC_ENV_ARGS, opponents=opponents, layer_config=LAYER_CONFIG)
     return env
 
 
@@ -383,8 +391,8 @@ def main(N_ENVS, TOTAL_EPOCHS, N_DEMONSTRATION_EPISODES, opponents, PPO_PARAMS):
 if __name__ == "__main__":
     PPO_PARAMS = {
         "learning_rate": 3e-4,
-        "n_steps": 512,
-        "batch_size": 64,
+        "n_steps": 1024,
+        "batch_size": 256,
         "n_epochs": 4,
         "gamma": 0.999,
         "gae_lambda": 0.97,
@@ -397,7 +405,7 @@ if __name__ == "__main__":
 
     N_DEMONSTRATION_EPISODES = 50
 
-    N_ENVS = 16
+    N_ENVS = 64
     TOTAL_EPOCHS = 1 + 50_000_000 // (PPO_PARAMS["n_steps"] * N_ENVS)
     opponents = []
 
