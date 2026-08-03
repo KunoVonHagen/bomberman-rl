@@ -129,15 +129,14 @@ COIN_DISTANCE_LAYER = CRATE_DISTANCE_LAYER + 1
 
 NUM_LAYERS = COIN_DISTANCE_LAYER + 1
 
-@njit(cache=True)
-def _time_aware_bfs_kernel(starts, occ, W, H, T):
-    dist = np.full((W, H), -1.0, dtype=np.float32)
-    visited = np.zeros((W, H, T + 1), dtype=np.bool_)
+_DANGER_SLICE = slice(DANGER_MAP_LAYERS[0], DANGER_MAP_LAYERS[-1] + 1)
+_OCC_SLICE = slice(OCCUPIED_MAP_LAYERS[0], OCCUPIED_MAP_LAYERS[-1] + 1)
 
-    max_nodes = W * H * (T + 1)
-    qx = np.empty(max_nodes, dtype=np.int32)
-    qy = np.empty(max_nodes, dtype=np.int32)
-    qt = np.empty(max_nodes, dtype=np.int32)
+
+@njit(cache=True)
+def _time_aware_bfs_kernel(starts, occ, W, H, T, dist, visited, qx, qy, qt):
+    dist[:, :] = -1.0
+    visited[:, :, :] = False
     head = 0
     tail = 0
 
@@ -192,14 +191,10 @@ def _time_aware_bfs_kernel(starts, occ, W, H, T):
             qt[tail] = next_t
             tail += 1
 
-    return dist
-
 
 @njit(cache=True)
-def _multi_source_bfs_kernel(targets, occ, W, H):
-    dist = np.full((W, H), -1.0, dtype=np.float32)
-    qx = np.empty(W * H, dtype=np.int32)
-    qy = np.empty(W * H, dtype=np.int32)
+def _multi_source_bfs_kernel(targets, occ, W, H, dist, qx, qy):
+    dist[:, :] = -1.0
     head = 0
     tail = 0
 
@@ -235,7 +230,48 @@ def _multi_source_bfs_kernel(targets, occ, W, H):
             qy[tail] = ny
             tail += 1
 
-    return dist
+
+@njit(cache=True)
+def _forecast_kernel(bomb_x, bomb_y, bomb_timer, blast_tensor,
+                      exp_x, exp_y, exp_timer,
+                      wall, crate, T, ET, danger_out, occ_out):
+    """Fused danger-forecast + occupancy-forecast computation."""
+    W, H = wall.shape
+    remaining_crates = crate.copy()
+
+    for t in range(T):
+        d = danger_out[t]
+        d[:, :] = 0.0
+        for i in range(exp_x.shape[0]):
+            if exp_timer[i] - t > 0:
+                d[exp_x[i], exp_y[i]] = 1.0
+        for i in range(bomb_x.shape[0]):
+            bt = bomb_timer[i]
+            if bt <= t < bt + ET:
+                blast = blast_tensor[bomb_x[i], bomb_y[i]]
+                for xx in range(W):
+                    for yy in range(H):
+                        if blast[xx, yy] > d[xx, yy]:
+                            d[xx, yy] = blast[xx, yy]
+
+        for xx in range(W):
+            for yy in range(H):
+                if d[xx, yy] > 0.0:
+                    remaining_crates[xx, yy] = False
+
+        o = occ_out[t]
+        for xx in range(W):
+            for yy in range(H):
+                v = wall[xx, yy] or remaining_crates[xx, yy]
+                o[xx, yy] = v or d[xx, yy] > 0.0
+        for i in range(bomb_x.shape[0]):
+            if bomb_timer[i] >= t:
+                o[bomb_x[i], bomb_y[i]] = True
+
+    of = occ_out[T]
+    for xx in range(W):
+        for yy in range(H):
+            of[xx, yy] = wall[xx, yy] or remaining_crates[xx, yy]
 
 
 class BombermanGymEnv(gym.Env):
@@ -282,6 +318,17 @@ class BombermanGymEnv(gym.Env):
         self._centered_tensor = np.zeros_like(self.grid_tensor)
         self.features = np.zeros(FEATURES_DIM, dtype=np.float32)
 
+        T_bfs = self._BT + self._ET
+        self._ta_bfs_visited = np.zeros((self.width, self.height, T_bfs + 1), dtype=np.bool_)
+        max_nodes_ta = self.width * self.height * (T_bfs + 1)
+        self._ta_bfs_qx = np.empty(max_nodes_ta, dtype=np.int32)
+        self._ta_bfs_qy = np.empty(max_nodes_ta, dtype=np.int32)
+        self._ta_bfs_qt = np.empty(max_nodes_ta, dtype=np.int32)
+
+        max_nodes_ms = self.width * self.height
+        self._ms_bfs_qx = np.empty(max_nodes_ms, dtype=np.int32)
+        self._ms_bfs_qy = np.empty(max_nodes_ms, dtype=np.int32)
+
         """
         self.observation_space = spaces.Dict({
             "grid_tensor": spaces.Box(
@@ -309,22 +356,14 @@ class BombermanGymEnv(gym.Env):
         wall_mask = self._build_wall_mask()
         self._wall_layer = np.where(wall_mask == -1, 1.0, 0.0).astype(np.float32)
         self._wall_bool = self._wall_layer.astype(bool)
-        self._empty_map = np.zeros((self.width, self.height), dtype=np.float32)
-        self._occ_scratch = np.zeros((self.width, self.height), dtype=bool)
         self.PRECOMPUTED_BLAST_COORDS: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
-        self.PRECOMPUTED_BLAST_MAP: Dict[Tuple[int, int], np.ndarray] = {}
+        self._blast_tensor = np.zeros((self.width, self.height, self.width, self.height), dtype=np.float32)
         for x, y in np.argwhere(wall_mask != -1):
             x, y = int(x), int(y)
             coords = self._compute_blast_coords(x, y, wall_mask, s.BOMB_POWER)
             self.PRECOMPUTED_BLAST_COORDS[(x, y)] = coords
-            bmap = np.zeros((self.width, self.height), dtype=np.float32)
             xs_, ys_ = zip(*coords)
-            bmap[list(xs_), list(ys_)] = 1.0
-            self.PRECOMPUTED_BLAST_MAP[(x, y)] = bmap
-
-        self._blast_tensor = np.zeros((self.width, self.height, self.width, self.height), dtype=np.float32)
-        for (bx, by), bmap in self.PRECOMPUTED_BLAST_MAP.items():
-            self._blast_tensor[bx, by] = bmap
+            self._blast_tensor[x, y, list(xs_), list(ys_)] = 1.0
 
         self.round = 0
         self.step_count = 0
@@ -457,12 +496,12 @@ class BombermanGymEnv(gym.Env):
         gt[4:_BASE_LAYERS].fill(0)
 
         ax, ay = self.agent.x, self.agent.y
-        gt[SELF_BLAST_LAYER] = self.PRECOMPUTED_BLAST_MAP.get((ax, ay), self._empty_map)
+        gt[SELF_BLAST_LAYER] = self._blast_tensor[ax, ay]
 
         for h in self.opponent_handles:
             ex_, ey_ = h.x, h.y
             gt[OPPONENT_LAYER, ex_, ey_] = 1.0
-            gt[OPPONENT_DANGER_LAYER] += self.PRECOMPUTED_BLAST_MAP.get((ex_, ey_), self._empty_map)
+            gt[OPPONENT_DANGER_LAYER] += self._blast_tensor[ex_, ey_]
             gt[BOMBS_LEFT_LAYER, ex_, ey_] = 1.0 if h.bombs_left else 0.0
 
         gt[OPPONENT_DANGER_LAYER] = np.where(gt[OPPONENT_DANGER_LAYER] > 0, 1.0, 0.0)
@@ -472,7 +511,7 @@ class BombermanGymEnv(gym.Env):
             pos_ch = 8 + b["timer"]
             danger_ch = 8 + BT + b["timer"]
             gt[pos_ch, b["x"], b["y"]] = 1.0
-            gt[danger_ch] = self.PRECOMPUTED_BLAST_MAP.get((b["x"], b["y"]), self._empty_map)
+            gt[danger_ch] = self._blast_tensor[b["x"], b["y"]]
 
         for ex in self.explosions:
             if ex["stage"] == 0:
@@ -487,55 +526,48 @@ class BombermanGymEnv(gym.Env):
             "xyij,ij->xy", self._blast_tensor, self.grid_tensor[CRATE_LAYER]
         )
 
-    def _compute_danger_forecast(self):
-        """danger[t] = cells dangerous t steps from now, assuming no new
-        bombs. Iterates only over currently active bombs/explosions."""
+    def _compute_forecasts(self):
+        """Fused replacement for the former _compute_danger_forecast +
+        _compute_occupancy_forecast pair."""
         gt = self.grid_tensor
         T = self._BT + self._ET
         active_explosions = [ex for ex in self.explosions if ex["stage"] == 0]
 
         if not self.bombs and not active_explosions:
-            gt[DANGER_MAP_LAYERS[0]:DANGER_MAP_LAYERS[-1] + 1] = 0.0
-            return
-
-        for t in range(T):
-            danger = gt[DANGER_MAP_LAYERS[t]]
-            danger.fill(0.0)
-            for ex in active_explosions:
-                if ex["timer"] - t > 0:
-                    for (x, y) in ex["coords"]:
-                        danger[x, y] = 1.0
-            for b in self.bombs:
-                if b["timer"] <= t < b["timer"] + self._ET:
-                    np.maximum(danger, self.PRECOMPUTED_BLAST_MAP.get((b["x"], b["y"]), self._empty_map), out=danger)
-
-    def _compute_occupancy_forecast(self):
-        """occ[t] = walls | surviving crates | pending bombs | danger, at t
-        steps from now. Needs danger[t] computed first."""
-        gt = self.grid_tensor
-        T = self._BT + self._ET
-
-        if not self.bombs and not self.explosions:
+            gt[_DANGER_SLICE] = 0.0
             static = (self._wall_bool | gt[CRATE_LAYER].astype(bool)).astype(np.float32)
-            for layer in OCCUPIED_MAP_LAYERS:
-                gt[layer] = static
+            gt[_OCC_SLICE] = static
             return
 
-        remaining_crates = gt[CRATE_LAYER].astype(bool)
-        occ = self._occ_scratch
-        for t in range(T):
-            danger_t = gt[DANGER_MAP_LAYERS[t]].astype(bool)
-            remaining_crates &= ~danger_t
+        if self.bombs:
+            bomb_x = np.fromiter((b["x"] for b in self.bombs), dtype=np.int64, count=len(self.bombs))
+            bomb_y = np.fromiter((b["y"] for b in self.bombs), dtype=np.int64, count=len(self.bombs))
+            bomb_timer = np.fromiter((b["timer"] for b in self.bombs), dtype=np.int64, count=len(self.bombs))
+        else:
+            bomb_x = bomb_y = bomb_timer = np.zeros(0, dtype=np.int64)
 
-            np.logical_or(self._wall_bool, remaining_crates, out=occ)
-            for b in self.bombs:
-                if b["timer"] >= t:
-                    occ[b["x"], b["y"]] = True
-            occ |= danger_t
+        if active_explosions:
+            exp_x_list, exp_y_list, exp_timer_list = [], [], []
+            for ex in active_explosions:
+                for (x, y) in ex["coords"]:
+                    exp_x_list.append(x)
+                    exp_y_list.append(y)
+                    exp_timer_list.append(ex["timer"])
+            exp_x = np.array(exp_x_list, dtype=np.int64)
+            exp_y = np.array(exp_y_list, dtype=np.int64)
+            exp_timer = np.array(exp_timer_list, dtype=np.int64)
+        else:
+            exp_x = exp_y = exp_timer = np.zeros(0, dtype=np.int64)
 
-            gt[OCCUPIED_MAP_LAYERS[t]] = occ
+        danger_out = gt[_DANGER_SLICE]
+        occ_out = gt[_OCC_SLICE]
 
-        gt[OCCUPIED_MAP_LAYERS[-1]] = (self._wall_bool | remaining_crates).astype(np.float32)
+        _forecast_kernel(
+            bomb_x, bomb_y, bomb_timer, self._blast_tensor,
+            exp_x, exp_y, exp_timer,
+            self._wall_bool, gt[CRATE_LAYER].astype(bool),
+            T, self._ET, danger_out, occ_out,
+        )
 
     def _time_aware_bfs(self, starts, out_layer):
         """Earliest arrival time at every cell, respecting the occupancy
@@ -550,13 +582,17 @@ class BombermanGymEnv(gym.Env):
         else:
             starts_arr = np.zeros((0, 2), dtype=np.int64)
 
-        occ = gt[OCCUPIED_MAP_LAYERS[0]:OCCUPIED_MAP_LAYERS[-1] + 1]
-        gt[out_layer] = _time_aware_bfs_kernel(starts_arr, occ, W, H, T)
+        occ = gt[_OCC_SLICE]
+        _time_aware_bfs_kernel(
+            starts_arr, occ, W, H, T,
+            gt[out_layer], self._ta_bfs_visited,
+            self._ta_bfs_qx, self._ta_bfs_qy, self._ta_bfs_qt,
+        )
 
     def _compute_danger_summary(self):
         """Onset/clear timestep of the danger forecast, per cell (-1 = never)."""
         gt = self.grid_tensor
-        stack = gt[DANGER_MAP_LAYERS[0]:DANGER_MAP_LAYERS[-1] + 1]
+        stack = gt[_DANGER_SLICE]
         ever = stack.any(axis=0)
 
         onset = np.argmax(stack, axis=0)
@@ -577,17 +613,18 @@ class BombermanGymEnv(gym.Env):
         m[:, :-1] += free[:, 1:]
         gt[MOBILITY_LAYER] = m
 
-    def _multi_source_bfs(self, targets: np.ndarray, occ: np.ndarray) -> np.ndarray:
+    def _multi_source_bfs(self, targets: np.ndarray, occ: np.ndarray, out: np.ndarray) -> None:
         """Static (non-time-aware) BFS distance from every cell to the
         nearest True cell in `targets`, under fixed occupancy `occ`.
         Delegates to a JIT-compiled kernel implementing the identical
         FIFO/BFS algorithm (distances are order-independent, so this is a
-        drop-in replacement)."""
+        drop-in replacement). Writes the result directly into `out`
+        (a view into grid_tensor) using reused scratch queue buffers."""
         W, H = self.width, self.height
-        return _multi_source_bfs_kernel(
+        _multi_source_bfs_kernel(
             np.ascontiguousarray(targets, dtype=np.bool_),
             np.ascontiguousarray(occ, dtype=np.bool_),
-            W, H,
+            W, H, out, self._ms_bfs_qx, self._ms_bfs_qy,
         )
 
     def _compute_distance_fields(self):
@@ -595,14 +632,13 @@ class BombermanGymEnv(gym.Env):
         occ_now = gt[OCCUPIED_MAP_LAYERS[0]].astype(bool)
 
         crate_targets = (gt[CRATE_POTENTIAL_LAYER] > 0) & ~occ_now
-        gt[CRATE_DISTANCE_LAYER] = self._multi_source_bfs(crate_targets, occ_now)
+        self._multi_source_bfs(crate_targets, occ_now, gt[CRATE_DISTANCE_LAYER])
 
         coin_targets = gt[COIN_LAYER].astype(bool)
-        gt[COIN_DISTANCE_LAYER] = self._multi_source_bfs(coin_targets, occ_now)
+        self._multi_source_bfs(coin_targets, occ_now, gt[COIN_DISTANCE_LAYER])
 
     def _refresh_forecast_layers(self):
-        self._compute_danger_forecast()
-        self._compute_occupancy_forecast()
+        self._compute_forecasts()
         self._time_aware_bfs([(self.agent.x, self.agent.y)], SELF_DISTANCE_LAYER)
         opponent_positions = [(h.x, h.y) for h in self.opponent_handles if not h.dead]
         self._time_aware_bfs(opponent_positions, OPPONENTS_LEAST_DISTANCE_LAYER)
@@ -828,15 +864,21 @@ class BombermanGymEnv(gym.Env):
         if len(collectable_idx) == 0 or not self.active_agents:
             return
         active_pos = np.array([[a.x, a.y] for a in self.active_agents], dtype=np.int64)
-        for ci in collectable_idx:
+        coin_pos = self.coins_xy[collectable_idx]                      # (C, 2)
+        eq = (coin_pos[:, None, :] == active_pos[None, :, :]).all(-1)  # (C, A)
+        hit_coin, hit_agent = np.nonzero(eq)
+        seen = set()
+        for ci_local, ai in zip(hit_coin, hit_agent):
+            ci = int(collectable_idx[ci_local])
+            if ci in seen:
+                continue
+            seen.add(ci)
             cx, cy = self.coins_xy[ci]
-            matches = np.nonzero((active_pos[:, 0] == cx) & (active_pos[:, 1] == cy))[0]
-            if len(matches):
-                handle = self.active_agents[int(matches[0])]
-                self.coins_collectable[ci] = False
-                self.grid_tensor[COIN_LAYER, cx, cy] = 0.0
-                handle.update_score(s.REWARD_COIN)
-                handle.add_event(e.COIN_COLLECTED)
+            handle = self.active_agents[int(ai)]
+            self.coins_collectable[ci] = False
+            self.grid_tensor[COIN_LAYER, cx, cy] = 0.0
+            handle.update_score(s.REWARD_COIN)
+            handle.add_event(e.COIN_COLLECTED)
 
     def _update_explosions(self):
         if not self.explosions:
