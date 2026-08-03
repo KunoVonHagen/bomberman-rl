@@ -27,12 +27,23 @@ CLASSIC_ENV_ARGS = WorldArgs(
 
 def benchmark_environment(num_episodes=100, opponents=None):
     if opponents is None:
-        opponents = []
+        opponents = [(my_agent_setup, my_agent_act)] * 3
 
     env = BombermanGymEnv(
         CLASSIC_ENV_ARGS,
         opponents=opponents,
-        layer_config=["base", "timer_channels"]#, "forecast", "danger_summary", "mobility"]
+        layer_config=[
+            "base",
+            "timer_channels",
+            #"forecast",
+            #"self_distance",
+            #"opponent_distance",
+            #"crate_potential",
+            #"danger_summary",
+            #"mobility",
+            #"crate_distance",
+            #"coin_distance"
+        ]
     )
 
     total_steps = 0
@@ -76,6 +87,6 @@ def benchmark_environment(num_episodes=100, opponents=None):
 
 if __name__ == "__main__":
     benchmark_environment(
-        num_episodes=5000,
+        num_episodes=1000,
         opponents=[(my_agent_setup, my_agent_act)]*0
     )
