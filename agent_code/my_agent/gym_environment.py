@@ -22,14 +22,13 @@ except ImportError:  # pragma: no cover - graceful, correctness-preserving fallb
 
 import settings as s
 import events as e
-
-from agent_code.my_agent.features import (
-    get_features,
-    FEATURES_DIM,
-    EVENT_REWARDS,
-    FEATURE_REWARDS,
-    FEATURE_DIFF_REWARDS,
+from rewards import (
     SIMPLE_EVENT_REWARDS,
+    EVENT_REWARDS,
+    CRATE_SHAPING_COEF,
+    COIN_SHAPING_COEF,
+    ESCAPE_BONUS_COEF,
+    DANGER_PENALTY_COEF
 )
 
 # Kept for drop-in compatibility with callers that construct WorldArgs(...).
@@ -409,7 +408,6 @@ class BombermanGymEnv(gym.Env):
 
         self.grid_tensor = np.zeros((self.n_observation_layers, self.width, self.height), dtype=np.float32)
         self._centered_tensor = np.zeros_like(self.grid_tensor)
-        self.features = np.zeros(FEATURES_DIM, dtype=np.float32)
 
         T_bfs = self._BT + self._ET
         self._ta_bfs_visited = np.zeros((self.width, self.height, T_bfs + 1), dtype=np.bool_)
@@ -469,6 +467,10 @@ class BombermanGymEnv(gym.Env):
         self.previous_visited_count = 1
         self.visited = np.zeros((self.width, self.height), dtype=bool)
         self.previous_features = None
+
+        self._prev_coin_dist: Optional[float] = None
+        self._prev_crate_dist: Optional[float] = None
+        self._prev_bomb_danger: float = 0.0
 
         self.agent_actions = {}
 
@@ -568,6 +570,10 @@ class BombermanGymEnv(gym.Env):
         self.visited.fill(False)
         self.previous_features = None
         self.agent_actions = {}
+
+        self._prev_coin_dist = self._coin_distance_now()
+        self._prev_crate_dist = self._crate_distance_now() if self.agent.bombs_left else None
+        self._prev_bomb_danger = self._bomb_danger_now()
 
     def _rebuild_full_grid_tensor(self):
         """Full rebuild -- only once per round, cost amortized over the round."""
@@ -839,13 +845,10 @@ class BombermanGymEnv(gym.Env):
 
         grid_tensor = self._normalize_observation(self._get_centered_tensor())
         grid_tensor = self._select_output_layers(grid_tensor)
-        #self.features = get_features(grid_tensor)
-        #obs = {"grid_tensor": grid_tensor, "features": self.features}
         info = self._get_info()
         return grid_tensor, info
 
     def step(self, action):
-        self.previous_features = self.features
         self.step_count += 1
 
         shared = self._build_shared_state()
@@ -877,8 +880,6 @@ class BombermanGymEnv(gym.Env):
 
         grid_tensor = self._normalize_observation(self._get_centered_tensor())
         grid_tensor = self._select_output_layers(grid_tensor)
-        #self.features = get_features(grid_tensor)
-        #obs = {"grid_tensor": grid_tensor, "features": self.features}
 
         self.visited[self.agent.x, self.agent.y] = True
 
@@ -1145,9 +1146,65 @@ class BombermanGymEnv(gym.Env):
             return False
         return True
 
-    def shaped_reward(self):
-        reward = 0
+    def _nearest_coin_distance(self) -> float:
+        """Manhattan distance from the agent to the nearest collectable
+        coin, ignoring obstacles. O(#coins). -1.0 if none remain."""
+        idx = np.nonzero(self.coins_collectable)[0]
+        if len(idx) == 0:
+            return -1.0
+        coin_xy = self.coins_xy[idx]
+        d = np.abs(coin_xy[:, 0] - self.agent.x) + np.abs(coin_xy[:, 1] - self.agent.y)
+        return float(d.min())
 
+    def _nearest_crate_distance(self) -> float:
+        """Manhattan distance from the agent to the nearest crate,
+        ignoring obstacles. O(#crates). -1.0 if none remain."""
+        xs, ys = np.nonzero(self.arena == 1)
+        if len(xs) == 0:
+            return -1.0
+        d = np.abs(xs - self.agent.x) + np.abs(ys - self.agent.y)
+        return float(d.min())
+
+    def _coin_distance_now(self) -> float:
+        """Distance from the agent to the nearest coin. Uses the
+        already-computed occupancy-aware BFS layer when available (its
+        cost is already paid for the observation); otherwise falls back
+        to the cheap Manhattan estimate above. -1.0 if no coins remain."""
+        if self._enable_coin_distance:
+            d = float(self.grid_tensor[COIN_DISTANCE_LAYER, self.agent.x, self.agent.y])
+            if d >= 0:
+                return d
+        return self._nearest_coin_distance()
+
+    def _crate_distance_now(self) -> float:
+        """Distance from the agent to the nearest (still-useful) crate,
+        same BFS-layer-first / Manhattan-fallback strategy as coins."""
+        if self._enable_crate_distance:
+            d = float(self.grid_tensor[CRATE_DISTANCE_LAYER, self.agent.x, self.agent.y])
+            if d >= 0:
+                return d
+        return self._nearest_crate_distance()
+
+    def _bomb_danger_now(self) -> float:
+        """Danger score in [0, 1] for the agent's current tile: the max,
+        over active bombs whose blast already covers this tile, of how
+        close that bomb is to detonating (1.0 = about to explode).
+        0.0 if the tile is safe. O(#bombs) via the precomputed blast
+        tensor -- no BFS or forecast layers needed, so this is always
+        available regardless of `layer_config`."""
+        if not self.bombs:
+            return 0.0
+        ax, ay = self.agent.x, self.agent.y
+        worst = 0.0
+        for b in self.bombs:
+            if self._blast_tensor[b["x"], b["y"], ax, ay] > 0:
+                urgency = (s.BOMB_TIMER - b["timer"] + 1) / (s.BOMB_TIMER + 1)
+                if urgency > worst:
+                    worst = urgency
+        return worst
+
+    def shaped_reward(self):
+        reward = 0.0
 
         for event in self.agent.events:
             reward += EVENT_REWARDS.get(event, 0)
@@ -1158,6 +1215,31 @@ class BombermanGymEnv(gym.Env):
 
         if new_visited > 0:
             reward += 0.02
+
+        if self.agent.dead:
+            return reward
+
+        coin_dist = self._coin_distance_now()
+        just_collected = e.COIN_COLLECTED in self.agent.events
+        if (not just_collected) and coin_dist >= 0 and self._prev_coin_dist is not None and self._prev_coin_dist >= 0:
+            reward += COIN_SHAPING_COEF * (self._prev_coin_dist - coin_dist)
+        self._prev_coin_dist = coin_dist
+
+        if self.agent.bombs_left:
+            crate_dist = self._crate_distance_now()
+            just_destroyed = e.CRATE_DESTROYED in self.agent.events
+            if (not just_destroyed) and crate_dist >= 0 and self._prev_crate_dist is not None and self._prev_crate_dist >= 0:
+                reward += CRATE_SHAPING_COEF * (self._prev_crate_dist - crate_dist)
+            self._prev_crate_dist = crate_dist
+        else:
+            self._prev_crate_dist = None
+
+        danger = self._bomb_danger_now()
+        if danger > 0:
+            reward -= DANGER_PENALTY_COEF * danger
+        if self._prev_bomb_danger > danger:
+            reward += ESCAPE_BONUS_COEF * (self._prev_bomb_danger - danger)
+        self._prev_bomb_danger = danger
 
         return reward
 
