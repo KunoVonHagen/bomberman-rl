@@ -1,5 +1,5 @@
 from collections import namedtuple, deque
-from typing import List, Tuple, Callable, Optional, Dict, Any
+from typing import List, Tuple, Callable, Optional, Dict, Any, Iterable, Set
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -131,6 +131,62 @@ NUM_LAYERS = COIN_DISTANCE_LAYER + 1
 
 _DANGER_SLICE = slice(DANGER_MAP_LAYERS[0], DANGER_MAP_LAYERS[-1] + 1)
 _OCC_SLICE = slice(OCCUPIED_MAP_LAYERS[0], OCCUPIED_MAP_LAYERS[-1] + 1)
+
+LAYER_GROUPS: Dict[str, List[int]] = {
+    "base": [WALL_LAYER, CRATE_LAYER, COIN_LAYER, SELF_LAYER, SELF_BLAST_LAYER,
+              OPPONENT_LAYER, OPPONENT_DANGER_LAYER, BOMBS_LEFT_LAYER],
+    "timer_channels": list(range(8, _BASE_LAYERS)),
+    "forecast": list(DANGER_MAP_LAYERS) + list(OCCUPIED_MAP_LAYERS),
+    "self_distance": [SELF_DISTANCE_LAYER],
+    "opponent_distance": [OPPONENTS_LEAST_DISTANCE_LAYER],
+    "crate_potential": [CRATE_POTENTIAL_LAYER],
+    "danger_summary": [DANGER_ONSET_LAYER, DANGER_CLEAR_LAYER],
+    "mobility": [MOBILITY_LAYER],
+    "crate_distance": [CRATE_DISTANCE_LAYER],
+    "coin_distance": [COIN_DISTANCE_LAYER],
+}
+
+LAYER_GROUP_DEPENDENCIES: Dict[str, List[str]] = {
+    "self_distance": ["forecast"],
+    "opponent_distance": ["forecast"],
+    "danger_summary": ["forecast"],
+    "mobility": ["forecast"],
+    "crate_distance": ["forecast", "crate_potential"],
+    "coin_distance": ["forecast"],
+}
+
+ALL_LAYER_GROUPS: Tuple[str, ...] = tuple(LAYER_GROUPS.keys())
+
+
+def resolve_layer_groups(requested: Optional[Iterable[str]]) -> Set[str]:
+    """Expand a requested set of group names into the full set needed,
+    pulling in dependencies transitively. `None` means "enable everything"
+    (the original, fully-featured behaviour). "base" is always included.
+    """
+    if requested is None:
+        return set(LAYER_GROUPS.keys())
+
+    requested = set(requested)
+    unknown = requested - set(LAYER_GROUPS.keys())
+    if unknown:
+        raise ValueError(
+            f"Unknown layer group(s): {sorted(unknown)}. "
+            f"Available groups: {sorted(LAYER_GROUPS.keys())}"
+        )
+
+    requested.add("base")
+    resolved: Set[str] = set()
+
+    def _add(group: str):
+        if group in resolved:
+            return
+        resolved.add(group)
+        for dep in LAYER_GROUP_DEPENDENCIES.get(group, ()):
+            _add(dep)
+
+    for g in requested:
+        _add(g)
+    return resolved
 
 
 @njit(cache=True)
@@ -283,7 +339,23 @@ class BombermanGymEnv(gym.Env):
         opponents: List[Tuple[Callable[["AgentHandle"], None], Callable[["AgentHandle", dict], "Optional[str]"]]],
         reward_fn=None,
         render_mode=None,
+        layer_config: Optional[Iterable[str]] = None,
     ):
+        """
+        layer_config: which observation layer groups to compute and return.
+            - None (default): every group is enabled -> identical behaviour
+              to the original, fully-featured environment.
+            - An iterable of group names (see `ALL_LAYER_GROUPS` /
+              `LAYER_GROUPS`), e.g. ["base", "timer_channels", "forecast"].
+              Any group a requested group depends on is pulled in
+              automatically (see `LAYER_GROUP_DEPENDENCIES`), and "base" is
+              always included.
+            Disabling a group both skips its (sometimes expensive) per-step
+            computation and removes its layers from the returned
+            observation tensor, so `observation_space` shrinks accordingly.
+            Use this to trade off precomputed features (which make learning
+            easier) against raw stepping speed.
+        """
         super().__init__()
         self.args = args
         self.rng = np.random.default_rng(args.seed)
@@ -305,7 +377,28 @@ class BombermanGymEnv(gym.Env):
         self.center_x = self.width // 2
         self.center_y = self.height // 2
 
+        self.enabled_groups: Set[str] = resolve_layer_groups(layer_config)
+
+        self._enable_timer_channels = "timer_channels" in self.enabled_groups
+        self._enable_forecast = "forecast" in self.enabled_groups
+        self._enable_self_distance = "self_distance" in self.enabled_groups
+        self._enable_opponent_distance = "opponent_distance" in self.enabled_groups
+        self._enable_crate_potential = "crate_potential" in self.enabled_groups
+        self._enable_danger_summary = "danger_summary" in self.enabled_groups
+        self._enable_mobility = "mobility" in self.enabled_groups
+        self._enable_crate_distance = "crate_distance" in self.enabled_groups
+        self._enable_coin_distance = "coin_distance" in self.enabled_groups
+
+        output_indices = sorted(
+            idx for g in self.enabled_groups for idx in LAYER_GROUPS[g]
+        )
+        self._full_output = len(output_indices) == NUM_LAYERS
+        self._output_layer_indices = (
+            None if self._full_output else np.array(output_indices, dtype=np.int64)
+        )
+
         self.n_observation_layers = NUM_LAYERS
+        self.n_output_layers = len(output_indices)
         self._BT = s.BOMB_TIMER
         self._ET = s.EXPLOSION_TIMER
 
@@ -348,7 +441,7 @@ class BombermanGymEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(self.n_observation_layers, self.width, self.height),
+            shape=(self.n_output_layers, self.width, self.height),
             dtype=np.float32,
         )
         self.action_space = spaces.Discrete(len(ACTIONS))
@@ -380,6 +473,11 @@ class BombermanGymEnv(gym.Env):
         self.agent_actions = {}
 
         self.new_round()
+
+    @staticmethod
+    def available_layer_groups() -> Dict[str, List[int]]:
+        """Introspection helper: group name -> internal layer indices."""
+        return dict(LAYER_GROUPS)
 
     def _build_wall_mask(self) -> np.ndarray:
         """Wall portion of BombeRLeWorld.build_arena (RNG-independent)."""
@@ -483,7 +581,8 @@ class BombermanGymEnv(gym.Env):
             gt[COIN_LAYER, x, y] = 1.0
         gt[SELF_LAYER, self.agent.x, self.agent.y] = 1.0
         self._refresh_dynamic_layers()
-        self._init_crate_potential()
+        if self._enable_crate_potential:
+            self._init_crate_potential()
         self._refresh_forecast_layers()
 
     def _refresh_dynamic_layers(self):
@@ -507,17 +606,18 @@ class BombermanGymEnv(gym.Env):
         gt[OPPONENT_DANGER_LAYER] = np.where(gt[OPPONENT_DANGER_LAYER] > 0, 1.0, 0.0)
         gt[BOMBS_LEFT_LAYER, ax, ay] = 1.0 if self.agent.bombs_left else 0.0
 
-        for b in self.bombs:
-            pos_ch = 8 + b["timer"]
-            danger_ch = 8 + BT + b["timer"]
-            gt[pos_ch, b["x"], b["y"]] = 1.0
-            gt[danger_ch] = self._blast_tensor[b["x"], b["y"]]
+        if self._enable_timer_channels:
+            for b in self.bombs:
+                pos_ch = 8 + b["timer"]
+                danger_ch = 8 + BT + b["timer"]
+                gt[pos_ch, b["x"], b["y"]] = 1.0
+                gt[danger_ch] = self._blast_tensor[b["x"], b["y"]]
 
-        for ex in self.explosions:
-            if ex["stage"] == 0:
-                ch = 7 + 2 * BT + ex["timer"]
-                for (x, y) in ex["coords"]:
-                    gt[ch, x, y] = 1.0
+            for ex in self.explosions:
+                if ex["stage"] == 0:
+                    ch = 7 + 2 * BT + ex["timer"]
+                    for (x, y) in ex["coords"]:
+                        gt[ch, x, y] = 1.0
 
     def _init_crate_potential(self):
         """Full recompute -- only once per round. Kept current afterwards by
@@ -628,22 +728,31 @@ class BombermanGymEnv(gym.Env):
         )
 
     def _compute_distance_fields(self):
+        if not (self._enable_crate_distance or self._enable_coin_distance):
+            return
         gt = self.grid_tensor
         occ_now = gt[OCCUPIED_MAP_LAYERS[0]].astype(bool)
 
-        crate_targets = (gt[CRATE_POTENTIAL_LAYER] > 0) & ~occ_now
-        self._multi_source_bfs(crate_targets, occ_now, gt[CRATE_DISTANCE_LAYER])
+        if self._enable_crate_distance:
+            crate_targets = (gt[CRATE_POTENTIAL_LAYER] > 0) & ~occ_now
+            self._multi_source_bfs(crate_targets, occ_now, gt[CRATE_DISTANCE_LAYER])
 
-        coin_targets = gt[COIN_LAYER].astype(bool)
-        self._multi_source_bfs(coin_targets, occ_now, gt[COIN_DISTANCE_LAYER])
+        if self._enable_coin_distance:
+            coin_targets = gt[COIN_LAYER].astype(bool)
+            self._multi_source_bfs(coin_targets, occ_now, gt[COIN_DISTANCE_LAYER])
 
     def _refresh_forecast_layers(self):
-        self._compute_forecasts()
-        self._time_aware_bfs([(self.agent.x, self.agent.y)], SELF_DISTANCE_LAYER)
-        opponent_positions = [(h.x, h.y) for h in self.opponent_handles if not h.dead]
-        self._time_aware_bfs(opponent_positions, OPPONENTS_LEAST_DISTANCE_LAYER)
-        self._compute_danger_summary()
-        self._compute_mobility()
+        if self._enable_forecast:
+            self._compute_forecasts()
+        if self._enable_self_distance:
+            self._time_aware_bfs([(self.agent.x, self.agent.y)], SELF_DISTANCE_LAYER)
+        if self._enable_opponent_distance:
+            opponent_positions = [(h.x, h.y) for h in self.opponent_handles if not h.dead]
+            self._time_aware_bfs(opponent_positions, OPPONENTS_LEAST_DISTANCE_LAYER)
+        if self._enable_danger_summary:
+            self._compute_danger_summary()
+        if self._enable_mobility:
+            self._compute_mobility()
         self._compute_distance_fields()
 
     def _get_centered_tensor(self) -> np.ndarray:
@@ -711,6 +820,13 @@ class BombermanGymEnv(gym.Env):
 
         return tensor
 
+    def _select_output_layers(self, tensor: np.ndarray) -> np.ndarray:
+        """Slice down to just the enabled groups' layers. Returns the
+        original tensor unchanged (no copy) when every group is enabled."""
+        if self._output_layer_indices is None:
+            return tensor
+        return tensor[self._output_layer_indices]
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
@@ -722,6 +838,7 @@ class BombermanGymEnv(gym.Env):
         self.new_round()
 
         grid_tensor = self._normalize_observation(self._get_centered_tensor())
+        grid_tensor = self._select_output_layers(grid_tensor)
         #self.features = get_features(grid_tensor)
         #obs = {"grid_tensor": grid_tensor, "features": self.features}
         info = self._get_info()
@@ -759,6 +876,7 @@ class BombermanGymEnv(gym.Env):
         self._refresh_forecast_layers()
 
         grid_tensor = self._normalize_observation(self._get_centered_tensor())
+        grid_tensor = self._select_output_layers(grid_tensor)
         #self.features = get_features(grid_tensor)
         #obs = {"grid_tensor": grid_tensor, "features": self.features}
 
@@ -911,7 +1029,8 @@ class BombermanGymEnv(gym.Env):
                     if self.arena[x, y] == 1:
                         self.arena[x, y] = 0
                         self.grid_tensor[CRATE_LAYER, x, y] = 0.0
-                        self.grid_tensor[CRATE_POTENTIAL_LAYER] -= self._blast_tensor[:, :, x, y]
+                        if self._enable_crate_potential:
+                            self.grid_tensor[CRATE_POTENTIAL_LAYER] -= self._blast_tensor[:, :, x, y]
                         owner.add_event(e.CRATE_DESTROYED)
                         if len(self.coins_xy):
                             coin_matches = np.nonzero(
@@ -961,6 +1080,13 @@ class BombermanGymEnv(gym.Env):
                 other.add_event(e.OPPONENT_ELIMINATED)
 
     def check_game_state_conversion_accuracy(self, obs):
+        if not self._full_output:
+            raise RuntimeError(
+                "check_game_state_conversion_accuracy assumes every layer "
+                "group is enabled (layer_config=None); this env was built "
+                f"with a reduced config: {sorted(self.enabled_groups)}."
+            )
+
         from agent_code.my_agent.input_processing import observation_to_game_state
 
         correct_game_state = self.get_state_for_agent(self.agent)
