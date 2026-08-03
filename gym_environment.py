@@ -5,6 +5,21 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
+try:
+    from numba import njit
+    _NUMBA_AVAILABLE = True
+except ImportError:  # pragma: no cover - graceful, correctness-preserving fallback
+    _NUMBA_AVAILABLE = False
+
+    def njit(*args, **kwargs):
+        # No-op decorator so the exact same Python implementation below still
+        # runs correctly (just without JIT compilation) if numba isn't installed.
+        def _wrap(fn):
+            return fn
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+        return _wrap
+
 import settings as s
 import events as e
 
@@ -114,6 +129,113 @@ COIN_DISTANCE_LAYER = CRATE_DISTANCE_LAYER + 1
 
 NUM_LAYERS = COIN_DISTANCE_LAYER + 1
 
+@njit(cache=True)
+def _time_aware_bfs_kernel(starts, occ, W, H, T):
+    dist = np.full((W, H), -1.0, dtype=np.float32)
+    visited = np.zeros((W, H, T + 1), dtype=np.bool_)
+
+    max_nodes = W * H * (T + 1)
+    qx = np.empty(max_nodes, dtype=np.int32)
+    qy = np.empty(max_nodes, dtype=np.int32)
+    qt = np.empty(max_nodes, dtype=np.int32)
+    head = 0
+    tail = 0
+
+    for i in range(starts.shape[0]):
+        x = starts[i, 0]
+        y = starts[i, 1]
+        if occ[0, x, y] > 0:
+            continue
+        if not visited[x, y, 0]:
+            visited[x, y, 0] = True
+            dist[x, y] = 0.0
+            qx[tail] = x
+            qy[tail] = y
+            qt[tail] = 0
+            tail += 1
+
+    while head < tail:
+        x = qx[head]
+        y = qy[head]
+        t = qt[head]
+        head += 1
+
+        next_t = t + 1
+        if next_t > T:
+            next_t = T
+        occ_next = occ[next_t]
+
+        for k in range(5):
+            if k == 0:
+                nx, ny = x - 1, y
+            elif k == 1:
+                nx, ny = x + 1, y
+            elif k == 2:
+                nx, ny = x, y - 1
+            elif k == 3:
+                nx, ny = x, y + 1
+            else:
+                nx, ny = x, y
+
+            if nx < 0 or nx >= W or ny < 0 or ny >= H:
+                continue
+            if occ_next[nx, ny] > 0:
+                continue
+            if visited[nx, ny, next_t]:
+                continue
+
+            visited[nx, ny, next_t] = True
+            if dist[nx, ny] == -1.0:
+                dist[nx, ny] = next_t
+            qx[tail] = nx
+            qy[tail] = ny
+            qt[tail] = next_t
+            tail += 1
+
+    return dist
+
+
+@njit(cache=True)
+def _multi_source_bfs_kernel(targets, occ, W, H):
+    dist = np.full((W, H), -1.0, dtype=np.float32)
+    qx = np.empty(W * H, dtype=np.int32)
+    qy = np.empty(W * H, dtype=np.int32)
+    head = 0
+    tail = 0
+
+    for x in range(W):
+        for y in range(H):
+            if targets[x, y]:
+                dist[x, y] = 0.0
+                qx[tail] = x
+                qy[tail] = y
+                tail += 1
+
+    while head < tail:
+        x = qx[head]
+        y = qy[head]
+        head += 1
+
+        for k in range(4):
+            if k == 0:
+                nx, ny = x - 1, y
+            elif k == 1:
+                nx, ny = x + 1, y
+            elif k == 2:
+                nx, ny = x, y - 1
+            else:
+                nx, ny = x, y + 1
+
+            if nx < 0 or nx >= W or ny < 0 or ny >= H:
+                continue
+            if occ[nx, ny] or dist[nx, ny] != -1.0:
+                continue
+            dist[nx, ny] = dist[x, y] + 1.0
+            qx[tail] = nx
+            qy[tail] = ny
+            tail += 1
+
+    return dist
 
 
 class BombermanGymEnv(gym.Env):
@@ -183,6 +305,7 @@ class BombermanGymEnv(gym.Env):
         self._wall_layer = np.where(wall_mask == -1, 1.0, 0.0).astype(np.float32)
         self._wall_bool = self._wall_layer.astype(bool)
         self._empty_map = np.zeros((self.width, self.height), dtype=np.float32)
+        self._occ_scratch = np.zeros((self.width, self.height), dtype=bool)
         self.PRECOMPUTED_BLAST_COORDS: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
         self.PRECOMPUTED_BLAST_MAP: Dict[Tuple[int, int], np.ndarray] = {}
         for x, y in np.argwhere(wall_mask != -1):
@@ -371,7 +494,8 @@ class BombermanGymEnv(gym.Env):
             return
 
         for t in range(T):
-            danger = np.zeros((self.width, self.height), dtype=np.float32)
+            danger = gt[DANGER_MAP_LAYERS[t]]
+            danger.fill(0.0)
             for ex in active_explosions:
                 if ex["timer"] - t > 0:
                     for (x, y) in ex["coords"]:
@@ -379,7 +503,6 @@ class BombermanGymEnv(gym.Env):
             for b in self.bombs:
                 if b["timer"] <= t < b["timer"] + self._ET:
                     np.maximum(danger, self.PRECOMPUTED_BLAST_MAP.get((b["x"], b["y"]), self._empty_map), out=danger)
-            gt[DANGER_MAP_LAYERS[t]] = danger
 
     def _compute_occupancy_forecast(self):
         """occ[t] = walls | surviving crates | pending bombs | danger, at t
@@ -393,55 +516,37 @@ class BombermanGymEnv(gym.Env):
                 gt[layer] = static
             return
 
-        remaining_crates = gt[CRATE_LAYER].astype(bool).copy()
+        remaining_crates = gt[CRATE_LAYER].astype(bool)
+        occ = self._occ_scratch
         for t in range(T):
             danger_t = gt[DANGER_MAP_LAYERS[t]].astype(bool)
             remaining_crates &= ~danger_t
 
-            occ = self._wall_bool | remaining_crates
+            np.logical_or(self._wall_bool, remaining_crates, out=occ)
             for b in self.bombs:
                 if b["timer"] >= t:
                     occ[b["x"], b["y"]] = True
             occ |= danger_t
 
-            gt[OCCUPIED_MAP_LAYERS[t]] = occ.astype(np.float32)
+            gt[OCCUPIED_MAP_LAYERS[t]] = occ
 
         gt[OCCUPIED_MAP_LAYERS[-1]] = (self._wall_bool | remaining_crates).astype(np.float32)
 
     def _time_aware_bfs(self, starts, out_layer):
         """Earliest arrival time at every cell, respecting the occupancy
-        forecast (four moves + wait)."""
+        forecast (four moves + wait). Delegates to a JIT-compiled kernel that
+        implements the identical FIFO/BFS algorithm."""
         T = len(OCCUPIED_MAP_LAYERS) - 1
         W, H = self.width, self.height
         gt = self.grid_tensor
 
-        dist = np.full((W, H), -1, dtype=np.float32)
-        visited = np.zeros((W, H, T + 1), dtype=bool)
-        q = deque()
+        if starts:
+            starts_arr = np.asarray(starts, dtype=np.int64)
+        else:
+            starts_arr = np.zeros((0, 2), dtype=np.int64)
 
-        for x, y in starts:
-            if gt[OCCUPIED_MAP_LAYERS[0], x, y]:
-                continue
-            visited[x, y, 0] = True
-            dist[x, y] = 0
-            q.append((x, y, 0))
-
-        while q:
-            x, y, t = q.popleft()
-            next_t = min(t + 1, T)
-            occ = gt[OCCUPIED_MAP_LAYERS[next_t]]
-
-            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1), (x, y)):
-                if not (0 <= nx < W and 0 <= ny < H):
-                    continue
-                if occ[nx, ny] or visited[nx, ny, next_t]:
-                    continue
-                visited[nx, ny, next_t] = True
-                if dist[nx, ny] == -1:
-                    dist[nx, ny] = next_t
-                q.append((nx, ny, next_t))
-
-        gt[out_layer] = dist
+        occ = gt[OCCUPIED_MAP_LAYERS[0]:OCCUPIED_MAP_LAYERS[-1] + 1]
+        gt[out_layer] = _time_aware_bfs_kernel(starts_arr, occ, W, H, T)
 
     def _compute_danger_summary(self):
         """Onset/clear timestep of the danger forecast, per cell (-1 = never)."""
@@ -469,26 +574,16 @@ class BombermanGymEnv(gym.Env):
 
     def _multi_source_bfs(self, targets: np.ndarray, occ: np.ndarray) -> np.ndarray:
         """Static (non-time-aware) BFS distance from every cell to the
-        nearest True cell in `targets`, under fixed occupancy `occ`."""
+        nearest True cell in `targets`, under fixed occupancy `occ`.
+        Delegates to a JIT-compiled kernel implementing the identical
+        FIFO/BFS algorithm (distances are order-independent, so this is a
+        drop-in replacement)."""
         W, H = self.width, self.height
-        dist = np.full((W, H), -1, dtype=np.float32)
-        q = deque()
-
-        for x, y in np.argwhere(targets):
-            dist[x, y] = 0
-            q.append((int(x), int(y)))
-
-        while q:
-            x, y = q.popleft()
-            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
-                if not (0 <= nx < W and 0 <= ny < H):
-                    continue
-                if occ[nx, ny] or dist[nx, ny] != -1:
-                    continue
-                dist[nx, ny] = dist[x, y] + 1
-                q.append((nx, ny))
-
-        return dist
+        return _multi_source_bfs_kernel(
+            np.ascontiguousarray(targets, dtype=np.bool_),
+            np.ascontiguousarray(occ, dtype=np.bool_),
+            W, H,
+        )
 
     def _compute_distance_fields(self):
         gt = self.grid_tensor
@@ -540,10 +635,10 @@ class BombermanGymEnv(gym.Env):
         self.new_round()
 
         grid_tensor = self._get_centered_tensor()
-        self.features = get_features(grid_tensor)
-        obs = {"grid_tensor": grid_tensor, "features": self.features}
+        #self.features = get_features(grid_tensor)
+        #obs = {"grid_tensor": grid_tensor, "features": self.features}
         info = self._get_info()
-        return obs, info
+        return grid_tensor, info
 
     def step(self, action):
         self.previous_features = self.features
@@ -834,11 +929,8 @@ class BombermanGymEnv(gym.Env):
     def shaped_reward(self):
         reward = 0
 
-        disable_coin_away_movement_penalty = False
 
         for event in self.agent.events:
-            if event == e.COIN_COLLECTED:
-                disable_coin_away_movement_penalty = True
             reward += EVENT_REWARDS.get(event, 0)
 
         visited_count = np.sum(self.visited)
@@ -847,17 +939,6 @@ class BombermanGymEnv(gym.Env):
 
         if new_visited > 0:
             reward += 0.02
-
-        feature_diff = np.sign(self.features - self.previous_features)
-
-        for feature_index, reward_function in FEATURE_REWARDS.items():
-            reward += reward_function(self.features[feature_index])
-
-        for feature_diff_index, diff_reward in FEATURE_DIFF_REWARDS.items():
-            if feature_diff_index == 2 and disable_coin_away_movement_penalty:
-                reward += abs(diff_reward)
-                continue
-            reward += diff_reward * feature_diff[feature_diff_index]
 
         return reward
 
