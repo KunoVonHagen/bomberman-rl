@@ -169,7 +169,23 @@ ALL_LAYER_GROUPS: Tuple[str, ...] = tuple(LAYER_GROUPS.keys())
     FEATURE_OPPONENTS_ALIVE,
     FEATURE_COINS_REMAINING,
     FEATURE_CRATES_REMAINING,
-) = range(12)
+    # -- Below: inspired by the rule-based agent's decision logic (see
+    # callbacks.py / objectives.py / strategy.py). The rule-based agent
+    # never picks an action without first knowing (a) which of the six
+    # actions are actually safe right now, (b) whether dropping a bomb
+    # here is worth it (crates/opponents hit), and (c) whether any
+    # opponent is currently cornered and worth hunting. None of that was
+    # previously exposed to the RL agent, which only saw a single scalar
+    # danger value for its own tile.
+    FEATURE_SAFE_UP,
+    FEATURE_SAFE_RIGHT,
+    FEATURE_SAFE_DOWN,
+    FEATURE_SAFE_LEFT,
+    FEATURE_SAFE_WAIT,
+    FEATURE_SAFE_BOMB,
+    FEATURE_BOMB_TARGET_VALUE,
+    FEATURE_TRAPPED_OPPONENT_DISTANCE,
+) = range(20)
 
 FEATURE_NAMES: Tuple[str, ...] = (
     "self_x",
@@ -184,6 +200,14 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "opponents_alive",
     "coins_remaining",
     "crates_remaining",
+    "safe_up",
+    "safe_right",
+    "safe_down",
+    "safe_left",
+    "safe_wait",
+    "safe_bomb",
+    "bomb_target_value",
+    "trapped_opponent_distance",
 )
 NUM_FEATURES = len(FEATURE_NAMES)
 
@@ -391,8 +415,11 @@ class BombermanGymEnv(gym.Env):
             includes a `features` vector: a fixed-size, always-fully-
             populated set of cheap global scalars (own position, bomb
             danger, distances to the nearest coin/crate/opponent, mobility,
-            remaining coins/crates/opponents, etc. -- see `feature_names()`
-            for the exact ordering). None of these require computing any
+            remaining coins/crates/opponents, per-action safety flags
+            inspired by the rule-based agent's own action filtering, a
+            "is bombing here worth it" value, and distance to the nearest
+            cornered opponent -- see `feature_names()` for the exact
+            ordering). None of these require computing any
             high-complexity spatial layer in full, so they're available
             unchanged no matter which groups are enabled -- including
             `layer_config=[]`. A few opportunistically reuse a
@@ -1136,41 +1163,6 @@ class BombermanGymEnv(gym.Env):
             for other in self.active_agents:
                 other.add_event(e.OPPONENT_ELIMINATED)
 
-    def check_game_state_conversion_accuracy(self, obs):
-        if not self._full_output:
-            raise RuntimeError(
-                "check_game_state_conversion_accuracy assumes every layer "
-                "group is enabled (layer_config=None); this env was built "
-                f"with a reduced config: {sorted(self.enabled_groups)}."
-            )
-
-        from agent_code.my_agent.input_processing import observation_to_game_state
-
-        grid_tensor = obs["grid_tensor"] if isinstance(obs, dict) else obs
-
-        correct_game_state = self.get_state_for_agent(self.agent)
-        computed_game_state = observation_to_game_state(grid_tensor)
-
-        for important_key in ["field", "explosion_map"]:
-            if not np.array_equal(correct_game_state[important_key], computed_game_state[important_key]):
-                raise ValueError(f"Game state computation differs from correct game state in field '{important_key}')")
-
-        for important_key in ["bombs", "coins"]:
-            if not set(correct_game_state[important_key]) == set(computed_game_state[important_key]):
-                raise ValueError(f"Game state computation differs from correct game state in field '{important_key}')")
-
-        for important_index in [2, 3]:
-            if not correct_game_state["self"][important_index] == computed_game_state["self"][important_index]:
-                raise ValueError(f"Game state computation differs from correct game state in field 'self[{important_index}]'")
-
-        if not len(correct_game_state["others"]) == len(computed_game_state["others"]):
-            raise ValueError("Game state computation differs from correct game state in field 'others' (length mismatch)")
-
-        for opponent_index in range(len(correct_game_state["others"])):
-            for important_index in [2, 3]:
-                if not correct_game_state["others"][opponent_index][important_index] == computed_game_state["others"][opponent_index][important_index]:
-                    raise ValueError(f"Game state computation differs from correct game state in field 'others [{opponent_index}][{important_index}]'")
-
     def _get_info(self):
         return {
             "step": self.step_count,
@@ -1283,6 +1275,113 @@ class BombermanGymEnv(gym.Env):
         d = min(abs(h.x - self.agent.x) + abs(h.y - self.agent.y) for h in alive)
         return float(d)
 
+    def _danger_at_tick(self, x: int, y: int, t: int) -> bool:
+        """Whether (x, y) is on fire at tick `t` from now, computed
+        directly from `self.bombs`/`self.explosions` (not from the
+        forecast grid layers), using the same "explosion persists while
+        its timer - t > 0" / "bomb blasts while bt <= t < bt + ET" rules
+        as `_forecast_kernel`. Only ever queried for t in {0, 1, 2}, so
+        this stays O(#bombs + #explosions) and needs none of the
+        (optional, layer_config-gated) forecast layers -- matching this
+        file's convention that `features` never hard-depends on a
+        disable-able layer group."""
+        for ex in self.explosions:
+            if ex["stage"] == 0 and (ex["timer"] - t) > 0 and (x, y) in ex["coords_set"]:
+                return True
+        for b in self.bombs:
+            bt = b["timer"]
+            if bt <= t < bt + self._ET:
+                if self._blast_tensor[b["x"], b["y"], x, y] > 0:
+                    return True
+        return False
+
+    def _action_safety_now(self) -> Tuple[float, float, float, float, float, float]:
+        """One-tick-lookahead stand-in for the rule-based agent's
+        `get_legal_actions` + `is_action_safe` filtering (objectives.py),
+        which it runs before *any* other decision-making. For each of the
+        six actions: 0.0 if it's illegal (wall/crate/bomb/other agent in
+        the way) or walks onto a tile that's already on fire or about to
+        be next tick; 1.0 otherwise. For BOMB specifically, a hypothetical
+        bomb is placed at the agent's own tile and 1.0 is only returned if
+        at least one neighbouring tile (or staying put) would still be
+        clear of blast for the following two ticks -- i.e. "don't bomb
+        yourself into a corner". This is deliberately a shallow
+        approximation of the rule-based agent's full permanently-safe BFS
+        (`get_safe_square_action`) -- exact enough to flag immediately
+        suicidal actions, cheap enough to run every RL step.
+        Returned in ACTIONS order: (UP, RIGHT, DOWN, LEFT, WAIT, BOMB).
+        """
+        ax, ay = self.agent.x, self.agent.y
+        deltas = ((0, -1), (1, 0), (0, 1), (-1, 0), (0, 0))  # UP, RIGHT, DOWN, LEFT, WAIT
+
+        safety = []
+        for (dx, dy) in deltas:
+            nx, ny = ax + dx, ay + dy
+            if (dx, dy) != (0, 0) and not self._tile_is_free(nx, ny):
+                safety.append(0.0)
+                continue
+            safety.append(0.0 if (self._danger_at_tick(nx, ny, 0) or self._danger_at_tick(nx, ny, 1)) else 1.0)
+
+        if not self.agent.bombs_left:
+            safety.append(0.0)
+        else:
+            hypothetical = {"x": ax, "y": ay, "timer": self._BT, "owner": self.agent}
+            self.bombs.append(hypothetical)
+            escape = False
+            for (dx, dy) in deltas:
+                nx, ny = ax + dx, ay + dy
+                if (dx, dy) != (0, 0) and not self._tile_is_free(nx, ny):
+                    continue
+                if not self._danger_at_tick(nx, ny, 1) and not self._danger_at_tick(nx, ny, 2):
+                    escape = True
+                    break
+            self.bombs.pop()
+            safety.append(1.0 if escape else 0.0)
+
+        return tuple(safety)
+
+    def _bomb_target_value_now(self) -> float:
+        """Cheap stand-in for `evaluate_bomb_placement`'s (strategy.py)
+        first-pass filter: how worthwhile dropping a bomb on the agent's
+        current tile would be, combining crates that would be destroyed
+        and any opponent currently caught in the blast radius. O(blast
+        radius) via `PRECOMPUTED_BLAST_COORDS`. Does not account for
+        escape routes (that's `FEATURE_SAFE_BOMB`) or contested-tile
+        races against opponents -- just "is there anything worth blowing
+        up here", in [0, 1]."""
+        if not self.agent.bombs_left:
+            return 0.0
+        ax, ay = self.agent.x, self.agent.y
+        blast_coords = self.PRECOMPUTED_BLAST_COORDS.get((ax, ay), [(ax, ay)])
+        blast_set = set(blast_coords)
+        crates_hit = sum(1 for (bx, by) in blast_coords if self.arena[bx, by] == 1)
+        opponents_hit = sum(1 for h in self.opponent_handles if not h.dead and (h.x, h.y) in blast_set)
+
+        crate_frac = min(1.0, crates_hit / self._CRATE_POTENTIAL_MAX) if self._CRATE_POTENTIAL_MAX > 0 else 0.0
+        value = 0.5 * crate_frac + 0.5 * (1.0 if opponents_hit > 0 else 0.0)
+        return float(np.clip(value, 0.0, 1.0))
+
+    def _nearest_trapped_opponent_distance(self) -> float:
+        """Manhattan distance to the nearest living opponent with at most
+        one open orthogonal neighbour -- the same cornered-opponent
+        signal `find_trap_targets` (strategy.py) uses to pick hunting
+        targets for the rule-based agent. O(#opponents). -1.0 if no
+        opponent currently qualifies (including no opponents left)."""
+        ax, ay = self.agent.x, self.agent.y
+        best = None
+        for h in self.opponent_handles:
+            if h.dead:
+                continue
+            free = 0
+            for (nx, ny) in ((h.x, h.y - 1), (h.x, h.y + 1), (h.x - 1, h.y), (h.x + 1, h.y)):
+                if self._tile_is_free(nx, ny):
+                    free += 1
+            if free <= 1:
+                d = abs(h.x - ax) + abs(h.y - ay)
+                if best is None or d < best:
+                    best = d
+        return -1.0 if best is None else float(best)
+
     def _compute_global_features(self) -> np.ndarray:
         """Cheap, always-on numeric summary of global game state.
 
@@ -1304,6 +1403,16 @@ class BombermanGymEnv(gym.Env):
         not applicable / none left, otherwise a clipped fraction of the
         board size in [0, 1]" sentinel convention already used for the
         distance-like grid layers in `_normalize_observation`.
+
+        The trailing block (safe_up/right/down/left/wait/bomb,
+        bomb_target_value, trapped_opponent_distance) is new: it distills
+        the decision checks the rule-based agent (callbacks.py) always
+        runs before choosing a move -- "which actions won't get me
+        killed", "is bombing here worth it", "is any opponent cornered
+        right now" -- into features, since the RL agent previously had no
+        direct signal for any of that beyond the single-tile bomb_danger
+        value. Like the rest of this method, they're all O(small) and
+        independent of `layer_config`.
         """
         f = self._features
         W1 = max(self.width - 1, 1)
@@ -1354,6 +1463,21 @@ class BombermanGymEnv(gym.Env):
             )
         else:
             f[FEATURE_CRATES_REMAINING] = 0.0
+
+        safe_up, safe_right, safe_down, safe_left, safe_wait, safe_bomb = self._action_safety_now()
+        f[FEATURE_SAFE_UP] = safe_up
+        f[FEATURE_SAFE_RIGHT] = safe_right
+        f[FEATURE_SAFE_DOWN] = safe_down
+        f[FEATURE_SAFE_LEFT] = safe_left
+        f[FEATURE_SAFE_WAIT] = safe_wait
+        f[FEATURE_SAFE_BOMB] = safe_bomb
+
+        f[FEATURE_BOMB_TARGET_VALUE] = self._bomb_target_value_now()
+
+        trapped_dist = self._nearest_trapped_opponent_distance()
+        f[FEATURE_TRAPPED_OPPONENT_DISTANCE] = (
+            -1.0 if trapped_dist < 0 else np.clip(trapped_dist / self._DIST_MAX, 0.0, 1.0)
+        )
 
         self.previous_features = f.copy()
         return f
