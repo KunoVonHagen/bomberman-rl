@@ -4,16 +4,15 @@ from environment import WorldArgs
 import time
 import numpy as np
 import os
-import torch
+import copy
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
 from sb3_contrib.common.wrappers import ActionMasker
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.env_util import make_vec_env
 from multiprocessing import freeze_support
 from datetime import datetime
 from imitation.data.types import Transitions, DictObs
-from input_processing import observation_to_game_state
 from agent_code.my_agent.callbacks import act as expert_act, setup as expert_setup
 import tqdm
 import pathlib
@@ -23,27 +22,15 @@ from model import BombermanFeatureExtractor
 LAYER_CONFIG = [
     "base",
     "timer_channels",
-    #"forecast",
-    #"self_distance",
-    #"opponent_distance",
-    #"crate_potential",
-    #"danger_summary",
-    #"mobility",
-    #"crate_distance",
-    #"coin_distance"
+    "forecast",
+    "self_distance",
+    "opponent_distance",
+    "crate_potential",
+    "danger_summary",
+    "mobility",
+    "crate_distance",
+    "coin_distance"
 ]
-
-
-class ExpertPolicy:
-    def __init__(self, env):
-        self.env = env
-        expert_setup(env.agent)
-
-    def predict(self, observation, state=None, episode_start=None, deterministic=True):
-        game_state = observation_to_game_state(observation)
-        action = expert_act(self.env.agent, game_state)
-        action = BombermanGymEnv.ACTION_INDICES[action]
-        return action, state
 
 def dagger_collect(
     env: BombermanGymEnv,
@@ -189,10 +176,11 @@ def get_env(N_ENVS, opponents):
         n_envs=N_ENVS,
         vec_env_cls=SubprocVecEnv
     )
+    env = VecNormalize(env, norm_obs=True, norm_reward=True)
 
     return env
 
-def play_test_game(model, opponents):
+def play_test_game(model, opponents, obs_rms, ret_rms):
     os.makedirs(pathlib.Path(__file__).parent / "replays", exist_ok=True)
     os.makedirs(pathlib.Path(__file__).parent / "logs" / "test", exist_ok=True)
     test_env_args = WorldArgs(
@@ -212,14 +200,26 @@ def play_test_game(model, opponents):
         continue_without_training=False
     )
 
-    test_env = BombermanGymEnv(test_env_args, opponents=opponents, layer_config=LAYER_CONFIG)
-    grid_tensor, _ = test_env.reset()
+    test_env = make_vec_env(
+        lambda: ActionMasker(BombermanGymEnv(
+            test_env_args,
+            opponents=opponents,
+            layer_config=LAYER_CONFIG
+        ), mask_fn),
+        n_envs=1,
+        vec_env_cls=SubprocVecEnv
+    )
+    test_env = VecNormalize(test_env, norm_obs=True, norm_reward=True)
+    test_env.obs_rms = obs_rms
+    test_env.ret_rms = ret_rms
+
+    obs = test_env.reset()
     done = False
     while not done:
         action_masks = get_action_masks(test_env)
-        action, _ = model.predict(grid_tensor, deterministic=True, action_masks=action_masks)
-        grid_tensor, reward, terminated, truncated, info = test_env.step(action)
-        done = terminated or truncated
+        action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
+        obs, reward, dones, info = test_env.step(action)
+        done = dones[0]
         test_env.render()
     test_env.close()
 
@@ -231,9 +231,14 @@ def run_epoch(N_STEPS, N_ENVS, epoch, model, opponents, training_start=None):
         tb_log_name=f"PPO_{training_start}" if training_start else "PPO"
     )
 
-    #play_test_game(model, opponents)
 
     model.save(f"models/ppo_bomberman_{(epoch + 1) * N_STEPS * N_ENVS}")
+    train_vec_norm_env = model.get_vec_normalize_env()
+    train_vec_norm_env.save(f"models/ppo_bomberman_{(epoch + 1) * N_STEPS * N_ENVS}_vecnormalize.pkl")
+
+    obs_rms = copy.deepcopy(train_vec_norm_env.obs_rms)
+    ret_rms = copy.deepcopy(train_vec_norm_env.ret_rms)
+    play_test_game(model, opponents, obs_rms, ret_rms)
 
 
 def env_step_test(TEST_ROUNDS):
@@ -329,21 +334,21 @@ def main(N_ENVS, TOTAL_EPOCHS, N_DEMONSTRATION_EPISODES, opponents, PPO_PARAMS):
 if __name__ == "__main__":
     PPO_PARAMS = {
         "learning_rate": 3e-4,
-        "n_steps": 512,
-        "batch_size": 2048,
+        "n_steps": 1024,
+        "batch_size": 256,
         "n_epochs": 4,
-        "gamma": 0.999,
+        "gamma": 0.99,
         "gae_lambda": 0.97,
         "clip_range": 0.2,
         "clip_range_vf": None,
         "ent_coef": 0.01,
-        "vf_coef": 0.5,
-        "target_kl": 0.05,
+        "vf_coef": 0.7,
+        "target_kl": 0.02,
     }
 
     N_DEMONSTRATION_EPISODES = 50
 
-    N_ENVS = 16
+    N_ENVS = 32
     TOTAL_EPOCHS = 1 + 50_000_000 // (PPO_PARAMS["n_steps"] * N_ENVS)
     opponents = []
 
