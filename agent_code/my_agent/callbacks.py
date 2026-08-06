@@ -21,6 +21,9 @@ import numpy as np
 
 ACTIONS = ['UP', 'RIGHT', 'DOWN', 'LEFT', 'WAIT', 'BOMB']
 
+HUNT_RANGE_CORNERED = 10  # opponent has 0 escape routes: near-certain kill, worth a longer chase
+HUNT_RANGE_LOOSE = 6      # opponent has 1 escape route: still worth pursuing, but less aggressively
+
 
 def setup(self):
     """
@@ -44,7 +47,6 @@ def setup(self):
         self.logger.info("Loading model from saved state.")
         with open("my-saved-model.pt", "rb") as file:
             self.model = pickle.load(file)
-
 
 
 # TODO: Implement a central class that unifies all the feature computation needed for the rule-based agent to speed up dramatically
@@ -117,15 +119,21 @@ def act(self, game_state: dict) -> str:
     crate_action, crate_distance = get_action_toward_target(own_position, crate_targets, obstacles)
 
     trap_targets = find_trap_targets(game_state, max_escape_routes=1)
-    trapped_positions = {t['position'] for t in trap_targets}
-    hunt_action, hunt_distance = get_action_toward_target(
-        own_position, list(trapped_positions), obstacles
-    )
-    HUNT_RANGE = 6
+    cornered_positions = {t['position'] for t in trap_targets if t['escape_routes'] == 0}
+    loose_positions = {t['position'] for t in trap_targets if t['escape_routes'] == 1}
+    trapped_positions = cornered_positions | loose_positions
+
+    hunt_action, hunt_distance = get_action_toward_target(own_position, list(cornered_positions), obstacles)
+    hunt_range = HUNT_RANGE_CORNERED
+    if hunt_action is None or hunt_distance is None or hunt_distance > HUNT_RANGE_CORNERED:
+        loose_action, loose_distance = get_action_toward_target(own_position, list(loose_positions), obstacles)
+        if loose_action is not None and (hunt_action is None or (loose_distance or 0) <= HUNT_RANGE_LOOSE):
+            hunt_action, hunt_distance = loose_action, loose_distance
+            hunt_range = HUNT_RANGE_LOOSE
 
     if not in_immediate_danger:
         if (hunt_action is not None and hunt_action in movement_actions
-                and hunt_distance is not None and hunt_distance <= HUNT_RANGE):
+                and hunt_distance is not None and hunt_distance <= hunt_range):
             best_action = hunt_action
         elif coin_action is not None and coin_action in movement_actions:
             best_action = coin_action
@@ -134,7 +142,9 @@ def act(self, game_state: dict) -> str:
 
     if 'BOMB' in safe_actions:
         bomb_eval = evaluate_bomb_placement(game_state, trapped_positions=trapped_positions)
-        if bomb_eval['should_bomb'] and (bomb_eval['opponents_hit'] or coin_action is None or coin_distance > 3):
+        bomb_is_contest_safe = is_action_safe('BOMB', game_state, avoid_contested=True)
+        if bomb_eval['should_bomb'] and bomb_is_contest_safe and (
+                bomb_eval['opponents_hit'] or coin_action is None or coin_distance > 3):
             best_action = 'BOMB'
 
     self.logger.info(f"Time taken for act: {time.time() - start:.6f} seconds")

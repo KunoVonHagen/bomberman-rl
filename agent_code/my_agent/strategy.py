@@ -130,9 +130,10 @@ def evaluate_bomb_placement(
         crate_weight: float = 6.0,
         crate_weight_contested: float = 1.5,
         opponent_kill_bonus: float = 60.0,
-        trapped_kill_bonus: float = 40.0,
+        trapped_kill_bonus: float = 80.0,
         trapped_positions: set = None,
         min_score_to_bomb: float = 3.0,
+        single_route_score_floor: float = 12.0,
 ) -> Dict:
 
     field = game_state['field']
@@ -168,17 +169,15 @@ def evaluate_bomb_placement(
 
     escape_routes = count_escape_directions(hypothetical_state, require_non_pocket=not no_realistic_threat)
     result['escape_routes'] = escape_routes
-
-    required_escape_routes = 1 if no_realistic_threat else min_escape_routes
-    if escape_routes < required_escape_routes:
-        return result
+    if escape_routes < 1:
+        return result  # bombing here leaves no way out at all
 
     if no_realistic_threat:
         uncontested_escape_routes = escape_routes
     else:
         uncontested_escape_routes = count_uncontested_escape_directions(hypothetical_state)
         if uncontested_escape_routes < 1:
-            return result  # every escape could be cut off by an opponent moving into it
+            return result  # our only escape(s) could be blocked by an opponent's own movement
     result['uncontested_escape_routes'] = uncontested_escape_routes
 
     obstacles = (field != 0)
@@ -194,6 +193,10 @@ def evaluate_bomb_placement(
         + opponent_kill_bonus * len(opponents_hit)
         + trapped_kill_bonus * len(trapped_opponents_hit)
     )
+
+    required_routes = min_escape_routes if not no_realistic_threat else 1
+    if escape_routes < required_routes and not trapped_opponents_hit:
+        min_score_to_bomb = max(min_score_to_bomb, single_route_score_floor)
 
     result['score'] = score
     result['should_bomb'] = score >= min_score_to_bomb
