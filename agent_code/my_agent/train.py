@@ -140,6 +140,7 @@ def play_test_game(
     test_env.obs_rms = obs_rms
     test_env.ret_rms = ret_rms
     test_env.training = False
+    test_env.norm_reward = False
 
     obs = test_env.reset()
     done = False
