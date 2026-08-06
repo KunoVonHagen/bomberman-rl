@@ -112,17 +112,5 @@ screenshots/*.webm
 replays/
 results/
 
-# TensorBoard
-*.tfevents.*
-
-# Trained models
-**/models/*.zip
-**/models_bak/*.zip
-**/models/*.pkl
-**/models_bak/*.pkl
-
-
-
-# Behavioral Cloning Training Data
-**/*transitions*.pkl
-
+# Training runs
+**/runs/**
