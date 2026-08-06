@@ -121,7 +121,7 @@ DEFAULT_CONFIG = TrainingConfig(
     run_name=None,
     n_envs=32,
     total_timesteps=50_000_000,
-    save_every_timesteps=1024 * 32 * 8,
+    save_every_timesteps=1024 * 32,
     ppo=PPOConfig(
         learning_rate=3e-4,
         n_steps=1024,
@@ -137,7 +137,7 @@ DEFAULT_CONFIG = TrainingConfig(
     ),
     env=EnvConfig(),
     self_play=SelfPlayConfig(
-        enabled=True,
+        enabled=False,
         static_opponents=[
             #"agent_code.coin_collector_agent.callbacks",
             #"agent_code.random_agent.callbacks",
@@ -146,8 +146,8 @@ DEFAULT_CONFIG = TrainingConfig(
             #"agent_code.my_agent.callbacks",
         ],
         n_static_opponents=0,
-        n_self_play_opponents=3,
-        pool_size=16,
+        n_self_play_opponents=0,
+        pool_size=1,
         add_checkpoint_every_epochs=1,
         sample_strategy="latest_biased",
         latest_bias=0.2,

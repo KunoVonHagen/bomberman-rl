@@ -954,7 +954,12 @@ class BombermanGymEnv(gym.Env):
         return tensor[self._output_layer_indices]
 
     def set_opponents(self, opponents):
-        self.opponents = opponents
+        if len(opponents) > MAX_OPPONENTS:
+            raise ValueError(...)
+        self.opponent_act_fns = [act_fn for (_setup_fn, act_fn) in opponents]
+        self.n_real_opponents = len(opponents)
+        for handle, (setup_fn, _act_fn) in zip(self.opponent_handles, opponents):
+            setup_fn(handle)
 
     def reset(self, seed=None, options=None):
         """
