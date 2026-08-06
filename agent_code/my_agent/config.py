@@ -70,6 +70,7 @@ class SelfPlayConfig:
     """Controls whether/how the agent trains against its own past checkpoints."""
     enabled: bool = False
     static_opponents: List[str] = field(default_factory=list)
+    n_static_opponents: int = 1
     n_self_play_opponents: int = 1
     pool_size: int = 8
     add_checkpoint_every_epochs: int = 1
@@ -120,12 +121,12 @@ DEFAULT_CONFIG = TrainingConfig(
     run_name=None,
     n_envs=32,
     total_timesteps=50_000_000,
-    save_every_timesteps=1024 * 32,
+    save_every_timesteps=1024 * 32 * 8,
     ppo=PPOConfig(
         learning_rate=3e-4,
         n_steps=1024,
-        batch_size=128,
-        n_epochs=6,
+        batch_size=256,
+        n_epochs=8,
         gamma=0.99,
         gae_lambda=0.97,
         clip_range=0.2,
@@ -137,11 +138,18 @@ DEFAULT_CONFIG = TrainingConfig(
     env=EnvConfig(),
     self_play=SelfPlayConfig(
         enabled=True,
-        static_opponents=[],
+        static_opponents=[
+            #"agent_code.coin_collector_agent.callbacks",
+            #"agent_code.random_agent.callbacks",
+            #"agent_code.rule_based_agent.callbacks",
+            #"agent_code.peaceful_agent.callbacks",
+            #"agent_code.my_agent.callbacks",
+        ],
+        n_static_opponents=0,
         n_self_play_opponents=3,
-        pool_size=8,
+        pool_size=16,
         add_checkpoint_every_epochs=1,
         sample_strategy="latest_biased",
-        latest_bias=0.5,
+        latest_bias=0.2,
     ),
 )
