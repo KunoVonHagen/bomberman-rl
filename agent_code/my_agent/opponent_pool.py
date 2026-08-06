@@ -148,9 +148,11 @@ class OpponentPool:
         opponents: List[OpponentPair] = []
         descriptions: List[str] = []
 
-        for path in self.cfg.static_opponents:
-            opponents.append(self._resolve_static(path))
-            descriptions.append(path)
+        if self.cfg.static_opponents:
+            k = min(self.cfg.n_static_opponents, len(self.cfg.static_opponents))
+            for path in random.sample(self.cfg.static_opponents, k=k):
+                opponents.append(self._resolve_static(path))
+                descriptions.append(path)
 
         if self.cfg.enabled:
             for _ in range(self.cfg.n_self_play_opponents):

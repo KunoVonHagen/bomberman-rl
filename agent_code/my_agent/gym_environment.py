@@ -73,7 +73,7 @@ class AgentHandle:
     """
 
     __slots__ = ("name", "train", "logger", "x", "y", "score", "total_score",
-                 "bombs_left", "dead", "events")
+                 "bombs_left", "dead", "events", "__dict__")
 
     def __init__(self, name: str):
         self.name = name
@@ -435,6 +435,9 @@ class BombermanGymEnv(gym.Env):
         ]
         self.opponent_act_fns: List[Callable] = [act_fn for (_setup_fn, act_fn) in opponents]
         self.n_real_opponents = len(opponents)
+
+        for handle, (setup_fn, _act_fn) in zip(self.opponent_handles, opponents):
+            setup_fn(handle)
 
         self.all_agents: List[AgentHandle] = [self.agent] + self.opponent_handles
         self.n_agents = 1 + self.n_real_opponents
