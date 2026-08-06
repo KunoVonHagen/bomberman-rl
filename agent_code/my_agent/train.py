@@ -1,98 +1,232 @@
-from collections import namedtuple, deque
+"""
+train.py
+-----------------------------------------------------------------------------
+Main training entrypoint. All tunable behaviour lives in config.py — edit
+`DEFAULT_CONFIG` there rather than this file.
 
-import pickle
-from typing import List
+    python train.py
+        Start a fresh run using DEFAULT_CONFIG from config.py.
 
-import events as e
-from .callbacks import state_to_features
+    python train.py --resume run_20260101-101500
+        Resume the given run from its latest checkpoint, using the config
+        that run was originally created with (stored in its run_manifest.json).
 
-# This is only an example!
-Transition = namedtuple('Transition',
-                        ('state', 'action', 'next_state', 'reward'))
+    python train.py --resume runs/run_20260101-101500 --checkpoint checkpoint_0016777216
+        Resume from a specific checkpoint instead of the latest one.
+-----------------------------------------------------------------------------
+"""
+from __future__ import annotations
 
-# Hyper parameters -- DO modify
-TRANSITION_HISTORY_SIZE = 3  # keep only ... last transitions
-RECORD_ENEMY_TRANSITIONS = 1.0  # record enemy transitions with probability ...
+import argparse
+import copy
+from multiprocessing import freeze_support
 
-# Events
-PLACEHOLDER_EVENT = "PLACEHOLDER"
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.maskable.utils import get_action_masks
+from sb3_contrib.common.wrappers import ActionMasker
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
+from stable_baselines3.common.env_util import make_vec_env
 
+from agent_code.my_agent.gym_environment import BombermanGymEnv
+from environment import WorldArgs
+from model import BombermanFeatureExtractor
 
-def setup_training(self):
-    """
-    Initialise self for training purpose.
-
-    This is called after `setup` in callbacks.py.
-
-    :param self: This object is passed to all callbacks and you can set arbitrary values.
-    """
-    # Example: Setup an array that will note transition tuples
-    # (s, a, r, s')
-    self.transitions = deque(maxlen=TRANSITION_HISTORY_SIZE)
-
-
-def game_events_occurred(self, old_game_state: dict, self_action: str, new_game_state: dict, events: List[str]):
-    """
-    Called once per step to allow intermediate rewards based on game events.
-
-    When this method is called, self.events will contain a list of all game
-    events relevant to your agent that occurred during the previous step. Consult
-    settings.py to see what events are tracked. You can hand out rewards to your
-    agent based on these events and your knowledge of the (new) game state.
-
-    This is *one* of the places where you could update your agent.
-
-    :param self: This object is passed to all callbacks and you can set arbitrary values.
-    :param old_game_state: The state that was passed to the last call of `act`.
-    :param self_action: The action that you took.
-    :param new_game_state: The state the agent is in now.
-    :param events: The events that occurred when going from  `old_game_state` to `new_game_state`
-    """
-    self.logger.debug(f'Encountered game event(s) {", ".join(map(repr, events))} in step {new_game_state["step"]}')
-
-    # Idea: Add your own events to hand out rewards
-    # events.append(PLACEHOLDER_EVENT)
-
-    # state_to_features is defined in callbacks.py
-    self.transitions.append(Transition(state_to_features(old_game_state), self_action, state_to_features(new_game_state), reward_from_events(self, events)))
+from config import DEFAULT_CONFIG, TrainingConfig
+from checkpoint_manager import CheckpointManager
+from opponent_pool import OpponentPool
 
 
-def end_of_round(self, last_game_state: dict, last_action: str, events: List[str]):
-    """
-    Called at the end of each game or when the agent died to hand out final rewards.
-    This replaces game_events_occurred in this round.
-
-    This is similar to game_events_occurred. self.events will contain all events that
-    occurred during your agent's final step.
-
-    This is *one* of the places where you could update your agent.
-    This is also a good place to store an agent that you updated.
-
-    :param self: The same object that is passed to all of your callbacks.
-    """
-    self.logger.debug(f'Encountered event(s) {", ".join(map(repr, events))} in final step')
-    self.transitions.append(Transition(state_to_features(last_game_state), last_action, None, reward_from_events(self, events)))
-
-    # Store the model
-    with open("my-saved-model.pt", "wb") as file:
-        pickle.dump(self.model, file)
+def mask_fn(env):
+    return env.action_masks()
 
 
-def reward_from_events(self, events: List[str]) -> int:
-    """
-    *This is not a required function, but an idea to structure your code.*
+def build_world_args(
+    cfg: TrainingConfig,
+    log_dir: str,
+    save_replay: bool,
+    replay_path: str | None = None,
+) -> WorldArgs:
+    e = cfg.env
+    return WorldArgs(
+        scenario=e.scenario,
+        seed=e.seed,
+        silence_errors=e.silence_errors,
+        no_gui=e.no_gui,
+        make_video=e.make_video,
+        save_replay=save_replay,
+        save_stats=e.save_stats,
+        turn_based=e.turn_based,
+        update_interval=e.update_interval,
+        log_dir=log_dir,
+        match_name=e.match_name,
+        fps=e.fps,
+        replay=replay_path or e.replay,
+        continue_without_training=e.continue_without_training,
+    )
 
-    Here you can modify the rewards your agent get so as to en/discourage
-    certain behavior.
-    """
-    game_rewards = {
-        e.COIN_COLLECTED: 1,
-        e.KILLED_OPPONENT: 5,
-        PLACEHOLDER_EVENT: -.1  # idea: the custom event is bad
+
+def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecNormalize:
+    world_args = build_world_args(cfg, log_dir, save_replay=False)
+    env = make_vec_env(
+        lambda: ActionMasker(
+            BombermanGymEnv(world_args, opponents=opponents, layer_config=cfg.env.layer_config),
+            mask_fn,
+        ),
+        n_envs=cfg.n_envs,
+        vec_env_cls=SubprocVecEnv,
+    )
+    return VecNormalize(env, norm_obs=True, norm_reward=True)
+
+
+def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str) -> VecNormalize:
+    world_args = build_world_args(cfg, log_dir, save_replay=True, replay_path=replay_path)
+    env = make_vec_env(
+        lambda: ActionMasker(
+            BombermanGymEnv(world_args, opponents=opponents, layer_config=cfg.env.layer_config),
+            mask_fn,
+        ),
+        n_envs=1,
+        vec_env_cls=SubprocVecEnv,
+    )
+    return VecNormalize(env, norm_obs=True, norm_reward=True)
+
+
+def architecture_info(cfg: TrainingConfig) -> dict:
+    """Static description of the model, written once into run_manifest.json
+    so a run folder is self-describing without needing this script."""
+    return {
+        "policy": "MultiInputPolicy",
+        "algorithm": "MaskablePPO",
+        "features_extractor_class": BombermanFeatureExtractor.__name__,
+        "layer_config": cfg.env.layer_config,
     }
-    reward_sum = 0
-    for event in events:
-        if event in game_rewards:
-            reward_sum += game_rewards[event]
-    self.logger.info(f"Awarded {reward_sum} for events {', '.join(events)}")
-    return reward_sum
+
+
+def build_model(env: VecNormalize, cfg: TrainingConfig, tensorboard_log: str) -> MaskablePPO:
+    policy_kwargs = dict(features_extractor_class=BombermanFeatureExtractor)
+    return MaskablePPO(
+        "MultiInputPolicy",
+        env,
+        policy_kwargs=policy_kwargs,
+        tensorboard_log=tensorboard_log,
+        verbose=1,
+        learning_rate=cfg.ppo.learning_rate,
+        n_steps=cfg.ppo.n_steps,
+        batch_size=cfg.ppo.batch_size,
+        n_epochs=cfg.ppo.n_epochs,
+        gamma=cfg.ppo.gamma,
+        gae_lambda=cfg.ppo.gae_lambda,
+        clip_range=cfg.ppo.clip_range,
+        clip_range_vf=cfg.ppo.clip_range_vf,
+        ent_coef=cfg.ppo.ent_coef,
+        vf_coef=cfg.ppo.vf_coef,
+        target_kl=cfg.ppo.target_kl,
+    )
+
+
+def play_test_game(
+    model,
+    cfg: TrainingConfig,
+    opponents,
+    obs_rms,
+    ret_rms,
+    ckman: CheckpointManager,
+    timesteps_done: int,
+) -> None:
+    match_name = cfg.env.match_name or "match"
+    replay_path = ckman.replays_dir / f"{match_name}_{timesteps_done:010d}.pkl"
+
+    test_env = make_test_env(cfg, opponents, str(ckman.logs_dir), str(replay_path))
+    test_env.obs_rms = obs_rms
+    test_env.ret_rms = ret_rms
+    test_env.training = False
+
+    obs = test_env.reset()
+    done = False
+    while not done:
+        action_masks = get_action_masks(test_env)
+        action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
+        obs, reward, dones, info = test_env.step(action)
+        done = dones[0]
+    test_env.close()
+    print(f"Saved eval replay -> {replay_path}")
+
+
+def run(cfg: TrainingConfig, resume_from: str | None = None, resume_checkpoint: str | None = None) -> None:
+    freeze_support()
+
+    if resume_from:
+        ckman = CheckpointManager.resume(resume_from, runs_dir=cfg.runs_dir)
+        cfg = ckman.config
+        print(f"Resuming run '{cfg.run_name}' from {ckman.run_dir}")
+    else:
+        ckman = CheckpointManager.new(cfg, architecture_info(cfg))
+        print(f"Starting new run '{cfg.run_name}' in {ckman.run_dir}")
+
+    pool = OpponentPool(ckman, cfg.self_play)
+    opponents = pool.current_opponents()
+
+    env = make_train_env(cfg, opponents, str(ckman.logs_dir))
+    model = build_model(env, cfg, str(ckman.tensorboard_dir))
+
+    timesteps_done = 0
+    if resume_from:
+        checkpoint_dir = (
+            ckman.get_checkpoint(resume_checkpoint) if resume_checkpoint
+            else ckman.latest_checkpoint()
+        )
+        if checkpoint_dir is not None:
+            loaded_model, vecnorm_path = ckman.load_model(MaskablePPO, checkpoint_dir, env=env)
+            model = loaded_model
+            if vecnorm_path is not None:
+                env = VecNormalize.load(str(vecnorm_path), env.venv)
+                model.set_env(env)
+            timesteps_done = ckman.resolved_timesteps(checkpoint_dir)
+            print(f"Loaded checkpoint {checkpoint_dir.name} ({timesteps_done} timesteps)")
+        else:
+            print("No checkpoint found in this run yet — starting from scratch.")
+
+    while timesteps_done < cfg.total_timesteps:
+        chunk = min(cfg.save_every_timesteps, cfg.total_timesteps - timesteps_done)
+
+        model.learn(
+            total_timesteps=chunk,
+            reset_num_timesteps=False,
+            tb_log_name="PPO",
+        )
+        timesteps_done = model.num_timesteps
+
+        vec_env = model.get_vec_normalize_env()
+        ckpt_dir = ckman.save_checkpoint(
+            model,
+            vec_env,
+            timesteps_done,
+            extra_metadata={
+                "ep_rew_mean": model.logger.name_to_value.get("rollout/ep_rew_mean"),
+                "ep_len_mean": model.logger.name_to_value.get("rollout/ep_len_mean"),
+                "opponents": pool.last_opponent_descriptions(),
+            },
+        )
+        print(f"Saved checkpoint at {timesteps_done} timesteps -> {ckpt_dir}")
+
+        if cfg.self_play.enabled:
+            pool.maybe_add_checkpoint(ckpt_dir, timesteps_done)
+            opponents = pool.current_opponents()
+            env.env_method("set_opponents", opponents)
+
+        if cfg.eval_every_save:
+            obs_rms = copy.deepcopy(vec_env.obs_rms)
+            ret_rms = copy.deepcopy(vec_env.ret_rms)
+            play_test_game(model, cfg, opponents, obs_rms, ret_rms, ckman, timesteps_done)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--resume", type=str, default=None, help="Run name or path to resume from")
+    p.add_argument("--checkpoint", type=str, default=None, help="Specific checkpoint name to resume from (default: latest)")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    run(DEFAULT_CONFIG, resume_from=args.resume, resume_checkpoint=args.checkpoint)
