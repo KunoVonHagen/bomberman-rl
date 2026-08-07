@@ -24,7 +24,7 @@ from multiprocessing import freeze_support
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
 from sb3_contrib.common.wrappers import ActionMasker
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.env_util import make_vec_env
 
 from agent_code.my_agent.gym_environment import BombermanGymEnv
@@ -65,7 +65,7 @@ def build_world_args(
     )
 
 
-def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecNormalize:
+def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> SubprocVecEnv:
     world_args = build_world_args(cfg, log_dir, save_replay=False)
     env = make_vec_env(
         lambda: ActionMasker(
@@ -75,10 +75,10 @@ def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecNormalize
         n_envs=cfg.n_envs,
         vec_env_cls=SubprocVecEnv,
     )
-    return VecNormalize(env, norm_obs=True, norm_reward=True)
+    return env
 
 
-def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str) -> VecNormalize:
+def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str) -> SubprocVecEnv:
     world_args = build_world_args(cfg, log_dir, save_replay=True, replay_path=replay_path)
     env = make_vec_env(
         lambda: ActionMasker(
@@ -88,7 +88,7 @@ def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str
         n_envs=1,
         vec_env_cls=SubprocVecEnv,
     )
-    return VecNormalize(env, norm_obs=True, norm_reward=True)
+    return env
 
 
 def architecture_info(cfg: TrainingConfig) -> dict:
@@ -102,7 +102,7 @@ def architecture_info(cfg: TrainingConfig) -> dict:
     }
 
 
-def build_model(env: VecNormalize, cfg: TrainingConfig, tensorboard_log: str) -> MaskablePPO:
+def build_model(env: SubprocVecEnv, cfg: TrainingConfig, tensorboard_log: str) -> MaskablePPO:
     policy_kwargs = dict(features_extractor_class=BombermanFeatureExtractor)
     return MaskablePPO(
         "MultiInputPolicy",
@@ -128,8 +128,6 @@ def play_test_game(
     model,
     cfg: TrainingConfig,
     opponents,
-    obs_rms,
-    ret_rms,
     ckman: CheckpointManager,
     timesteps_done: int,
 ) -> None:
@@ -137,19 +135,18 @@ def play_test_game(
     replay_path = ckman.replays_dir / f"{match_name}_{timesteps_done:010d}.pkl"
 
     test_env = make_test_env(cfg, opponents, str(ckman.logs_dir), str(replay_path))
-    test_env.obs_rms = obs_rms
-    test_env.ret_rms = ret_rms
-    test_env.training = False
-    test_env.norm_reward = False
 
     obs = test_env.reset()
     done = False
+    total_reward = 0
     while not done:
         action_masks = get_action_masks(test_env)
-        action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
+        action, _ = model.predict(obs, deterministic=False, action_masks=action_masks)
         obs, reward, dones, info = test_env.step(action)
+        total_reward += reward[0]
         done = dones[0]
     test_env.close()
+    print(f"Eval game finished at {timesteps_done} timesteps, total_reward={total_reward}")
     print(f"Saved eval replay -> {replay_path}")
 
 
@@ -177,11 +174,8 @@ def run(cfg: TrainingConfig, resume_from: str | None = None, resume_checkpoint: 
             else ckman.latest_checkpoint()
         )
         if checkpoint_dir is not None:
-            loaded_model, vecnorm_path = ckman.load_model(MaskablePPO, checkpoint_dir, env=env)
+            loaded_model = ckman.load_model(MaskablePPO, checkpoint_dir, env=env)
             model = loaded_model
-            if vecnorm_path is not None:
-                env = VecNormalize.load(str(vecnorm_path), env.venv)
-                model.set_env(env)
             timesteps_done = ckman.resolved_timesteps(checkpoint_dir)
             print(f"Loaded checkpoint {checkpoint_dir.name} ({timesteps_done} timesteps)")
         else:
@@ -197,10 +191,8 @@ def run(cfg: TrainingConfig, resume_from: str | None = None, resume_checkpoint: 
         )
         timesteps_done = model.num_timesteps
 
-        vec_env = model.get_vec_normalize_env()
         ckpt_dir = ckman.save_checkpoint(
             model,
-            vec_env,
             timesteps_done,
             extra_metadata={
                 "ep_rew_mean": model.logger.name_to_value.get("rollout/ep_rew_mean"),
@@ -216,9 +208,7 @@ def run(cfg: TrainingConfig, resume_from: str | None = None, resume_checkpoint: 
             env.env_method("set_opponents", opponents)
 
         if cfg.eval_every_save:
-            obs_rms = copy.deepcopy(vec_env.obs_rms)
-            ret_rms = copy.deepcopy(vec_env.ret_rms)
-            play_test_game(model, cfg, opponents, obs_rms, ret_rms, ckman, timesteps_done)
+            play_test_game(model, cfg, opponents, ckman, timesteps_done)
 
 
 def parse_args() -> argparse.Namespace:

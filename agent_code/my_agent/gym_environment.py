@@ -1634,36 +1634,23 @@ class BombermanGymEnv(gym.Env):
         return -1.0 if best is None else float(best)
 
     def _compute_global_features(self) -> np.ndarray:
-        """Cheap, always-on numeric summary of global game state.
-
-        Every entry is O(1) or O(#agents / #bombs / #coins / #crates) --
-        never a full-grid BFS or forecast sweep -- so this method returns a
-        complete, meaningful feature vector regardless of `layer_config`
-        (including `layer_config=[]`, where every high-complexity spatial
-        layer is disabled). A couple of entries (coin/crate distance)
-        opportunistically reuse an already-computed time-aware BFS layer
-        when its group happens to be enabled, but fall back to an equally
-        cheap raw Manhattan estimate otherwise -- so they're never a hard
-        dependency on the expensive layers, just occasionally correlated
-        with them.
-
-        Every value is scaled to sit inside [-1, 1] for easy consumption by
-        a neural net: fixed-range quantities (position, elapsed time,
-        danger, mobility, remaining coins/crates/opponents) are simple
-        fractions in [0, 1]; open-ended distances use the same "-1 means
-        not applicable / none left, otherwise a clipped fraction of the
-        board size in [0, 1]" sentinel convention already used for the
-        distance-like grid layers in `_normalize_observation`.
-
-        The trailing block (safe_up/right/down/left/wait/bomb,
-        bomb_target_value, trapped_opponent_distance) is new: it distills
-        the decision checks the rule-based agent (callbacks.py) always
-        runs before choosing a move -- "which actions won't get me
-        killed", "is bombing here worth it", "is any opponent cornered
-        right now" -- into features, since the RL agent previously had no
-        direct signal for any of that beyond the single-tile bomb_danger
-        value. Like the rest of this method, they're all O(small) and
-        independent of `layer_config`.
+        """
+        Compute a vector of global features for the RL agent, including:
+        - Normalized agent position (x, y)
+        - Bombs left (binary)
+        - Step progress (normalized)
+        - Distances to nearest coin, crate, and opponent (normalized)
+        - Bomb danger (normalized)
+        - Mobility (normalized)
+        - Opponents alive (normalized)
+        - Coins remaining (normalized)
+        - Crates remaining (normalized)
+        - Safety of each action (binary)
+        - Bomb target value (normalized)
+        - Distance to nearest trapped opponent (normalized)
+        The features are normalized to be in the range [0, 1] or [-1, 1] as appropriate.
+        If a feature is not applicable (e.g., no coins remaining), it is set to -1.0.
+        The computed features are stored in `self.previous_features` for potential use in reward shaping.
         """
         f = self._features
         W1 = max(self.width - 1, 1)
@@ -1745,9 +1732,6 @@ class BombermanGymEnv(gym.Env):
 
         if new_visited > 0:
             reward += 0.02
-
-        if self.agent.dead:
-            return reward
 
         coin_dist = self._coin_distance_now()
         just_collected = e.COIN_COLLECTED in self.agent.events
