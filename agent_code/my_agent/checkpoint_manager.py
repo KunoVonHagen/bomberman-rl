@@ -88,7 +88,6 @@ class CheckpointManager:
     def save_checkpoint(
         self,
         model,
-        vec_env,
         timesteps: int,
         extra_metadata: Optional[dict] = None,
     ) -> pathlib.Path:
@@ -96,7 +95,6 @@ class CheckpointManager:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         model.save(str(ckpt_dir / "model.zip"))
-        vec_env.save(str(ckpt_dir / "vecnormalize.pkl"))
 
         metadata = {"timesteps": timesteps, "saved_at": datetime.now().isoformat()}
         if extra_metadata:
@@ -133,14 +131,13 @@ class CheckpointManager:
     def load_model(self, model_cls, checkpoint: Optional[pathlib.Path] = None, env=None, **load_kwargs):
         """
         Load a model from a checkpoint dir (defaults to the latest one).
-        Returns (model, vecnormalize_pkl_path_or_None).
+        Returns model.
         """
         ckpt_dir = checkpoint or self.latest_checkpoint()
         if ckpt_dir is None:
             return None, None
         model = model_cls.load(str(ckpt_dir / "model.zip"), env=env, **load_kwargs)
-        vecnorm_path = ckpt_dir / "vecnormalize.pkl"
-        return model, (vecnorm_path if vecnorm_path.exists() else None)
+        return model
 
     @staticmethod
     def resolved_timesteps(checkpoint_dir: pathlib.Path) -> int:
