@@ -119,13 +119,13 @@ class TrainingConfig:
 
 DEFAULT_CONFIG = TrainingConfig(
     run_name=None,
-    n_envs=32,
-    total_timesteps=50_000_000,
-    save_every_timesteps=1024 * 32 * 2,
+    n_envs=16,
+    total_timesteps=100_000_000,
+    save_every_timesteps=8192 * 16 * 2,
     ppo=PPOConfig(
-        learning_rate=3e-4,
-        n_steps=1024,
-        batch_size=256,
+        learning_rate=2e-4,
+        n_steps=8192,
+        batch_size=512,
         n_epochs=8,
         gamma=0.99,
         gae_lambda=0.97,
