@@ -14,24 +14,21 @@ OpponentPair = Tuple[Callable, Callable]
 
 class _CheckpointOpponent:
     """
-    Wraps a saved checkpoint (model + VecNormalize) as an opponent for self-play.
-    The model and VecNormalize are loaded lazily on first use, and the Gym environment is also created lazily.
+    Wraps a saved checkpoint as an opponent for self-play.
+    The model is loaded lazily on first use, and the Gym environment is also created lazily.
     This allows the opponent to be pickled and sent to subprocesses without loading the model or environment until needed.
     """
 
-    def __init__(self, model_path: str, vecnorm_path: str, env_cfg: EnvConfig):
+    def __init__(self, model_path: str, env_cfg: EnvConfig):
         self.model_path = model_path
-        self.vecnorm_path = vecnorm_path
         self.env_cfg = env_cfg
         self._model = None
-        self._vecnorm = None
         self._obs_env = None
         self._action_names = None
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_model"] = None
-        state["_vecnorm"] = None
         state["_obs_env"] = None
         state["_action_names"] = None
         return state
@@ -46,11 +43,6 @@ class _CheckpointOpponent:
                 self.model_path,
                 custom_objects={"n_envs": 1, "n_steps": 1},
             )
-
-        if self._vecnorm is None:
-            import pickle
-            with open(self.vecnorm_path, "rb") as f:
-                self._vecnorm = pickle.load(f)
 
         if self._obs_env is None:
             from agent_code.my_agent.gym_environment import BombermanGymEnv, ACTION_INDICES
@@ -73,8 +65,8 @@ class _CheckpointOpponent:
                 replay=False,
                 continue_without_training=self.env_cfg.continue_without_training,
             )
-            self._obs_env = BombermanGymEnv(world_args, opponents=[], layer_config=self.env_cfg.layer_config)
-            self._action_names = {v: k for k, v in ACTION_INDICES.items()}
+            self._obs_env = BombermanGymEnv(world_args, opponents=[((lambda handle: None), (lambda handle, state: "WAIT"))] * 3, layer_config=self.env_cfg.layer_config)
+            self._action_names = {v: k for k, v in ACTION_INDICES.items() if k is not None}
 
     def setup(self, agent):
         self._ensure_ready()
@@ -84,18 +76,17 @@ class _CheckpointOpponent:
         self._ensure_ready()
         obs_env = self._obs_env
         obs = obs_env.observation_from_game_state(game_state)
-        obs = self._vecnorm.normalize_obs(obs)
         action_masks = obs_env.action_masks()
 
-        action_idx, _ = self._model.predict(obs, deterministic=True, action_masks=action_masks)
+        action_idx, _ = self._model.predict(obs, deterministic=False, action_masks=action_masks)
         return self._action_names[int(action_idx)]
 
     def as_pair(self) -> OpponentPair:
         return (self.setup, self.act)
 
 
-def _make_checkpoint_opponent(model_path: str, vecnorm_path: str, env_cfg: EnvConfig) -> OpponentPair:
-    return _CheckpointOpponent(model_path, vecnorm_path, env_cfg).as_pair()
+def _make_checkpoint_opponent(model_path: str, env_cfg: EnvConfig) -> OpponentPair:
+    return _CheckpointOpponent(model_path, env_cfg).as_pair()
 
 
 class OpponentPool:
@@ -133,8 +124,7 @@ class OpponentPool:
         key = str(checkpoint_dir.resolve())
         if key not in self._opponent_cache:
             model_path = str((checkpoint_dir / "model.zip").resolve())
-            vecnorm_path = str((checkpoint_dir / "vecnormalize.pkl").resolve())
-            self._opponent_cache[key] = _make_checkpoint_opponent(model_path, vecnorm_path, self.env_cfg)
+            self._opponent_cache[key] = _make_checkpoint_opponent(model_path, self.env_cfg)
         return self._opponent_cache[key]
 
     @staticmethod
