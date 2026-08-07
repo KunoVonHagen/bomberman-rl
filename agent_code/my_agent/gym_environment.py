@@ -30,7 +30,8 @@ from rewards import (
     CRATE_SHAPING_COEF,
     COIN_SHAPING_COEF,
     ESCAPE_BONUS_COEF,
-    DANGER_PENALTY_COEF
+    DANGER_PENALTY_COEF,
+    TRAP_SHAPING_COEF
 )
 
 # Kept for drop-in compatibility with callers that construct WorldArgs(...).
@@ -540,6 +541,7 @@ class BombermanGymEnv(gym.Env):
         self._prev_coin_dist: Optional[float] = None
         self._prev_crate_dist: Optional[float] = None
         self._prev_bomb_danger: float = 0.0
+        self._prev_trap_dist: float = 0.0
 
         self.agent_actions = {}
 
@@ -1754,6 +1756,11 @@ class BombermanGymEnv(gym.Env):
         if self._prev_bomb_danger > danger:
             reward += ESCAPE_BONUS_COEF * (self._prev_bomb_danger - danger)
         self._prev_bomb_danger = danger
+
+        trap_dist = self._nearest_trapped_opponent_distance()
+        if trap_dist >= 0 and self._prev_trap_dist is not None and self._prev_trap_dist >= 0:
+            reward += TRAP_SHAPING_COEF * (self._prev_trap_dist - trap_dist)
+        self._prev_trap_dist = trap_dist
 
         return reward
 
