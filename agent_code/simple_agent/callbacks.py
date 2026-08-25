@@ -1,16 +1,35 @@
 import json
 import os
 import random
+from collections import OrderedDict
 
 import numpy as np
 
 import settings as s
 from .constants import ACTION_DELTA, DIRECTIONS, HORIZON
-from .pathfinding import bfs_next_step, find_reachable_tiles, bfs_distance
+from .pathfinding import bfs_next_step, find_reachable_tiles
 from .blast import get_blast_coords, project_cleared_field
 from .traps import find_traps
 from .danger import compute_danger_map, find_escape_action, has_escape_route, can_escape_own_bomb
-from .targeting import fastest_opponent_to, best_bomb_spot
+from .targeting import build_opponent_distance_maps, fastest_opponent_to, best_bomb_spot
+
+_DANGER_MAP_CACHE = OrderedDict()
+_DANGER_MAP_CACHE_MAXSIZE = 64
+
+
+def _cached_compute_danger_map(field, bombs, explosion_map, power, horizon):
+    key = (field.tobytes(), tuple(sorted(bombs)), explosion_map.tobytes(), power, horizon)
+    cached = _DANGER_MAP_CACHE.get(key)
+    if cached is not None:
+        _DANGER_MAP_CACHE.move_to_end(key)
+        return cached
+
+    result = compute_danger_map(field, bombs, explosion_map, power, horizon)
+    _DANGER_MAP_CACHE[key] = result
+    _DANGER_MAP_CACHE.move_to_end(key)
+    if len(_DANGER_MAP_CACHE) > _DANGER_MAP_CACHE_MAXSIZE:
+        _DANGER_MAP_CACHE.popitem(last=False)
+    return result
 
 
 REPLAY_LOG_PATH = os.path.join(os.path.dirname(__file__),
@@ -51,7 +70,7 @@ def _write_replay_frame(self, game_state, action, reason, danger_map=None, pocke
     bomb_positions = {b_pos for b_pos, _ in bombs}
 
     if danger_map is None:
-        danger_map = compute_danger_map(
+        danger_map = _cached_compute_danger_map(
             field, bombs, explosion_map, s.BOMB_POWER, HORIZON
         )
     danger_zone = set().union(*danger_map)
@@ -125,7 +144,7 @@ def act(self, game_state: dict):
     if bombs_left:
         self.own_bomb_pos = None
 
-    danger_map = compute_danger_map(field, bombs, explosion_map, s.BOMB_POWER, HORIZON)
+    danger_map = _cached_compute_danger_map(field, bombs, explosion_map, s.BOMB_POWER, HORIZON)
     danger_zone = set().union(*danger_map)
 
     # 1. If currently standing in a future blast, escape first.
@@ -140,6 +159,13 @@ def act(self, game_state: dict):
                  if field[x + dx, y + dy] == 0 and (x + dx, y + dy) not in occupied]
         return _finish(self, game_state, random.choice(moves) if moves else 'WAIT', "emergency safe move", danger_map)
 
+    avoid_base = danger_zone | bomb_positions | opponent_positions
+    own_reachable = find_reachable_tiles(field, pos, avoid=avoid_base)
+    opp_dist_maps = build_opponent_distance_maps(field, others) if others else {}
+
+    escape_cache = {}
+    blast_cache = {}
+
     # 2. Identify dead-end pockets, both now and after pending bombs clear crates.
     pockets = find_traps(field, s.BOMB_POWER) if others else {}
     future_pockets = {}
@@ -150,11 +176,11 @@ def act(self, game_state: dict):
     # 3. If we're trapped and an opponent could seal us in, flee toward the chokepoint.
     if pos in pockets:
         choke, pocket, _dist_to_choke, _lethal = pockets[pos]
-        our_dist = bfs_distance(field, pos, choke, avoid=danger_zone | bomb_positions | opponent_positions)
+        our_dist = own_reachable.get(choke)
         if our_dist is not None:
-            opp_dist = fastest_opponent_to(field, choke, others, exclude=pocket)
+            opp_dist = fastest_opponent_to(opp_dist_maps, choke, exclude=pocket)
             if opp_dist is not None and opp_dist <= our_dist + s.BOMB_TIMER:
-                move = bfs_next_step(field, pos, {choke}, avoid=danger_zone | bomb_positions | opponent_positions)
+                move = bfs_next_step(field, pos, {choke}, avoid=avoid_base)
                 if move is not None:
                     return _finish(self, game_state, move, "move toward tactical target", danger_map, pockets)
 
@@ -170,35 +196,45 @@ def act(self, game_state: dict):
             their_pocket = find_reachable_tiles(field, opp_pos, avoid={choke})
             if pos in their_pocket and pos != choke:
                 continue
-            our_dist = bfs_distance(field, pos, choke, avoid=danger_zone | bomb_positions | opponent_positions)
-            their_dist = bfs_distance(field, opp_pos, choke)
+            our_dist = own_reachable.get(choke)
+            their_dist = opp_dist_maps.get(opp_pos, {}).get(choke)
             if our_dist is None or their_dist is None or our_dist > their_dist:
                 continue
             if pos == choke:
-                if lethal and can_escape_own_bomb(field, bombs, explosion_map, choke, s.BOMB_POWER, s.BOMB_TIMER, HORIZON, opponent_positions):
+                if choke not in escape_cache:
+                    escape_cache[choke] = can_escape_own_bomb(
+                        field, bombs, explosion_map, choke, s.BOMB_POWER, s.BOMB_TIMER, HORIZON, opponent_positions,
+                        base_danger_map=danger_map)
+                if lethal and escape_cache[choke]:
                     self.own_bomb_pos = pos
                     return _finish(self, game_state, 'BOMB', "place a tactical bomb", danger_map, pockets)
                 return _finish(self, game_state, 'WAIT', "wait for a tactical opening", danger_map, pockets)
             else:
-                move = bfs_next_step(field, pos, {choke}, avoid=danger_zone | bomb_positions | opponent_positions)
+                move = bfs_next_step(field, pos, {choke}, avoid=avoid_base)
                 if move is not None:
                     return _finish(self, game_state, move, "move toward tactical target", danger_map, pockets)
 
     # 5. Look for a bomb spot that would hit a reachable, inescapable opponent.
     if bombs_left and others:
-        reachable = find_reachable_tiles(field, pos, avoid=danger_zone | bomb_positions | opponent_positions)
         best_strike = None
         for _, _, _, opp_pos in others:
-            for spot in get_blast_coords(field, opp_pos, s.BOMB_POWER):
-                dist = reachable.get(spot)
+            if opp_pos not in blast_cache:
+                blast_cache[opp_pos] = get_blast_coords(field, opp_pos, s.BOMB_POWER)
+            for spot in blast_cache[opp_pos]:
+                dist = own_reachable.get(spot)
                 if dist is None or dist > s.BOMB_TIMER:
                     continue
                 if best_strike is not None and dist >= best_strike[0]:
                     continue
                 opp_occupied = ({b_pos for b_pos, _ in bombs} | opponent_positions | {spot}) - {opp_pos}
-                if has_escape_route(field, bombs, explosion_map, spot, s.BOMB_TIMER, s.BOMB_POWER, HORIZON, opp_pos, opp_occupied):
+                if has_escape_route(field, bombs, explosion_map, spot, s.BOMB_TIMER, s.BOMB_POWER, HORIZON, opp_pos, opp_occupied,
+                                    base_danger_map=danger_map):
                     continue
-                if not can_escape_own_bomb(field, bombs, explosion_map, spot, s.BOMB_POWER, s.BOMB_TIMER, HORIZON, opponent_positions):
+                if spot not in escape_cache:
+                    escape_cache[spot] = can_escape_own_bomb(
+                        field, bombs, explosion_map, spot, s.BOMB_POWER, s.BOMB_TIMER, HORIZON, opponent_positions,
+                        base_danger_map=danger_map)
+                if not escape_cache[spot]:
                     continue
                 best_strike = (dist, spot)
         if best_strike is not None:
@@ -206,7 +242,7 @@ def act(self, game_state: dict):
             if target_pos == pos:
                 self.own_bomb_pos = pos
                 return _finish(self, game_state, 'BOMB', "place a tactical bomb", danger_map, pockets)
-            move = bfs_next_step(field, pos, {target_pos}, avoid=danger_zone | bomb_positions | opponent_positions)
+            move = bfs_next_step(field, pos, {target_pos}, avoid=avoid_base)
             if move is not None:
                 return _finish(self, game_state, move, "move toward tactical target", danger_map, pockets)
 
@@ -217,7 +253,7 @@ def act(self, game_state: dict):
         if pocket in seen_pockets:
             continue
         seen_pockets.add(pocket)
-        opp_dist = fastest_opponent_to(field, choke, others, exclude=pocket)
+        opp_dist = fastest_opponent_to(opp_dist_maps, choke, exclude=pocket)
         if opp_dist is None:
             continue
         for t in pocket:
@@ -227,15 +263,17 @@ def act(self, game_state: dict):
     # 7. Go collect the nearest safe coin.
     coin_action = bfs_next_step(field, pos, coins, avoid=danger_zone | risky | bomb_positions | opponent_positions)
     if coin_action is None:
-        coin_action = bfs_next_step(field, pos, coins, avoid=danger_zone | bomb_positions | opponent_positions)
+        coin_action = bfs_next_step(field, pos, coins, avoid=avoid_base)
 
     # 8. No coin reachable: head toward the best crate-clearing bomb spot instead.
     if coin_action is None and bombs_left:
         avoid_for_spot = danger_zone | risky | bomb_positions | opponent_positions
-        target = best_bomb_spot(field, bombs, explosion_map, avoid_for_spot, pos, s.BOMB_POWER, s.BOMB_TIMER, HORIZON, others, opponent_positions)
+        target = best_bomb_spot(field, bombs, explosion_map, avoid_for_spot, pos, s.BOMB_POWER, s.BOMB_TIMER, HORIZON, opp_dist_maps, opponent_positions,
+                                 escape_cache=escape_cache, blast_cache=blast_cache, base_danger_map=danger_map)
         if target is None:
-            avoid_for_spot = danger_zone | bomb_positions | opponent_positions
-            target = best_bomb_spot(field, bombs, explosion_map, avoid_for_spot, pos, s.BOMB_POWER, s.BOMB_TIMER, HORIZON, others, opponent_positions)
+            avoid_for_spot = avoid_base
+            target = best_bomb_spot(field, bombs, explosion_map, avoid_for_spot, pos, s.BOMB_POWER, s.BOMB_TIMER, HORIZON, opp_dist_maps, opponent_positions, reachable=own_reachable,
+                                     escape_cache=escape_cache, blast_cache=blast_cache, base_danger_map=danger_map)
         if target is not None:
             target_pos, _ = target
             if target_pos == pos:
@@ -251,13 +289,12 @@ def act(self, game_state: dict):
     # 9. Retreat toward our own just-placed bomb's safe zone while it counts down.
     if self.own_bomb_pos is not None:
         dist_to_bomb = find_reachable_tiles(field, self.own_bomb_pos, avoid=bomb_positions - {self.own_bomb_pos})
-        reachable_safe = find_reachable_tiles(field, pos, avoid=danger_zone | bomb_positions | opponent_positions)
-        candidates = [t for t in reachable_safe if t in dist_to_bomb]
+        candidates = [t for t in own_reachable if t in dist_to_bomb]
         if candidates:
-            best_tile = min(candidates, key=lambda t: (dist_to_bomb[t], reachable_safe[t]))
+            best_tile = min(candidates, key=lambda t: (dist_to_bomb[t], own_reachable[t]))
             if best_tile == pos:
                 return _finish(self, game_state, 'WAIT', "wait for a tactical opening", danger_map, pockets)
-            move = bfs_next_step(field, pos, {best_tile}, avoid=danger_zone | bomb_positions | opponent_positions)
+            move = bfs_next_step(field, pos, {best_tile}, avoid=avoid_base)
             if move is not None:
                 return _finish(self, game_state, move, "move toward tactical target", danger_map, pockets)
 
@@ -277,8 +314,8 @@ def act(self, game_state: dict):
                 if choke in seen_chokes or field[choke] != 0:
                     continue
                 seen_chokes.add(choke)
-                opp_dist = fastest_opponent_to(field, choke, others, exclude=pocket)
-                our_dist = bfs_distance(field, pos, choke, avoid=danger_zone | bomb_positions | opponent_positions)
+                opp_dist = fastest_opponent_to(opp_dist_maps, choke, exclude=pocket)
+                our_dist = own_reachable.get(choke)
                 if opp_dist is None or our_dist is None:
                     continue
                 if our_dist <= opp_dist + s.BOMB_TIMER:
@@ -286,7 +323,7 @@ def act(self, game_state: dict):
 
         hunt_action = bfs_next_step(field, pos, hunt_targets, avoid=danger_zone | risky | bomb_positions | opponent_positions)
         if hunt_action is None:
-            hunt_action = bfs_next_step(field, pos, hunt_targets, avoid=danger_zone | bomb_positions | opponent_positions)
+            hunt_action = bfs_next_step(field, pos, hunt_targets, avoid=avoid_base)
         if hunt_action is not None:
             return _finish(self, game_state, hunt_action, "hunt opponent or approach chokepoint", danger_map, pockets)
 

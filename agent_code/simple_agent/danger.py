@@ -24,6 +24,18 @@ def compute_danger_map(field, bombs, explosion_map, power, horizon):
     return danger
 
 
+def _extend_danger_map(base_danger_map, field, bomb_pos, bomb_timer, power, horizon):
+    """Return base_danger_map plus the blast contribution of one extra bomb."""
+    blast = get_blast_coords(field, bomb_pos, power)
+    explode_at = bomb_timer + 1
+
+    extended = list(base_danger_map)
+    for t in (explode_at, explode_at + 1):
+        if 0 <= t <= horizon:
+            extended[t] = base_danger_map[t] | blast
+    return extended
+
+
 def _time_expanded_search(field, occupied, danger_map, start, horizon):
     """BFS over (position, time) states to find a first action leading to permanent safety.
 
@@ -74,16 +86,22 @@ def find_escape_action(field, bombs, danger_map, start, horizon, opponent_positi
     return full_safe if full_safe is not None else fallback
 
 
-def has_escape_route(field, bombs, explosion_map, bomb_pos, bomb_timer, power, horizon, start, occupied):
+def has_escape_route(field, bombs, explosion_map, bomb_pos, bomb_timer, power, horizon, start, occupied,
+                      base_danger_map=None):
     """Return True if a path to full safety exists from `start`, assuming a bomb is placed at `bomb_pos`."""
-    hypothetical_bombs = list(bombs) + [(bomb_pos, bomb_timer)]
-    danger_map = compute_danger_map(field, hypothetical_bombs, explosion_map, power, horizon)
+    if base_danger_map is not None:
+        danger_map = _extend_danger_map(base_danger_map, field, bomb_pos, bomb_timer, power, horizon)
+    else:
+        hypothetical_bombs = list(bombs) + [(bomb_pos, bomb_timer)]
+        danger_map = compute_danger_map(field, hypothetical_bombs, explosion_map, power, horizon)
     full_safe, _ = _time_expanded_search(field, occupied, danger_map, start, horizon)
     return full_safe is not None
 
 
-def can_escape_own_bomb(field, bombs, explosion_map, pos, power, timer, horizon, opponent_positions=frozenset()):
+def can_escape_own_bomb(field, bombs, explosion_map, pos, power, timer, horizon, opponent_positions=frozenset(),
+                         base_danger_map=None):
     """Return True if the agent could survive dropping a bomb at `pos` right now."""
     occupied = {b_pos for b_pos, _ in bombs} | opponent_positions
     occupied.add(pos)
-    return has_escape_route(field, bombs, explosion_map, pos, timer, power, horizon, pos, occupied)
+    return has_escape_route(field, bombs, explosion_map, pos, timer, power, horizon, pos, occupied,
+                             base_danger_map=base_danger_map)

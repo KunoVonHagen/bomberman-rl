@@ -1,4 +1,4 @@
-from collections import deque
+from collections import deque, OrderedDict
 
 from .constants import DIRECTIONS
 from .blast import get_blast_coords
@@ -142,7 +142,7 @@ def _dfs_analyze(adj):
     }
 
 
-def find_traps(field, power):
+def _find_traps_uncached(field, power):
     """Identify dead-end pockets on `field` reachable only through a single chokepoint.
 
     Returns {tile: (chokepoint, pocket, dist_to_choke, lethal)} for every tile in such a pocket,
@@ -215,3 +215,22 @@ def find_traps(field, power):
                     traps[t] = (c, pocket, dist_to_choke, lethal)
 
     return traps
+
+_TRAPS_CACHE = OrderedDict()
+_TRAPS_CACHE_MAXSIZE = 64
+
+
+def find_traps(field, power):
+    """Cached version of the trap/pocket/chokepoint analysis."""
+    key = (field.tobytes(), power)
+    cached = _TRAPS_CACHE.get(key)
+    if cached is not None:
+        _TRAPS_CACHE.move_to_end(key)
+        return cached
+
+    result = _find_traps_uncached(field, power)
+    _TRAPS_CACHE[key] = result
+    _TRAPS_CACHE.move_to_end(key)
+    if len(_TRAPS_CACHE) > _TRAPS_CACHE_MAXSIZE:
+        _TRAPS_CACHE.popitem(last=False)
+    return result
