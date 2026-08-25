@@ -17,6 +17,8 @@ REPLAY_LOG_PATH = os.path.join(os.path.dirname(__file__),
     "simple_agent_thoughts.json",
 )
 
+SAVE_REPLAY = getattr(s, "SAVE_REPLAY", False)
+
 
 def _jsonable(value):
     """Convert numpy/sets/tuples and other game-state values to JSON-safe data."""
@@ -32,7 +34,7 @@ def _jsonable(value):
     return value
 
 
-def _write_replay_frame(self, game_state, action, reason):
+def _write_replay_frame(self, game_state, action, reason, danger_map=None, pockets=None):
     """Append one visualization frame to the replay JSONL file.
 
     This records decision-relevant state/features, not private hidden chain-of-thought.
@@ -48,9 +50,10 @@ def _write_replay_frame(self, game_state, action, reason):
     opponent_positions = {opp_pos for _, _, _, opp_pos in others}
     bomb_positions = {b_pos for b_pos, _ in bombs}
 
-    danger_map = compute_danger_map(
-        field, bombs, explosion_map, s.BOMB_POWER, HORIZON
-    )
+    if danger_map is None:
+        danger_map = compute_danger_map(
+            field, bombs, explosion_map, s.BOMB_POWER, HORIZON
+        )
     danger_zone = set().union(*danger_map)
 
     reachable = find_reachable_tiles(
@@ -59,7 +62,8 @@ def _write_replay_frame(self, game_state, action, reason):
         avoid=danger_zone | bomb_positions | opponent_positions,
     )
 
-    pockets = find_traps(field, s.BOMB_POWER) if others else {}
+    if pockets is None:
+        pockets = find_traps(field, s.BOMB_POWER) if others else {}
     trap_tiles = set()
     chokepoints = set()
     for choke, pocket, _dist_to_choke, _lethal in pockets.values():
@@ -86,9 +90,10 @@ def _write_replay_frame(self, game_state, action, reason):
         replay_file.write(json.dumps(frame, separators=(",", ":")) + "\n")
 
 
-def _finish(self, game_state, action, reason):
+def _finish(self, game_state, action, reason, danger_map=None, pockets=None):
     """Record the chosen action, then return it to the game engine."""
-    _write_replay_frame(self, game_state, action, reason)
+    if SAVE_REPLAY:
+        _write_replay_frame(self, game_state, action, reason, danger_map, pockets)
     return action
 
 
@@ -97,9 +102,10 @@ def setup(self):
     self.own_bomb_pos = None
     self._replay_initialized = True
 
-    os.makedirs(os.path.dirname(REPLAY_LOG_PATH), exist_ok=True)
-    with open(REPLAY_LOG_PATH, "w", encoding="utf-8"):
-        pass
+    if SAVE_REPLAY:
+        os.makedirs(os.path.dirname(REPLAY_LOG_PATH), exist_ok=True)
+        with open(REPLAY_LOG_PATH, "w", encoding="utf-8"):
+            pass
 
 
 def act(self, game_state: dict):
@@ -127,12 +133,12 @@ def act(self, game_state: dict):
     if currently_unsafe:
         escape = find_escape_action(field, bombs, danger_map, pos, HORIZON, opponent_positions)
         if escape is not None:
-            return _finish(self, game_state, escape, "escape danger")
+            return _finish(self, game_state, escape, "escape danger", danger_map)
         x, y = pos
         occupied = {b_pos for b_pos, _ in bombs} | opponent_positions
         moves = [move for move, (dx, dy) in ACTION_DELTA.items()
                  if field[x + dx, y + dy] == 0 and (x + dx, y + dy) not in occupied]
-        return _finish(self, game_state, random.choice(moves) if moves else 'WAIT', "emergency safe move")
+        return _finish(self, game_state, random.choice(moves) if moves else 'WAIT', "emergency safe move", danger_map)
 
     # 2. Identify dead-end pockets, both now and after pending bombs clear crates.
     pockets = find_traps(field, s.BOMB_POWER) if others else {}
@@ -150,7 +156,7 @@ def act(self, game_state: dict):
             if opp_dist is not None and opp_dist <= our_dist + s.BOMB_TIMER:
                 move = bfs_next_step(field, pos, {choke}, avoid=danger_zone | bomb_positions | opponent_positions)
                 if move is not None:
-                    return _finish(self, game_state, move, "move toward tactical target")
+                    return _finish(self, game_state, move, "move toward tactical target", danger_map, pockets)
 
     # 4. If an opponent is trapped and we can beat them to the chokepoint, seal or bomb it.
     if bombs_left:
@@ -171,12 +177,12 @@ def act(self, game_state: dict):
             if pos == choke:
                 if lethal and can_escape_own_bomb(field, bombs, explosion_map, choke, s.BOMB_POWER, s.BOMB_TIMER, HORIZON, opponent_positions):
                     self.own_bomb_pos = pos
-                    return _finish(self, game_state, 'BOMB', "place a tactical bomb")
-                return _finish(self, game_state, 'WAIT', "wait for a tactical opening")
+                    return _finish(self, game_state, 'BOMB', "place a tactical bomb", danger_map, pockets)
+                return _finish(self, game_state, 'WAIT', "wait for a tactical opening", danger_map, pockets)
             else:
                 move = bfs_next_step(field, pos, {choke}, avoid=danger_zone | bomb_positions | opponent_positions)
                 if move is not None:
-                    return _finish(self, game_state, move, "move toward tactical target")
+                    return _finish(self, game_state, move, "move toward tactical target", danger_map, pockets)
 
     # 5. Look for a bomb spot that would hit a reachable, inescapable opponent.
     if bombs_left and others:
@@ -199,10 +205,10 @@ def act(self, game_state: dict):
             _, target_pos = best_strike
             if target_pos == pos:
                 self.own_bomb_pos = pos
-                return _finish(self, game_state, 'BOMB', "place a tactical bomb")
+                return _finish(self, game_state, 'BOMB', "place a tactical bomb", danger_map, pockets)
             move = bfs_next_step(field, pos, {target_pos}, avoid=danger_zone | bomb_positions | opponent_positions)
             if move is not None:
-                return _finish(self, game_state, move, "move toward tactical target")
+                return _finish(self, game_state, move, "move toward tactical target", danger_map, pockets)
 
     # 6. Mark tiles that are only risky because an opponent could trap us there.
     risky = set()
@@ -234,13 +240,13 @@ def act(self, game_state: dict):
             target_pos, _ = target
             if target_pos == pos:
                 self.own_bomb_pos = pos
-                return _finish(self, game_state, 'BOMB', "place a tactical bomb")
+                return _finish(self, game_state, 'BOMB', "place a tactical bomb", danger_map, pockets)
             move = bfs_next_step(field, pos, {target_pos}, avoid=avoid_for_spot)
             if move is not None:
-                return _finish(self, game_state, move, "move toward tactical target")
+                return _finish(self, game_state, move, "move toward tactical target", danger_map, pockets)
 
     if coin_action is not None:
-        return _finish(self, game_state, coin_action, "collect nearest safe coin")
+        return _finish(self, game_state, coin_action, "collect nearest safe coin", danger_map, pockets)
 
     # 9. Retreat toward our own just-placed bomb's safe zone while it counts down.
     if self.own_bomb_pos is not None:
@@ -250,10 +256,10 @@ def act(self, game_state: dict):
         if candidates:
             best_tile = min(candidates, key=lambda t: (dist_to_bomb[t], reachable_safe[t]))
             if best_tile == pos:
-                return _finish(self, game_state, 'WAIT', "wait for a tactical opening")
+                return _finish(self, game_state, 'WAIT', "wait for a tactical opening", danger_map, pockets)
             move = bfs_next_step(field, pos, {best_tile}, avoid=danger_zone | bomb_positions | opponent_positions)
             if move is not None:
-                return _finish(self, game_state, move, "move toward tactical target")
+                return _finish(self, game_state, move, "move toward tactical target", danger_map, pockets)
 
     # 10. Nothing better to do: hunt opponents, favoring chokepoints we can beat them to.
     if others:
@@ -282,7 +288,7 @@ def act(self, game_state: dict):
         if hunt_action is None:
             hunt_action = bfs_next_step(field, pos, hunt_targets, avoid=danger_zone | bomb_positions | opponent_positions)
         if hunt_action is not None:
-            return _finish(self, game_state, hunt_action, "hunt opponent or approach chokepoint")
+            return _finish(self, game_state, hunt_action, "hunt opponent or approach chokepoint", danger_map, pockets)
 
     # 11. Fallback: take any safe move, preferring non-risky tiles.
     x, y = pos
@@ -297,4 +303,4 @@ def act(self, game_state: dict):
         valid = preferred
     valid.append('WAIT')
 
-    return _finish(self, game_state, random.choice(valid), "fallback safe action")
+    return _finish(self, game_state, random.choice(valid), "fallback safe action", danger_map, pockets)

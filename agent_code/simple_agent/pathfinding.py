@@ -51,4 +51,17 @@ def bfs_distance(field, start, target, avoid=frozenset()):
     """Return the shortest-path distance from `start` to `target`, or None if unreachable."""
     if start == target:
         return 0
-    return find_reachable_tiles(field, start, avoid=avoid).get(target)
+
+    visited = {start}
+    queue = deque([(start, 0)])
+    while queue:
+        (cx, cy), dist = queue.popleft()
+        for dx, dy in DIRECTIONS:
+            nx, ny = cx + dx, cy + dy
+            if field[nx, ny] == 0 and (nx, ny) not in avoid and (nx, ny) not in visited:
+                if (nx, ny) == target:
+                    return dist + 1
+                visited.add((nx, ny))
+                queue.append(((nx, ny), dist + 1))
+
+    return None
