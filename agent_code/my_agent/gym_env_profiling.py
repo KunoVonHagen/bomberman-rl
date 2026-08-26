@@ -1,7 +1,7 @@
 import time
 import pathlib
 
-from gym_environment import BombermanGymEnv
+from agent_code.my_agent.gym_environment import BombermanGymEnv
 from environment import WorldArgs
 from agent_code.my_agent.callbacks import setup as my_agent_setup, act as my_agent_act
 from agent_code.random_agent.callbacks import setup as random_agent_setup, act as random_agent_act
@@ -31,19 +31,7 @@ def benchmark_environment(num_episodes=100, opponents=None):
 
     env = BombermanGymEnv(
         CLASSIC_ENV_ARGS,
-        opponents=opponents,
-        layer_config=[
-            "base",
-            "timer_channels",
-            #"forecast",
-            #"self_distance",
-            #"opponent_distance",
-            #"crate_potential",
-            #"danger_summary",
-            #"mobility",
-            #"crate_distance",
-            #"coin_distance"
-        ]
+        opponents=opponents
     )
 
     total_steps = 0
