@@ -21,19 +21,19 @@ import argparse
 import copy
 from multiprocessing import freeze_support
 
+import numpy as np
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
-from sb3_contrib.common.wrappers import ActionMasker
-from stable_baselines3.common.vec_env import SubprocVecEnv
-from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv
+from stable_baselines3.common.vec_env.base_vec_env import VecEnvObs, VecEnvStepReturn
 
 from environment import WorldArgs
 
-from .gym_environment import BombermanGymEnv
-from .model import BombermanFeatureExtractor
-from .config import DEFAULT_CONFIG, TrainingConfig
-from .checkpoint_manager import CheckpointManager
-from .opponent_pool import OpponentPool
+from agent_code.my_agent.gym_environment import BombermanGymEnv
+from agent_code.my_agent.model import BombermanFeatureExtractor
+from agent_code.my_agent.config import DEFAULT_CONFIG, TrainingConfig
+from agent_code.my_agent.checkpoint_manager import CheckpointManager
+from agent_code.my_agent.opponent_pool import OpponentPool
 
 
 def mask_fn(env):
@@ -65,31 +65,121 @@ def build_world_args(
     )
 
 
-def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> SubprocVecEnv:
+# --- ADD THIS NEW WRAPPER CLASS ---
+class NativeBatchedVecEnv(VecEnv):
+    """
+    Adapter to make a natively batched Gymnasium Env (like BombermanGymEnv)
+    compatible with Stable-Baselines3's VecEnv API.
+    """
+
+    def __init__(self, batched_env):
+        self.env = batched_env
+        super().__init__(
+            num_envs=self.env.n_envs,
+            observation_space=self.env.single_observation_space,  # NOT self.env.observation_space
+            action_space=self.env.single_action_space  # NOT self.env.action_space
+        )
+        self._actions = None
+        self._last_infos: list[dict] = []
+
+    def reset(self, seed=None, options=None):
+        # Unpack the tuple from the underlying env
+        obs, infos = self.env.reset(seed=seed, options=options)
+        self._last_infos = infos
+        # Return ONLY obs, not the tuple - works around sb3_contrib bug
+        return obs
+
+    def step_async(self, actions: np.ndarray) -> None:
+        self._actions = actions
+
+    def step_wait(self):
+        obs, rewards, terminated, truncated, infos = self.env.step(self._actions)
+        dones = terminated | truncated
+        self._last_infos = infos
+        return obs, rewards, dones, infos
+
+    def step(self, actions: np.ndarray):
+        self.step_async(actions)
+        return self.step_wait()
+
+    def close(self) -> None:
+        return self.env.close()
+
+    def env_method(self, method_name: str, *args, **kwargs) -> list:
+        result = getattr(self.env, method_name)(*args, **kwargs)
+        return [result]
+
+    def action_masks(self) -> np.ndarray:
+        return self.env.action_masks()
+
+    def env_is_wrapped(self, wrapper_class: type, indices: list[int] | None = None) -> list[bool]:
+        if indices is None:
+            return [False] * self.num_envs
+        return [False] * len(indices)
+
+    def get_attr(self, attr_name: str, indices: list[int] | None = None) -> list:
+        attr = getattr(self.env, attr_name)
+        if indices is None:
+            if isinstance(attr, (list, np.ndarray)) and len(attr) == self.num_envs:
+                return list(attr)
+            return [attr] * self.num_envs
+        if isinstance(attr, (list, np.ndarray)) and len(attr) == self.num_envs:
+            return [attr[i] for i in indices]
+        return [attr] * len(indices)
+
+    def set_attr(self, attr_name: str, values, indices: list[int] | None = None) -> None:
+        if indices is None:
+            if isinstance(values, (list, np.ndarray)) and len(values) == self.num_envs:
+                setattr(self.env, attr_name, values)
+            else:
+                setattr(self.env, attr_name, values)
+        else:
+            current = getattr(self.env, attr_name)
+            if isinstance(current, (list, np.ndarray)) and len(current) == self.num_envs:
+                if isinstance(current, np.ndarray):
+                    current[indices] = values
+                else:
+                    for idx, val in zip(indices, values):
+                        current[idx] = val
+                setattr(self.env, attr_name, current)
+            else:
+                setattr(self.env, attr_name, values[0] if isinstance(values, (list, np.ndarray)) else values)
+
+    def get_images(self) -> list[np.ndarray]:
+        return [None] * self.num_envs
+
+
+# -----------------------------------
+
+def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> NativeBatchedVecEnv:
     world_args = build_world_args(cfg, log_dir, save_replay=False)
-    env = make_vec_env(
-        lambda: ActionMasker(
-            BombermanGymEnv(world_args, opponents=opponents, layer_config=cfg.env.layer_config),
-            mask_fn,
-        ),
-        n_envs=cfg.n_envs,
-        vec_env_cls=SubprocVecEnv,
+
+    # 1. Instantiate the natively batched environment directly
+    # Pass cfg.n_envs HERE, not to a VecEnv wrapper
+    env = BombermanGymEnv(
+        world_args,
+        opponents=opponents,
+        layer_config=cfg.env.layer_config,
+        n_envs=cfg.n_envs
     )
-    return env
+
+    # 2. Wrap it in our custom adapter. NO SubprocVecEnv, NO ActionMasker needed here
+    # because the adapter handles action_masks directly.
+    return NativeBatchedVecEnv(env)
 
 
-def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str) -> SubprocVecEnv:
+def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str) -> NativeBatchedVecEnv:
     world_args = build_world_args(cfg, log_dir, save_replay=True, replay_path=replay_path)
-    env = make_vec_env(
-        lambda: ActionMasker(
-            BombermanGymEnv(world_args, opponents=opponents, layer_config=cfg.env.layer_config),
-            mask_fn,
-        ),
-        n_envs=1,
-        vec_env_cls=SubprocVecEnv,
-    )
-    return env
 
+    # For testing, we usually just want 1 game playing out
+    env = BombermanGymEnv(
+        world_args,
+        opponents=opponents,
+        layer_config=cfg.env.layer_config,
+        n_envs=1
+    )
+
+    return NativeBatchedVecEnv(env)
 
 def architecture_info(cfg: TrainingConfig) -> dict:
     """Static description of the model, written once into run_manifest.json
@@ -102,7 +192,7 @@ def architecture_info(cfg: TrainingConfig) -> dict:
     }
 
 
-def build_model(env: SubprocVecEnv, cfg: TrainingConfig, tensorboard_log: str) -> MaskablePPO:
+def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str) -> MaskablePPO:
     policy_kwargs = dict(features_extractor_class=BombermanFeatureExtractor)
     return MaskablePPO(
         "MultiInputPolicy",

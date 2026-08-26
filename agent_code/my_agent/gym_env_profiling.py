@@ -1,11 +1,11 @@
 import time
 import pathlib
+import numpy as np  # Added import for array operations
 
 from agent_code.my_agent.gym_environment import BombermanGymEnv
 from environment import WorldArgs
 from agent_code.my_agent.callbacks import setup as my_agent_setup, act as my_agent_act
 from agent_code.random_agent.callbacks import setup as random_agent_setup, act as random_agent_act
-
 
 CLASSIC_ENV_ARGS = WorldArgs(
     scenario="classic",
@@ -25,56 +25,70 @@ CLASSIC_ENV_ARGS = WorldArgs(
 )
 
 
-def benchmark_environment(num_episodes=100, opponents=None):
+def benchmark_environment(n_envs=8, total_steps=50000, opponents=None):
+    """
+    Profiling for batched environments is best measured in total environment steps,
+    rather than episodes, because games finish asynchronously.
+    """
     if opponents is None:
         opponents = [(my_agent_setup, my_agent_act)] * 3
 
+    # 1. Initialize the environment with the desired number of parallel games
     env = BombermanGymEnv(
         CLASSIC_ENV_ARGS,
-        opponents=opponents
+        opponents=opponents,
+        n_envs=n_envs,  # <--- KEY CHANGE: Tell the env how many games to run internally
+        auto_reset=True  # Ensures finished games instantly restart without slowing down the loop
     )
 
-    total_steps = 0
-    total_time = 0.0
+    print(f"Profiling batched environment with {n_envs} parallel games for {total_steps} steps...")
+    print(f"(Max possible individual game steps: {n_envs * total_steps})\n")
 
-    print(f"Running {num_episodes} episodes...\n")
+    total_completed_games = 0
+    start_time = time.perf_counter()
 
-    for episode in range(num_episodes):
-        obs, _ = env.reset()
+    # Initial reset
+    obs, _ = env.reset()
 
-        done = False
-        steps = 0
+    # 2. Step Loop instead of Episode Loop
+    for step in range(total_steps):
+        # The action_space is now a MultiDiscrete([6, 6, 6...]) matching n_envs.
+        # .sample() automatically returns an array of shape (n_envs,) with random actions.
+        actions = env.action_space.sample()
 
-        start = time.perf_counter()
+        # Step returns batched data: terminateds and truncateds are boolean arrays of shape (n_envs,)
+        obs, rewards, terminateds, truncateds, infos = env.step(actions)
 
-        while not done:
-            action = env.action_space.sample()  # Random agent
-            obs, reward, terminated, truncated, info = env.step(action)
+        # 3. Count how many individual games finished on this specific tick
+        finished_this_tick = np.sum(terminateds | truncateds)
+        total_completed_games += finished_this_tick
 
-            done = terminated or truncated
-            steps += 1
-
-        elapsed = time.perf_counter() - start
-
-        #fps = steps / elapsed if elapsed > 0 else float("inf")
-        #print(f"Episode {episode + 1:3d}: {steps:4d} steps | {fps:8.2f} steps/s")
-
-        total_steps += steps
-        total_time += elapsed
-
+    elapsed_time = time.perf_counter() - start_time
     env.close()
 
+    # 4. Calculate throughput metrics
+    total_individual_game_steps = n_envs * total_steps
+    steps_per_second = total_individual_game_steps / elapsed_time if elapsed_time > 0 else float("inf")
 
-    print("\n========== Benchmark ==========")
-    print(f"Episodes:      {num_episodes}")
-    print(f"Total steps:   {total_steps}")
-    print(f"Total time:    {total_time:.3f} s")
-    print(f"Average speed: {total_steps / total_time:.2f} steps/s")
-    print(f"Average steps: {total_steps / num_episodes:.2f}")
+    print("\n========== Batched Benchmark Results ==========")
+    print(f"Parallel Environments (n_envs):  {n_envs}")
+    print(f"Environment Steps Executed:      {total_steps:,}")
+    print(f"Total Individual Game Steps:     {total_individual_game_steps:,}")
+    print(f"Games Completed:                 {total_completed_games:,}")
+    print(f"Total Wall-Clock Time:           {elapsed_time:.3f} s")
+    print(f"Throughput (Steps/Second):       {steps_per_second:,.2f}")
+
+    if total_completed_games > 0:
+        print(f"Avg Steps per Completed Game:   {total_individual_game_steps / total_completed_games:.2f}")
+    else:
+        print("Warning: No games completed during the benchmark window.")
 
 
 if __name__ == "__main__":
+    # Example: Run 16 parallel environments for 100,000 steps.
+    # This will execute 1,600,000 individual game steps.
     benchmark_environment(
-        num_episodes=1000,
-        opponents=[(my_agent_setup, my_agent_act)]*0
+        n_envs=64,
+        total_steps=1024,
+        opponents=[(my_agent_setup, my_agent_act)] * 0  # 0 opponents as in your original script
     )
