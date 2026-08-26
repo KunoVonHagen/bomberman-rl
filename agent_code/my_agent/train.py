@@ -24,7 +24,7 @@ from multiprocessing import freeze_support
 import numpy as np
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv, VecMonitor
 from stable_baselines3.common.vec_env.base_vec_env import VecEnvObs, VecEnvStepReturn
 
 from environment import WorldArgs
@@ -106,8 +106,27 @@ class NativeBatchedVecEnv(VecEnv):
         return self.env.close()
 
     def env_method(self, method_name: str, *args, **kwargs) -> list:
+        # Extract 'indices' before calling the underlying method
+        # (natively batched envs operate on all envs at once, so we filter after)
+        indices = kwargs.pop('indices', None)
+
         result = getattr(self.env, method_name)(*args, **kwargs)
-        return [result]
+
+        # Convert batched results to per-env list as SB3 expects
+        if isinstance(result, np.ndarray) and result.ndim > 0 and result.shape[0] == self.num_envs:
+            # Batched array like action_masks: (n_envs, n_actions) -> list of (n_actions,) arrays
+            per_env = [result[i] for i in range(self.num_envs)]
+            if indices is not None:
+                return [per_env[i] for i in indices]
+            return per_env
+        elif isinstance(result, list) and len(result) == self.num_envs:
+            if indices is not None:
+                return [result[i] for i in indices]
+            return list(result)
+        else:
+            # Scalar or single value - replicate for requested envs
+            n = len(indices) if indices is not None else self.num_envs
+            return [result] * n
 
     def action_masks(self) -> np.ndarray:
         return self.env.action_masks()
@@ -151,21 +170,17 @@ class NativeBatchedVecEnv(VecEnv):
 
 # -----------------------------------
 
-def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> NativeBatchedVecEnv:
+def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
     world_args = build_world_args(cfg, log_dir, save_replay=False)
-
-    # 1. Instantiate the natively batched environment directly
-    # Pass cfg.n_envs HERE, not to a VecEnv wrapper
     env = BombermanGymEnv(
         world_args,
         opponents=opponents,
         layer_config=cfg.env.layer_config,
         n_envs=cfg.n_envs
     )
-
-    # 2. Wrap it in our custom adapter. NO SubprocVecEnv, NO ActionMasker needed here
-    # because the adapter handles action_masks directly.
-    return NativeBatchedVecEnv(env)
+    vec_env = NativeBatchedVecEnv(env)
+    # Wrap with VecMonitor to track ep_rew_mean and ep_len_mean
+    return VecMonitor(vec_env, filename=None)
 
 
 def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str) -> NativeBatchedVecEnv:
@@ -281,12 +296,22 @@ def run(cfg: TrainingConfig, resume_from: str | None = None, resume_checkpoint: 
         )
         timesteps_done = model.num_timesteps
 
+        # Get metrics from the monitor (now they'll be available!)
+        ep_rew_mean = model.logger.name_to_value.get("rollout/ep_rew_mean")
+        ep_len_mean = model.logger.name_to_value.get("rollout/ep_len_mean")
+
+        # Print them explicitly
+        if ep_rew_mean is not None:
+            print(f"  ep_rew_mean: {ep_rew_mean:.4f}")
+        if ep_len_mean is not None:
+            print(f"  ep_len_mean: {ep_len_mean:.1f}")
+
         ckpt_dir = ckman.save_checkpoint(
             model,
             timesteps_done,
             extra_metadata={
-                "ep_rew_mean": model.logger.name_to_value.get("rollout/ep_rew_mean"),
-                "ep_len_mean": model.logger.name_to_value.get("rollout/ep_len_mean"),
+                "ep_rew_mean": ep_rew_mean,
+                "ep_len_mean": ep_len_mean,
                 "opponents": pool.last_opponent_descriptions(),
             },
         )
@@ -295,7 +320,7 @@ def run(cfg: TrainingConfig, resume_from: str | None = None, resume_checkpoint: 
         if cfg.self_play.enabled:
             pool.maybe_add_checkpoint(ckpt_dir, timesteps_done)
             opponents = pool.current_opponents()
-            env.env_method("set_opponents", opponents)
+            env.env_method("set_opponents", opponents)  # Note: env is now VecMonitor
 
         if cfg.eval_every_save:
             play_test_game(model, cfg, opponents, ckman, timesteps_done)
