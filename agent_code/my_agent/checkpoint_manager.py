@@ -6,7 +6,7 @@ import pathlib
 from datetime import datetime
 from typing import Optional, List
 
-from config import TrainingConfig
+from .config import TrainingConfig
 
 
 class CheckpointManager:

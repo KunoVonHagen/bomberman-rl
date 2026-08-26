@@ -6,8 +6,8 @@ import random
 import tempfile
 from typing import Callable, Dict, List, Optional, Tuple
 
-from config import EnvConfig, SelfPlayConfig
-from checkpoint_manager import CheckpointManager
+from .config import EnvConfig, SelfPlayConfig
+from .checkpoint_manager import CheckpointManager
 
 OpponentPair = Tuple[Callable, Callable]
 
