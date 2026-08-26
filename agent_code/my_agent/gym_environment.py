@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover - graceful, correctness-preserving fallb
 
 import settings as s
 import events as e
-from rewards import (
+from .rewards import (
     SIMPLE_EVENT_REWARDS,
     EVENT_REWARDS,
     CRATE_SHAPING_COEF,

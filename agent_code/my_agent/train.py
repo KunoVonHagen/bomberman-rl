@@ -27,13 +27,13 @@ from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.env_util import make_vec_env
 
-from agent_code.my_agent.gym_environment import BombermanGymEnv
 from environment import WorldArgs
-from model import BombermanFeatureExtractor
 
-from config import DEFAULT_CONFIG, TrainingConfig
-from checkpoint_manager import CheckpointManager
-from opponent_pool import OpponentPool
+from .gym_environment import BombermanGymEnv
+from .model import BombermanFeatureExtractor
+from .config import DEFAULT_CONFIG, TrainingConfig
+from .checkpoint_manager import CheckpointManager
+from .opponent_pool import OpponentPool
 
 
 def mask_fn(env):
