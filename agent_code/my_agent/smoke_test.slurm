@@ -2,7 +2,7 @@
 #SBATCH --job-name=bomberman-smoketest
 #SBATCH --partition=dev_gpu_h100
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-gpu=16
+#SBATCH --cpus-per-gpu=32
 #SBATCH --time=00:20:00
 #SBATCH --output=logs/smoketest-%j.out
 #SBATCH --error=logs/smoketest-%j.err

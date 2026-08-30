@@ -2,7 +2,7 @@
 #SBATCH --job-name=bomberman-ppo
 #SBATCH --partition=gpu_h100
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-gpu=24
+#SBATCH --cpus-per-gpu=32
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
