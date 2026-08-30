@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import multiprocessing as mp
+import pathlib
 from datetime import datetime
 from multiprocessing import freeze_support
 
@@ -200,17 +202,207 @@ class NativeBatchedVecEnv(VecEnv):
         return [None] * self.num_envs
 
 
-# -----------------------------------
+def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, layer_config, shard_n_envs: int):
+    """
+    Entry point for one shard subprocess. Owns a real BombermanGymEnv
+    simulating `shard_n_envs` games natively-batched (i.e. via its own
+    internal Python for-loop over that shard's envs). Talks to the parent
+    over a Pipe using the same verb set SB3's own SubprocVecEnv workers use,
+    so shard results can be concatenated like any other VecEnv batch.
+    """
+    parent_remote.close()
+    from environment import WorldArgs
+    from agent_code.my_agent.gym_environment import BombermanGymEnv
+
+    world_args = WorldArgs(**world_args_kwargs)
+    env = BombermanGymEnv(world_args, opponents=opponents, layer_config=layer_config, n_envs=shard_n_envs)
+
+    while True:
+        try:
+            cmd, data = remote.recv()
+        except EOFError:
+            break
+
+        if cmd == "step":
+            obs, rewards, terminated, truncated, infos = env.step(data)
+            remote.send((obs, rewards, terminated, truncated, infos))
+        elif cmd == "reset":
+            seed, options = data
+            obs, infos = env.reset(seed=seed, options=options)
+            remote.send((obs, infos))
+        elif cmd == "action_masks":
+            remote.send(env.action_masks())
+        elif cmd == "env_method":
+            method_name, args, kwargs = data
+            remote.send(getattr(env, method_name)(*args, **kwargs))
+        elif cmd == "get_spaces":
+            remote.send((env.single_observation_space, env.single_action_space))
+        elif cmd == "close":
+            env.close()
+            remote.close()
+            break
+        else:
+            raise NotImplementedError(f"Unknown shard command: {cmd!r}")
+
+
+def _concat_obs(obs_list: list) -> dict:
+    """Dict obs -> concatenate each key across shards along the batch axis."""
+    keys = obs_list[0].keys()
+    return {k: np.concatenate([o[k] for o in obs_list], axis=0) for k in keys}
+
+
+class ShardedNativeBatchedVecEnv(VecEnv):
+    """
+    Runs several BombermanGymEnv batches in separate OS processes ("shards"),
+    each natively-batched in-process, and concatenates their outputs into one
+    big batch for SB3 -- functionally a drop-in replacement for
+    NativeBatchedVecEnv when you want actual multi-core usage.
+
+    Why this exists: BombermanGymEnv.step()/reset() loop over envs with a
+    plain Python `for env in range(self.n_envs): self._advance(env, ...)`.
+    That means simulating N envs in ONE process is single-threaded no matter
+    how many CPU cores are requested -- more n_envs just makes that loop
+    longer, and extra cores sit idle. Sharding cfg.n_envs across
+    `n_shards` OS processes lets those per-shard loops run in parallel
+    instead of sequentially, without touching the env's internals. The
+    long-term fix is vectorizing _advance() itself with numpy across the
+    batch dimension; this is the practical fix that doesn't require
+    rewriting the game logic.
+    """
+
+    def __init__(self, cfg: TrainingConfig, opponents, log_dir: str, n_shards: int):
+        if cfg.n_envs % n_shards != 0:
+            raise ValueError(f"cfg.n_envs ({cfg.n_envs}) must be divisible by n_shards ({n_shards})")
+        self.n_shards = n_shards
+        self.shard_size = cfg.n_envs // n_shards
+        self._cfg = cfg
+
+        ctx = mp.get_context("spawn")
+        self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(n_shards)])
+        self.processes = []
+        for i, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
+            e = cfg.env
+            world_args_kwargs = dict(
+                scenario=e.scenario,
+                seed=e.seed,
+                silence_errors=e.silence_errors,
+                no_gui=e.no_gui,
+                make_video=e.make_video,
+                save_replay=False,
+                save_stats=e.save_stats,
+                turn_based=e.turn_based,
+                update_interval=e.update_interval,
+                log_dir=str(pathlib.Path(log_dir) / f"shard_{i}"),
+                match_name=e.match_name,
+                fps=e.fps,
+                replay=e.replay,
+                continue_without_training=e.continue_without_training,
+            )
+            p = ctx.Process(
+                target=_shard_worker,
+                args=(work_remote, remote, world_args_kwargs, opponents, e.layer_config, self.shard_size),
+                daemon=True,
+            )
+            p.start()
+            self.processes.append(p)
+            work_remote.close()
+
+        self.remotes[0].send(("get_spaces", None))
+        obs_space, act_space = self.remotes[0].recv()
+
+        super().__init__(num_envs=cfg.n_envs, observation_space=obs_space, action_space=act_space)
+        self._actions = None
+
+    def reset(self, seed=None, options=None):
+        for remote in self.remotes:
+            remote.send(("reset", (seed, options)))
+        results = [remote.recv() for remote in self.remotes]
+        obs_list, info_lists = zip(*results)
+        self._last_infos = [info for infos in info_lists for info in infos]
+        return _concat_obs(list(obs_list))
+
+    def step_async(self, actions: np.ndarray) -> None:
+        self._actions = actions
+
+    def step_wait(self):
+        shards = np.split(np.asarray(self._actions), self.n_shards)
+        for remote, shard_actions in zip(self.remotes, shards):
+            remote.send(("step", shard_actions))
+        results = [remote.recv() for remote in self.remotes]
+        obs_list, rew_list, term_list, trunc_list, info_lists = zip(*results)
+
+        obs = _concat_obs(list(obs_list))
+        rewards = np.concatenate(rew_list, axis=0)
+        terminated = np.concatenate(term_list, axis=0)
+        truncated = np.concatenate(trunc_list, axis=0)
+        dones = terminated | truncated
+        infos = [info for infos in info_lists for info in infos]
+        self._last_infos = infos
+        return obs, rewards, dones, infos
+
+    def step(self, actions: np.ndarray):
+        self.step_async(actions)
+        return self.step_wait()
+
+    def close(self) -> None:
+        for remote in self.remotes:
+            try:
+                remote.send(("close", None))
+            except (BrokenPipeError, OSError):
+                pass
+        for p in self.processes:
+            p.join(timeout=5)
+
+    def action_masks(self) -> np.ndarray:
+        for remote in self.remotes:
+            remote.send(("action_masks", None))
+        return np.concatenate([remote.recv() for remote in self.remotes], axis=0)
+
+    def env_method(self, method_name: str, *args, indices=None, **kwargs) -> list:
+        # Broadcast to every shard (matches the original single-process
+        # behaviour, e.g. set_opponents applies the same opponent list
+        # everywhere). Per-index targeting isn't supported since a single
+        # index may not map cleanly onto shard boundaries; add it if needed.
+        for remote in self.remotes:
+            remote.send(("env_method", (method_name, args, kwargs)))
+        results = [remote.recv() for remote in self.remotes]
+        n = len(indices) if indices is not None else self.num_envs
+        # Most calls here (e.g. set_opponents) return None / a shared value;
+        # replicate per-env like the original NativeBatchedVecEnv did.
+        return [results[0]] * n
+
+    def env_is_wrapped(self, wrapper_class: type, indices=None) -> list[bool]:
+        n = len(indices) if indices is not None else self.num_envs
+        return [False] * n
+
+    def get_attr(self, attr_name: str, indices=None) -> list:
+        raise NotImplementedError(
+            "get_attr isn't wired up for ShardedNativeBatchedVecEnv -- add an "
+            "'attr' verb to _shard_worker if something in the training loop needs it."
+        )
+
+    def set_attr(self, attr_name: str, values, indices=None) -> None:
+        raise NotImplementedError(
+            "set_attr isn't wired up for ShardedNativeBatchedVecEnv -- add an "
+            "'attr' verb to _shard_worker if something in the training loop needs it."
+        )
+
+    def get_images(self) -> list:
+        return [None] * self.num_envs
+
 
 def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
-    world_args = build_world_args(cfg, log_dir, save_replay=False)
-    env = BombermanGymEnv(
-        world_args,
-        opponents=opponents,
-        layer_config=cfg.env.layer_config,
-        n_envs=cfg.n_envs
-    )
-    vec_env = NativeBatchedVecEnv(env)
+    if cfg.n_shards > 1:
+        vec_env = ShardedNativeBatchedVecEnv(cfg, opponents, log_dir, n_shards=cfg.n_shards)
+    else:
+        world_args = build_world_args(cfg, log_dir, save_replay=False)
+        env = BombermanGymEnv(
+            world_args,
+            opponents=opponents,
+            layer_config=cfg.env.layer_config,
+            n_envs=cfg.n_envs
+        )
+        vec_env = NativeBatchedVecEnv(env)
     # Wrap with VecMonitor to track ep_rew_mean and ep_len_mean
     return VecMonitor(vec_env, filename=None)
 
@@ -368,6 +560,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default=None, choices=["auto", "cuda", "cpu"],
                    help="Override cfg.device. Use 'cuda' to force GPU and hard-fail if unavailable.")
     p.add_argument("--n-envs", type=int, default=None, help="Override cfg.n_envs for this run.")
+    p.add_argument("--n-shards", type=int, default=None,
+                   help="Override cfg.n_shards -- split n_envs across this many subprocesses for real "
+                        "multi-core usage (n_envs must be divisible by n_shards).")
     p.add_argument("--smoke-test", action="store_true",
                    help="Run a tiny, fast config (few envs, few timesteps, frequent saves, "
                         "eval disabled, self-play disabled, distinct run_name) to sanity-check "
@@ -398,5 +593,8 @@ if __name__ == "__main__":
     if args.n_envs is not None:
         cfg = copy.deepcopy(cfg)
         cfg.n_envs = args.n_envs
+    if args.n_shards is not None:
+        cfg = copy.deepcopy(cfg)
+        cfg.n_shards = args.n_shards
 
     run(cfg, resume_from=args.resume, resume_checkpoint=args.checkpoint)
