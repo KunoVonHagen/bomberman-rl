@@ -237,6 +237,12 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
             remote.send(getattr(env, method_name)(*args, **kwargs))
         elif cmd == "get_spaces":
             remote.send((env.single_observation_space, env.single_action_space))
+        elif cmd == "get_attr":
+            remote.send(getattr(env, data))
+        elif cmd == "set_attr":
+            attr_name, value = data
+            setattr(env, attr_name, value)
+            remote.send(None)
         elif cmd == "close":
             env.close()
             remote.close()
@@ -376,16 +382,29 @@ class ShardedNativeBatchedVecEnv(VecEnv):
         return [False] * n
 
     def get_attr(self, attr_name: str, indices=None) -> list:
-        raise NotImplementedError(
-            "get_attr isn't wired up for ShardedNativeBatchedVecEnv -- add an "
-            "'attr' verb to _shard_worker if something in the training loop needs it."
-        )
+        for remote in self.remotes:
+            remote.send(("get_attr", attr_name))
+
+        per_env = []
+        for remote in self.remotes:
+            value = remote.recv()
+            per_env.extend([value] * self.shard_size)
+        if indices is not None:
+            return [per_env[i] for i in indices]
+        return per_env
 
     def set_attr(self, attr_name: str, values, indices=None) -> None:
-        raise NotImplementedError(
-            "set_attr isn't wired up for ShardedNativeBatchedVecEnv -- add an "
-            "'attr' verb to _shard_worker if something in the training loop needs it."
-        )
+        if indices is not None:
+            raise NotImplementedError(
+                "set_attr with per-index targeting isn't supported by "
+                "ShardedNativeBatchedVecEnv -- shard boundaries don't map "
+                "cleanly onto arbitrary env indices."
+            )
+        value = values[0] if isinstance(values, (list, np.ndarray)) else values
+        for remote in self.remotes:
+            remote.send(("set_attr", (attr_name, value)))
+        for remote in self.remotes:
+            remote.recv()
 
     def get_images(self) -> list:
         return [None] * self.num_envs
