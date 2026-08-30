@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+from datetime import datetime
 from multiprocessing import freeze_support
 
 import numpy as np
+import torch
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv, VecMonitor
@@ -38,6 +40,36 @@ from agent_code.my_agent.opponent_pool import OpponentPool
 
 def mask_fn(env):
     return env.action_masks()
+
+
+def resolve_device(requested: str = "auto") -> str:
+    """Resolve 'auto' -> cuda if available else cpu, and print a clear,
+    unmissable diagnostic so a silent CPU fallback never goes unnoticed
+    in a scrollback log on the cluster."""
+    if requested != "auto":
+        device = requested
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print("=" * 60)
+    print(f"[device] requested={requested!r} -> resolved={device!r}")
+    print(f"[device] torch.cuda.is_available() = {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        idx = torch.cuda.current_device()
+        print(f"[device] GPU: {torch.cuda.get_device_name(idx)}")
+        props = torch.cuda.get_device_properties(idx)
+        print(f"[device] Total VRAM: {props.total_memory / 1024**3:.1f} GB")
+    elif device == "cuda":
+        raise RuntimeError(
+            "device='cuda' was requested/forced but torch.cuda.is_available() "
+            "is False. Check CUDA module / driver / torch build on this node."
+        )
+    else:
+        print("[device] Running on CPU. This will be slow for the CNN "
+              "feature extractor -- check that a GPU partition/module was "
+              "requested if that wasn't intentional.")
+    print("=" * 60)
+    return device
 
 
 def build_world_args(
@@ -207,7 +239,7 @@ def architecture_info(cfg: TrainingConfig) -> dict:
     }
 
 
-def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str) -> MaskablePPO:
+def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str, device: str) -> MaskablePPO:
     policy_kwargs = dict(features_extractor_class=BombermanFeatureExtractor)
     return MaskablePPO(
         "MultiInputPolicy",
@@ -215,6 +247,7 @@ def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str) -> Maska
         policy_kwargs=policy_kwargs,
         tensorboard_log=tensorboard_log,
         verbose=1,
+        device=device,
         learning_rate=cfg.ppo.learning_rate,
         n_steps=cfg.ppo.n_steps,
         batch_size=cfg.ppo.batch_size,
@@ -266,11 +299,13 @@ def run(cfg: TrainingConfig, resume_from: str | None = None, resume_checkpoint: 
         ckman = CheckpointManager.new(cfg, architecture_info(cfg))
         print(f"Starting new run '{cfg.run_name}' in {ckman.run_dir}")
 
+    device = resolve_device(cfg.device)
+
     pool = OpponentPool(ckman, cfg.self_play)
     opponents = pool.current_opponents()
 
     env = make_train_env(cfg, opponents, str(ckman.logs_dir))
-    model = build_model(env, cfg, str(ckman.tensorboard_dir))
+    model = build_model(env, cfg, str(ckman.tensorboard_dir), device)
 
     timesteps_done = 0
     if resume_from:
@@ -279,7 +314,7 @@ def run(cfg: TrainingConfig, resume_from: str | None = None, resume_checkpoint: 
             else ckman.latest_checkpoint()
         )
         if checkpoint_dir is not None:
-            loaded_model = ckman.load_model(MaskablePPO, checkpoint_dir, env=env)
+            loaded_model = ckman.load_model(MaskablePPO, checkpoint_dir, env=env, device=device)
             model = loaded_model
             timesteps_done = ckman.resolved_timesteps(checkpoint_dir)
             print(f"Loaded checkpoint {checkpoint_dir.name} ({timesteps_done} timesteps)")
@@ -330,9 +365,38 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--resume", type=str, default=None, help="Run name or path to resume from")
     p.add_argument("--checkpoint", type=str, default=None, help="Specific checkpoint name to resume from (default: latest)")
+    p.add_argument("--device", type=str, default=None, choices=["auto", "cuda", "cpu"],
+                   help="Override cfg.device. Use 'cuda' to force GPU and hard-fail if unavailable.")
+    p.add_argument("--n-envs", type=int, default=None, help="Override cfg.n_envs for this run.")
+    p.add_argument("--smoke-test", action="store_true",
+                   help="Run a tiny, fast config (few envs, few timesteps, frequent saves, "
+                        "eval disabled, self-play disabled, distinct run_name) to sanity-check "
+                        "the whole pipeline end-to-end before a long cluster job.")
     return p.parse_args()
+
+
+def build_smoke_test_config(base_cfg: TrainingConfig) -> TrainingConfig:
+    cfg = copy.deepcopy(base_cfg)
+    cfg.run_name = f"smoketest_{datetime.now():%Y%m%d-%H%M%S}"
+    cfg.n_envs = min(cfg.n_envs, 8)
+    cfg.total_timesteps = cfg.ppo.n_steps * cfg.n_envs * 3  # a handful of rollouts
+    cfg.save_every_timesteps = cfg.ppo.n_steps * cfg.n_envs  # save after every rollout
+    cfg.eval_every_save = True  # exercise play_test_game() too
+    cfg.self_play.enabled = False  # keep it simple/fast; opponent pool has its own paths to check separately
+    return cfg
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run(DEFAULT_CONFIG, resume_from=args.resume, resume_checkpoint=args.checkpoint)
+
+    cfg = DEFAULT_CONFIG
+    if args.smoke_test:
+        cfg = build_smoke_test_config(cfg)
+    if args.device is not None:
+        cfg = copy.deepcopy(cfg)
+        cfg.device = args.device
+    if args.n_envs is not None:
+        cfg = copy.deepcopy(cfg)
+        cfg.n_envs = args.n_envs
+
+    run(cfg, resume_from=args.resume, resume_checkpoint=args.checkpoint)
