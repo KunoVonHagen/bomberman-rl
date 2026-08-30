@@ -85,10 +85,8 @@ def benchmark_environment(n_envs=8, total_steps=50000, opponents=None):
 
 
 if __name__ == "__main__":
-    # Example: Run 16 parallel environments for 100,000 steps.
-    # This will execute 1,600,000 individual game steps.
     benchmark_environment(
-        n_envs=64,
-        total_steps=1024,
-        opponents=[(my_agent_setup, my_agent_act)] * 0  # 0 opponents as in your original script
+        n_envs=16,
+        total_steps=4096,
+        opponents=[(my_agent_setup, my_agent_act)] * 0
     )
