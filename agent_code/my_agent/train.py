@@ -365,17 +365,22 @@ class ShardedNativeBatchedVecEnv(VecEnv):
         return np.concatenate([remote.recv() for remote in self.remotes], axis=0)
 
     def env_method(self, method_name: str, *args, indices=None, **kwargs) -> list:
-        # Broadcast to every shard (matches the original single-process
-        # behaviour, e.g. set_opponents applies the same opponent list
-        # everywhere). Per-index targeting isn't supported since a single
-        # index may not map cleanly onto shard boundaries; add it if needed.
         for remote in self.remotes:
             remote.send(("env_method", (method_name, args, kwargs)))
         results = [remote.recv() for remote in self.remotes]
-        n = len(indices) if indices is not None else self.num_envs
-        # Most calls here (e.g. set_opponents) return None / a shared value;
-        # replicate per-env like the original NativeBatchedVecEnv did.
-        return [results[0]] * n
+
+        per_env = []
+        for result in results:
+            if isinstance(result, np.ndarray) and result.ndim > 0 and result.shape[0] == self.shard_size:
+                per_env.extend(result[i] for i in range(self.shard_size))
+            elif isinstance(result, list) and len(result) == self.shard_size:
+                per_env.extend(result)
+            else:
+                per_env.extend([result] * self.shard_size)
+
+        if indices is not None:
+            return [per_env[i] for i in indices]
+        return per_env
 
     def env_is_wrapped(self, wrapper_class: type, indices=None) -> list[bool]:
         n = len(indices) if indices is not None else self.num_envs
@@ -592,7 +597,6 @@ def parse_args() -> argparse.Namespace:
 def build_smoke_test_config(base_cfg: TrainingConfig) -> TrainingConfig:
     cfg = copy.deepcopy(base_cfg)
     cfg.run_name = f"smoketest_{datetime.now():%Y%m%d-%H%M%S}"
-    cfg.n_envs = min(cfg.n_envs, 8)
     cfg.total_timesteps = cfg.ppo.n_steps * cfg.n_envs * 3  # a handful of rollouts
     cfg.save_every_timesteps = cfg.ppo.n_steps * cfg.n_envs  # save after every rollout
     cfg.eval_every_save = True  # exercise play_test_game() too
