@@ -16,4 +16,4 @@ source ~/envs/bomberman/bin/activate
 
 cd $HOME/bomberman-rl
 
-srun python train.py "$@"
+srun python -m agent_code.my_agent.train "$@"

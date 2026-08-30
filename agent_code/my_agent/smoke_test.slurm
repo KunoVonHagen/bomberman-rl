@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== Running smoke test (tiny config: few envs, ~3 rollouts, checkpoint + eval game exercised) ==="
-time python train.py --smoke-test --device cuda
+time python -m agent_code.my_agent.train --smoke-test --device cuda
 
 echo
 echo "=== Smoke test finished. Utilization logs written to: $MONITOR_DIR ==="
