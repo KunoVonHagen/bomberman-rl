@@ -15,7 +15,7 @@ module load devel/python/3.11.7-gnu-14.2
 
 source ~/envs/bomberman/bin/activate  # or module-load conda + conda activate
 
-cd "$HOME/bomberman-rl"               # repo root containing train.py
+cd "$HOME/bomberman-rl"
 
 echo "=== Node / GPU info ==="
 hostname
@@ -55,7 +55,11 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== Running smoke test (tiny config: few envs, ~3 rollouts, checkpoint + eval game exercised) ==="
-time python -m agent_code.my_agent.train --smoke-test --device cuda
+echo "--- pass 1: n_shards=1 (old single-process behavior, baseline) ---"
+time python -m agent_code.my_agent.train --smoke-test --device cuda --n-shards 1
+echo
+echo "--- pass 2: n_shards=8 (sharded across subprocesses) ---"
+time python -m agent_code.my_agent.train --smoke-test --device cuda --n-envs 8 --n-shards 8
 
 echo
 echo "=== Smoke test finished. Utilization logs written to: $MONITOR_DIR ==="
