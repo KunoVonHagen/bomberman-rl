@@ -3,7 +3,7 @@
 #SBATCH --partition=dev_gpu_h100
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-gpu=32
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=logs/sweep-%j.out
 #SBATCH --error=logs/sweep-%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -32,16 +32,9 @@ echo "n_envs,n_shards,wall_seconds,avg_fps,fps_per_env,status" > "$SUMMARY_CSV"
 # --- Combos to try: "n_envs:n_shards" -----------------------------------
 # n_shards must divide n_envs and stay <= cpus-per-gpu (32). Edit freely.
 COMBOS=(
-    "32:1"
-    "32:4"
-    "32:8"
-    "32:16"
-    "32:32"
-    "64:1"
     "64:8"
     "64:16"
     "64:32"
-    "128:1"
     "128:8"
     "128:16"
     "128:32"
