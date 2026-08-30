@@ -84,6 +84,8 @@ class TrainingConfig:
     runs_dir: str = "runs"
     n_envs: int = 32
     total_timesteps: int = 50_000_000
+
+    device: str = "auto"
     n_demonstration_episodes: int = 50
     save_every_timesteps: int = 1_048_576
     eval_every_save: bool = True
