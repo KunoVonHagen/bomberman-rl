@@ -1530,7 +1530,7 @@ class BombermanGymEnv(gym.Env):
         agent = self.agents[env]
         total = 0.0
         for ev in agent.events:
-            total += SIMPLE_EVENT_REWARDS.get(ev, EVENT_REWARDS.get(ev, 0.0))
+            total += EVENT_REWARDS.get(ev, 0.0)
 
         coin_now = self._coin_distance_now(env)
         prev = self._prev_coin_dist[env]
