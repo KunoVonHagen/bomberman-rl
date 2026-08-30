@@ -10,8 +10,7 @@
 #SBATCH --mail-user=gz300@uni-heidelberg.de
 
 module purge
-module load devel/cuda/12.x
-module load devel/python/3.11
+module load devel/python/3.11.7-gnu-14.2
 
 source ~/envs/bomberman/bin/activate
 

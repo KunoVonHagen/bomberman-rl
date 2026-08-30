@@ -11,8 +11,7 @@ set -euo pipefail
 mkdir -p logs
 
 module purge
-module load devel/cuda/12.x           # confirm exact name: module avail devel/cuda
-module load devel/python/3.11         # match your venv's python version
+module load devel/python/3.11.7-gnu-14.2
 
 source ~/envs/bomberman/bin/activate  # or module-load conda + conda activate
 
