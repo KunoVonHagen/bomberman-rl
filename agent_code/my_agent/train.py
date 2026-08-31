@@ -545,12 +545,12 @@ def run_eval_suite(
                 action_masks = get_action_masks(test_env)
                 action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
                 obs, reward, dones, info = test_env.step(action)
-                total_reward += reward[0]
-                done = dones[0]
+                total_reward += float(reward[0])
+                done = bool(dones[0])
             test_env.close()
             rewards.append(total_reward)
 
-        mean_reward = sum(rewards) / len(rewards)
+        mean_reward = float(sum(rewards) / len(rewards))
         results[bot_path] = mean_reward
         print(f"  eval vs {bot_short_name}: {mean_reward:.2f} (n={n_episodes})")
 
@@ -629,8 +629,8 @@ def run(
             model,
             timesteps_done,
             extra_metadata={
-                "ep_rew_mean": ep_rew_mean,
-                "ep_len_mean": ep_len_mean,
+                "ep_rew_mean": float(ep_rew_mean) if ep_rew_mean is not None else None,
+                "ep_len_mean": float(ep_len_mean) if ep_len_mean is not None else None,
                 "opponents": pool.last_opponent_descriptions(),
                 "eval_suite": eval_suite_results,
             },
