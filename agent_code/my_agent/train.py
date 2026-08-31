@@ -504,12 +504,76 @@ def play_test_game(
     print(f"Saved eval replay -> {replay_path}")
 
 
-def run(cfg: TrainingConfig, resume_from: str | None = None, resume_checkpoint: str | None = None) -> None:
+EVAL_SUITE_BOTS = [
+    "agent_code.rule_based_agent.callbacks",
+    "agent_code.coin_collector_agent.callbacks",
+    "agent_code.peaceful_agent.callbacks",
+]
+
+
+def run_eval_suite(
+    model,
+    cfg: TrainingConfig,
+    ckman: CheckpointManager,
+    timesteps_done: int,
+    n_episodes: int = 10,
+    bot_paths: list[str] | None = None,
+) -> dict[str, float]:
+    """Evaluate the current model (deterministic policy) against a battery
+    of fixed scripted bots, independent of the self-play opponent mix used
+    for training. Returns {bot_path: mean_reward}. Use this to tell whether
+    self-play reward gains reflect real skill growth or just co-evolved
+    exploitation of your own policy's blind spots."""
+    bot_paths = bot_paths if bot_paths is not None else EVAL_SUITE_BOTS
+    results: dict[str, float] = {}
+
+    for bot_path in bot_paths:
+        opponents = [OpponentPool._resolve_static(bot_path)] * 3
+        bot_short_name = bot_path.split(".")[1]
+        rewards = []
+
+        for i in range(n_episodes):
+            replay_path = (
+                ckman.replays_dir
+                / f"eval_{bot_short_name}_{timesteps_done:010d}_{i}.pkl"
+            )
+            test_env = make_test_env(cfg, opponents, str(ckman.logs_dir), str(replay_path))
+            obs = test_env.reset()
+            done = False
+            total_reward = 0.0
+            while not done:
+                action_masks = get_action_masks(test_env)
+                action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
+                obs, reward, dones, info = test_env.step(action)
+                total_reward += reward[0]
+                done = dones[0]
+            test_env.close()
+            rewards.append(total_reward)
+
+        mean_reward = sum(rewards) / len(rewards)
+        results[bot_path] = mean_reward
+        print(f"  eval vs {bot_short_name}: {mean_reward:.2f} (n={n_episodes})")
+
+    return results
+
+
+def run(
+    cfg: TrainingConfig,
+    resume_from: str | None = None,
+    resume_checkpoint: str | None = None,
+    self_play_overrides: dict | None = None,
+) -> None:
     freeze_support()
 
     if resume_from:
         ckman = CheckpointManager.resume(resume_from, runs_dir=cfg.runs_dir)
         cfg = ckman.config
+        if self_play_overrides:
+            for k, v in self_play_overrides.items():
+                setattr(cfg.self_play, k, v)
+
+            ckman.update_manifest_config()
+            print(f"Applied self_play overrides: {self_play_overrides}")
         print(f"Resuming run '{cfg.run_name}' from {ckman.run_dir}")
     else:
         ckman = CheckpointManager.new(cfg, architecture_info(cfg))
@@ -557,6 +621,10 @@ def run(cfg: TrainingConfig, resume_from: str | None = None, resume_checkpoint: 
         if ep_len_mean is not None:
             print(f"  ep_len_mean: {ep_len_mean:.1f}")
 
+        eval_suite_results = None
+        if cfg.eval_every_save:
+            eval_suite_results = run_eval_suite(model, cfg, ckman, timesteps_done)
+
         ckpt_dir = ckman.save_checkpoint(
             model,
             timesteps_done,
@@ -564,6 +632,7 @@ def run(cfg: TrainingConfig, resume_from: str | None = None, resume_checkpoint: 
                 "ep_rew_mean": ep_rew_mean,
                 "ep_len_mean": ep_len_mean,
                 "opponents": pool.last_opponent_descriptions(),
+                "eval_suite": eval_suite_results,
             },
         )
         print(f"Saved checkpoint at {timesteps_done} timesteps -> {ckpt_dir}")
@@ -591,6 +660,14 @@ def parse_args() -> argparse.Namespace:
                    help="Run a tiny, fast config (few envs, few timesteps, frequent saves, "
                         "eval disabled, self-play disabled, distinct run_name) to sanity-check "
                         "the whole pipeline end-to-end before a long cluster job.")
+    p.add_argument("--static-opponents", type=str, nargs="*", default=None,
+                   help="Override self_play.static_opponents with these module paths "
+                        "(e.g. agent_code.rule_based_agent.callbacks). Only takes effect "
+                        "with --resume; persisted into the run's manifest.")
+    p.add_argument("--n-static-opponents", type=int, default=None,
+                   help="Override self_play.n_static_opponents on resume.")
+    p.add_argument("--n-self-play-opponents", type=int, default=None,
+                   help="Override self_play.n_self_play_opponents on resume.")
     return p.parse_args()
 
 
@@ -620,4 +697,17 @@ if __name__ == "__main__":
         cfg = copy.deepcopy(cfg)
         cfg.n_shards = args.n_shards
 
-    run(cfg, resume_from=args.resume, resume_checkpoint=args.checkpoint)
+    self_play_overrides = {}
+    if args.static_opponents is not None:
+        self_play_overrides["static_opponents"] = args.static_opponents
+    if args.n_static_opponents is not None:
+        self_play_overrides["n_static_opponents"] = args.n_static_opponents
+    if args.n_self_play_opponents is not None:
+        self_play_overrides["n_self_play_opponents"] = args.n_self_play_opponents
+
+    run(
+        cfg,
+        resume_from=args.resume,
+        resume_checkpoint=args.checkpoint,
+        self_play_overrides=self_play_overrides or None,
+    )
