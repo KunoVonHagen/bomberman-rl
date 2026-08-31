@@ -75,6 +75,18 @@ class CheckpointManager:
         }
         (self.run_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2))
 
+    def update_manifest_config(self, architecture_info: Optional[dict] = None) -> None:
+        """Re-persist the manifest with the current (possibly overridden)
+        self.config, preserving the existing architecture block unless a
+        new one is given. Call this after mutating self.config in-place
+        (e.g. applying --static-opponents on resume) so the change survives
+        a future resume instead of being silently dropped."""
+        info = architecture_info
+        if info is None:
+            existing = self.read_manifest() if self.manifest_path.exists() else {}
+            info = existing.get("architecture", {})
+        self._write_manifest(info)
+
     @property
     def manifest_path(self) -> pathlib.Path:
         return self.run_dir / "run_manifest.json"
