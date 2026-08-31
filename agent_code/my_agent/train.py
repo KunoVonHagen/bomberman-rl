@@ -495,7 +495,7 @@ def play_test_game(
     total_reward = 0
     while not done:
         action_masks = get_action_masks(test_env)
-        action, _ = model.predict(obs, deterministic=False, action_masks=action_masks)
+        action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
         obs, reward, dones, info = test_env.step(action)
         total_reward += reward[0]
         done = dones[0]
