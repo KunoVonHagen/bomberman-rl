@@ -9,6 +9,22 @@ from typing import Optional, List
 from .config import TrainingConfig
 
 
+def _json_safe(obj):
+    """json.dumps(default=...) fallback for common non-serializable types
+    that sneak into metadata dicts (numpy scalars/arrays, pathlib.Path)."""
+    try:
+        import numpy as np
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+    except ImportError:
+        pass
+    if isinstance(obj, pathlib.Path):
+        return str(obj)
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+
 class CheckpointManager:
     def __init__(self, run_dir: pathlib.Path, config: TrainingConfig):
         self.run_dir = pathlib.Path(run_dir)
@@ -111,7 +127,7 @@ class CheckpointManager:
         metadata = {"timesteps": timesteps, "saved_at": datetime.now().isoformat()}
         if extra_metadata:
             metadata.update(extra_metadata)
-        (ckpt_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+        (ckpt_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=_json_safe))
 
         (self.checkpoints_dir / "latest.txt").write_text(ckpt_dir.name)
 
