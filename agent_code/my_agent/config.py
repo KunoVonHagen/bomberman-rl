@@ -14,8 +14,34 @@ always self-describing and reproducible.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, ClassVar
 import json
+
+
+def _coerce_value(current, raw):
+    """Turn a raw CLI string into the same type as the field it's replacing.
+    Only used by TrainingConfig.apply_overrides -- if `raw` isn't a string
+    (already the right type), it's returned unchanged."""
+    if not isinstance(raw, str):
+        return raw
+    if isinstance(current, bool):
+        return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+    if isinstance(current, int) and not isinstance(current, bool):
+        return int(float(raw))  # float() first so "1e6" style works for int fields too
+    if isinstance(current, float):
+        return float(raw)
+    if isinstance(current, list):
+        return [x for x in raw.split(",") if x]
+    if current is None:
+        # Optional[...] field currently unset (e.g. clip_range_vf). Try float,
+        # allow an explicit "none"/"null" to keep it unset, else pass through as str.
+        if raw.strip().lower() in ("none", "null", ""):
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return raw
+    return raw  # str / Literal fields
 
 
 @dataclass
@@ -98,6 +124,67 @@ class TrainingConfig:
     env: EnvConfig = field(default_factory=EnvConfig)
     self_play: SelfPlayConfig = field(default_factory=SelfPlayConfig)
 
+    RESUMABLE_FIELDS: ClassVar[set] = {
+        "total_timesteps",
+        "save_every_timesteps",
+        "eval_every_save",
+        "device",
+        "n_envs",
+        "n_shards",
+        "n_demonstration_episodes",
+        "ppo.learning_rate",
+        "ppo.n_steps",
+        "ppo.batch_size",
+        "ppo.n_epochs",
+        "ppo.gamma",
+        "ppo.gae_lambda",
+        "ppo.clip_range",
+        "ppo.clip_range_vf",
+        "ppo.ent_coef",
+        "ppo.vf_coef",
+        "ppo.target_kl",
+        "self_play.enabled",
+        "self_play.static_opponents",
+        "self_play.n_static_opponents",
+        "self_play.n_self_play_opponents",
+        "self_play.pool_size",
+        "self_play.add_checkpoint_every_epochs",
+        "self_play.sample_strategy",
+        "self_play.latest_bias",
+    }
+
+    def apply_overrides(self, overrides: dict, *, restrict_to: set | None = None) -> list:
+        """Apply {"dotted.path": raw_value} overrides in place. raw_value may be a
+        CLI string (coerced to match the existing field's type) or an already-typed
+        value. If `restrict_to` is given, any path not in it raises ValueError --
+        pass TrainingConfig.RESUMABLE_FIELDS here when resuming a run so a typo or
+        an over-eager override can't quietly change the model's architecture out
+        from under its own checkpoint.
+
+        Returns a list of (path, old_value, new_value) for logging.
+        """
+        applied = []
+        for dotted_key, raw_value in overrides.items():
+            if restrict_to is not None and dotted_key not in restrict_to:
+                raise ValueError(
+                    f"'{dotted_key}' can't be changed on --resume (it would change the "
+                    f"model's architecture or environment, desyncing it from the loaded "
+                    f"checkpoint). Fields allowed on resume: {', '.join(sorted(restrict_to))}"
+                )
+            parts = dotted_key.split(".")
+            obj = self
+            for p in parts[:-1]:
+                if not hasattr(obj, p):
+                    raise ValueError(f"Unknown config path '{dotted_key}' (no '{p}')")
+                obj = getattr(obj, p)
+            leaf = parts[-1]
+            if not hasattr(obj, leaf):
+                raise ValueError(f"Unknown config path '{dotted_key}'")
+            current = getattr(obj, leaf)
+            new_value = _coerce_value(current, raw_value)
+            setattr(obj, leaf, new_value)
+            applied.append((dotted_key, current, new_value))
+        return applied
 
     def to_dict(self) -> dict:
         return asdict(self)

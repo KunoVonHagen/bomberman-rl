@@ -13,6 +13,13 @@ Main training entrypoint. All tunable behaviour lives in config.py — edit
 
     python train.py --resume runs/run_20260101-101500 --checkpoint checkpoint_0016777216
         Resume from a specific checkpoint instead of the latest one.
+
+    python train.py --resume run_20260101-101500 --set ppo.learning_rate=1e-4 ppo.ent_coef=0.0 total_timesteps=2_000_000_000
+        Resume, but override arbitrary model-independent hyperparameters for
+        the next phase of training. Only fields in TrainingConfig.RESUMABLE_FIELDS
+        are allowed here -- anything that would change the model's architecture
+        or the environment's observation format is rejected, since that would
+        desync a resumed run from the checkpoint it's loading.
 -----------------------------------------------------------------------------
 """
 from __future__ import annotations
@@ -28,6 +35,7 @@ import numpy as np
 import torch
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
+from stable_baselines3.common.utils import get_schedule_fn
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv, VecMonitor
 from stable_baselines3.common.vec_env.base_vec_env import VecEnvObs, VecEnvStepReturn
 
@@ -35,7 +43,7 @@ from environment import WorldArgs
 
 from agent_code.my_agent.gym_environment import BombermanGymEnv
 from agent_code.my_agent.model import BombermanFeatureExtractor
-from agent_code.my_agent.config import DEFAULT_CONFIG, TrainingConfig
+from agent_code.my_agent.config import DEFAULT_CONFIG, TrainingConfig, PPOConfig
 from agent_code.my_agent.checkpoint_manager import CheckpointManager
 from agent_code.my_agent.opponent_pool import OpponentPool
 
@@ -478,6 +486,50 @@ def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str, device: 
     )
 
 
+def apply_ppo_hyperparams(model: MaskablePPO, ppo_cfg: PPOConfig) -> None:
+    """Re-apply every PPOConfig field onto an already-constructed/loaded model.
+
+    This exists because loading a checkpoint (MaskablePPO.load / ckman.load_model)
+    restores the hyperparameters that were saved *into that checkpoint* -- so
+    building a fresh model from an updated cfg and then loading weights on top
+    of it silently reverts learning_rate, clip_range, ent_coef, etc. back to
+    whatever they were when the checkpoint was written. Call this right after
+    loading to make --set overrides on --resume actually take effect.
+
+    Every field is safe to just assign except `n_steps`, which sizes the
+    rollout buffer that was already allocated at model-construction time --
+    that one requires rebuilding the buffer, not just flipping an int.
+    """
+    model.learning_rate = ppo_cfg.learning_rate
+    model.lr_schedule = get_schedule_fn(ppo_cfg.learning_rate)
+    model.clip_range = get_schedule_fn(ppo_cfg.clip_range)
+    model.clip_range_vf = (
+        get_schedule_fn(ppo_cfg.clip_range_vf) if ppo_cfg.clip_range_vf is not None else None
+    )
+    model.gamma = ppo_cfg.gamma
+    model.gae_lambda = ppo_cfg.gae_lambda
+    model.ent_coef = ppo_cfg.ent_coef
+    model.vf_coef = ppo_cfg.vf_coef
+    model.n_epochs = ppo_cfg.n_epochs
+    model.target_kl = ppo_cfg.target_kl
+    model.batch_size = ppo_cfg.batch_size  # only read at train()-time; safe to assign directly
+
+    if model.n_steps != ppo_cfg.n_steps:
+        old_n_steps = model.n_steps
+        buffer_cls = type(model.rollout_buffer)
+        model.n_steps = ppo_cfg.n_steps
+        model.rollout_buffer = buffer_cls(
+            ppo_cfg.n_steps,
+            model.observation_space,
+            model.action_space,
+            device=model.device,
+            gamma=model.gamma,
+            gae_lambda=model.gae_lambda,
+            n_envs=model.n_envs,
+        )
+        print(f"  ppo.n_steps changed ({old_n_steps} -> {ppo_cfg.n_steps}): rebuilt rollout buffer")
+
+
 def play_test_game(
     model,
     cfg: TrainingConfig,
@@ -561,21 +613,24 @@ def run(
     cfg: TrainingConfig,
     resume_from: str | None = None,
     resume_checkpoint: str | None = None,
-    self_play_overrides: dict | None = None,
+    overrides: dict | None = None,
 ) -> None:
     freeze_support()
 
     if resume_from:
         ckman = CheckpointManager.resume(resume_from, runs_dir=cfg.runs_dir)
         cfg = ckman.config
-        if self_play_overrides:
-            for k, v in self_play_overrides.items():
-                setattr(cfg.self_play, k, v)
-
+        if overrides:
+            applied = cfg.apply_overrides(overrides, restrict_to=TrainingConfig.RESUMABLE_FIELDS)
             ckman.update_manifest_config()
-            print(f"Applied self_play overrides: {self_play_overrides}")
+            print("Applied overrides on resume:")
+            for path, old, new in applied:
+                print(f"  {path}: {old!r} -> {new!r}")
         print(f"Resuming run '{cfg.run_name}' from {ckman.run_dir}")
     else:
+        if overrides:
+            cfg = copy.deepcopy(cfg)
+            cfg.apply_overrides(overrides)
         ckman = CheckpointManager.new(cfg, architecture_info(cfg))
         print(f"Starting new run '{cfg.run_name}' in {ckman.run_dir}")
 
@@ -597,6 +652,7 @@ def run(
             loaded_model = ckman.load_model(MaskablePPO, checkpoint_dir, env=env, device=device)
             model = loaded_model
             timesteps_done = ckman.resolved_timesteps(checkpoint_dir)
+            apply_ppo_hyperparams(model, cfg.ppo)
             print(f"Loaded checkpoint {checkpoint_dir.name} ({timesteps_done} timesteps)")
         else:
             print("No checkpoint found in this run yet — starting from scratch.")
@@ -661,13 +717,21 @@ def parse_args() -> argparse.Namespace:
                         "eval disabled, self-play disabled, distinct run_name) to sanity-check "
                         "the whole pipeline end-to-end before a long cluster job.")
     p.add_argument("--static-opponents", type=str, nargs="*", default=None,
-                   help="Override self_play.static_opponents with these module paths "
-                        "(e.g. agent_code.rule_based_agent.callbacks). Only takes effect "
-                        "with --resume; persisted into the run's manifest.")
+                   help="Shorthand for --set self_play.static_opponents=... (comma-joined "
+                        "internally). Override self_play.static_opponents with these module "
+                        "paths (e.g. agent_code.rule_based_agent.callbacks).")
     p.add_argument("--n-static-opponents", type=int, default=None,
-                   help="Override self_play.n_static_opponents on resume.")
+                   help="Shorthand for --set self_play.n_static_opponents=...")
     p.add_argument("--n-self-play-opponents", type=int, default=None,
-                   help="Override self_play.n_self_play_opponents on resume.")
+                   help="Shorthand for --set self_play.n_self_play_opponents=...")
+    p.add_argument("--set", dest="overrides", type=str, nargs="*", default=[],
+                   metavar="path.to.field=value",
+                   help="Override any TrainingConfig field by dotted path, e.g. "
+                        "--set ppo.learning_rate=1e-4 ppo.ent_coef=0.0 total_timesteps=2_000_000_000. "
+                        "Repeatable / space-separated. On --resume, only fields in "
+                        "TrainingConfig.RESUMABLE_FIELDS are accepted (anything that would "
+                        "change the model's architecture or the environment's observation "
+                        "format is rejected, to avoid desyncing a run from its checkpoint).")
     return p.parse_args()
 
 
@@ -687,27 +751,29 @@ if __name__ == "__main__":
     cfg = DEFAULT_CONFIG
     if args.smoke_test:
         cfg = build_smoke_test_config(cfg)
-    if args.device is not None:
-        cfg = copy.deepcopy(cfg)
-        cfg.device = args.device
-    if args.n_envs is not None:
-        cfg = copy.deepcopy(cfg)
-        cfg.n_envs = args.n_envs
-    if args.n_shards is not None:
-        cfg = copy.deepcopy(cfg)
-        cfg.n_shards = args.n_shards
 
-    self_play_overrides = {}
+    overrides: dict[str, object] = {}
+    if args.device is not None:
+        overrides["device"] = args.device
+    if args.n_envs is not None:
+        overrides["n_envs"] = args.n_envs
+    if args.n_shards is not None:
+        overrides["n_shards"] = args.n_shards
     if args.static_opponents is not None:
-        self_play_overrides["static_opponents"] = args.static_opponents
+        overrides["self_play.static_opponents"] = ",".join(args.static_opponents)
     if args.n_static_opponents is not None:
-        self_play_overrides["n_static_opponents"] = args.n_static_opponents
+        overrides["self_play.n_static_opponents"] = args.n_static_opponents
     if args.n_self_play_opponents is not None:
-        self_play_overrides["n_self_play_opponents"] = args.n_self_play_opponents
+        overrides["self_play.n_self_play_opponents"] = args.n_self_play_opponents
+    for item in args.overrides:
+        if "=" not in item:
+            raise SystemExit(f"--set expects path.to.field=value, got: {item!r}")
+        key, _, value = item.partition("=")
+        overrides[key.strip()] = value.strip()
 
     run(
         cfg,
         resume_from=args.resume,
         resume_checkpoint=args.checkpoint,
-        self_play_overrides=self_play_overrides or None,
+        overrides=overrides or None,
     )
