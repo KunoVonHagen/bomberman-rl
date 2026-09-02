@@ -13,9 +13,51 @@ always self-describing and reproducible.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, is_dataclass, fields as dataclass_fields
 from typing import Optional, List, Literal, ClassVar
 import json
+
+
+def _coerce_dataclass_list(cls, raw: str) -> list:
+    """Parse a List[<dataclass>] override. Two supported formats:
+
+    1. JSON: '[{"n_static":0,"n_self_play":3,"weight":3.0}, ...]'
+       Flexible, but painful to quote on Windows/PowerShell (which will
+       silently strip the double quotes from a bareword-adjacent quoted
+       substring on a native command line -- ["n_static":0] becomes
+       [n_static:0], which is invalid JSON).
+
+    2. Shorthand: semicolon-separated entries, each a comma-separated list
+       of that dataclass's field values in declaration order (trailing
+       fields with defaults may be omitted). For OpponentArrangement
+       (n_static, n_self_play, weight) that's "n_static,n_self_play[,weight]":
+           "0,3,3;1,2,3;2,1,2;3,0,1"
+       No quote characters needed at all -- safe to wrap in single quotes
+       (or leave bare) in any shell.
+    """
+    trimmed = raw.strip()
+    if trimmed.startswith("[") or trimmed.startswith("{"):
+        parsed = json.loads(trimmed)
+        return [cls(**item) if isinstance(item, dict) else item for item in parsed]
+
+    field_specs = dataclass_fields(cls)
+    items = []
+    for chunk in trimmed.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [p.strip() for p in chunk.split(",")]
+        if len(parts) > len(field_specs):
+            raise ValueError(
+                f"Too many values in '{chunk}' for {cls.__name__} "
+                f"(expected at most {len(field_specs)}: "
+                f"{', '.join(f.name for f in field_specs)})"
+            )
+        kwargs = {}
+        for f, val in zip(field_specs, parts):
+            kwargs[f.name] = _coerce_value(f.default, val)
+        items.append(cls(**kwargs))
+    return items
 
 
 def _coerce_value(current, raw):
@@ -31,6 +73,8 @@ def _coerce_value(current, raw):
     if isinstance(current, float):
         return float(raw)
     if isinstance(current, list):
+        if current and is_dataclass(current[0]):
+            return _coerce_dataclass_list(type(current[0]), raw)
         return [x for x in raw.split(",") if x]
     if current is None:
         # Optional[...] field currently unset (e.g. clip_range_vf). Try float,
@@ -91,17 +135,58 @@ class EnvConfig:
     ])
 
 
+@dataclass(frozen=True)
+class OpponentArrangement:
+    """One possible 'shape' of the opponent lineup for a rollout -- e.g.
+    (n_static=1, n_self_play=2) or (n_static=3, n_self_play=0).
+
+    SelfPlayConfig.arrangements holds a menu of these. Every time
+    OpponentPool builds a fresh lineup it draws one arrangement at random
+    (weighted by `weight`), then fills its n_static/n_self_play slots. This
+    is what lets training rotate through genuinely different team
+    compositions -- all self-play, a scripted bot mixed in, an all-static
+    lineup, etc. -- instead of grinding against one fixed mix.
+
+    All arrangements in a given SelfPlayConfig must add up to the same
+    total (n_static + n_self_play): the number of opponent seats is a
+    property of the game/environment, only *who* fills them should vary.
+    """
+    n_static: int = 1
+    n_self_play: int = 2
+    weight: float = 1.0
+
+
 @dataclass
 class SelfPlayConfig:
-    """Controls whether/how the agent trains against its own past checkpoints."""
+    """Controls whether/how the agent trains against its own past checkpoints,
+    plus how varied the opponent lineups it faces are."""
     enabled: bool = False
     static_opponents: List[str] = field(default_factory=list)
-    n_static_opponents: int = 1
-    n_self_play_opponents: int = 1
+
+    arrangements: List[OpponentArrangement] = field(
+        default_factory=lambda: [OpponentArrangement(n_static=1, n_self_play=2, weight=1.0)]
+    )
+    allow_repeat_static_opponents: bool = True
+    shuffle_opponent_order: bool = True
+    resample_every_n_rollouts: int = 1
+
     pool_size: int = 8
     add_checkpoint_every_epochs: int = 1
     sample_strategy: Literal["uniform", "latest_biased"] = "latest_biased"
     latest_bias: float = 0.5
+
+    def __post_init__(self):
+        self.arrangements = [
+            a if isinstance(a, OpponentArrangement) else OpponentArrangement(**a)
+            for a in self.arrangements
+        ]
+        totals = {a.n_static + a.n_self_play for a in self.arrangements}
+        if len(totals) > 1:
+            raise ValueError(
+                "All self_play.arrangements must add up to the same total opponent "
+                f"count (the game's player count is fixed) -- got totals {sorted(totals)}. "
+                "Vary the static/self-play *mix* between arrangements, not the total."
+            )
 
 
 @dataclass
@@ -145,8 +230,10 @@ class TrainingConfig:
         "ppo.target_kl",
         "self_play.enabled",
         "self_play.static_opponents",
-        "self_play.n_static_opponents",
-        "self_play.n_self_play_opponents",
+        "self_play.arrangements",
+        "self_play.allow_repeat_static_opponents",
+        "self_play.shuffle_opponent_order",
+        "self_play.resample_every_n_rollouts",
         "self_play.pool_size",
         "self_play.add_checkpoint_every_epochs",
         "self_play.sample_strategy",
@@ -194,8 +281,25 @@ class TrainingConfig:
         d = dict(d)
         d["ppo"] = PPOConfig(**d.get("ppo", {}))
         d["env"] = EnvConfig(**d.get("env", {}))
-        d["self_play"] = SelfPlayConfig(**d.get("self_play", {}))
+        d["self_play"] = SelfPlayConfig(**cls._migrate_self_play_dict(d.get("self_play", {})))
         return cls(**d)
+
+    @staticmethod
+    def _migrate_self_play_dict(sp: dict) -> dict:
+        """Old run_manifest.json files (written before `arrangements` existed)
+        store a single scalar `n_static_opponents`/`n_self_play_opponents`
+        pair instead. Translate those into an equivalent one-item
+        `arrangements` list so old runs still resume cleanly."""
+        sp = dict(sp)
+        n_static = sp.pop("n_static_opponents", None)
+        n_self_play = sp.pop("n_self_play_opponents", None)
+        if "arrangements" not in sp and (n_static is not None or n_self_play is not None):
+            sp["arrangements"] = [{
+                "n_static": n_static if n_static is not None else 1,
+                "n_self_play": n_self_play if n_self_play is not None else 2,
+                "weight": 1.0,
+            }]
+        return sp
 
     def save(self, path: str) -> None:
         with open(path, "w") as f:
@@ -230,16 +334,21 @@ DEFAULT_CONFIG = TrainingConfig(
     self_play=SelfPlayConfig(
         enabled=True,
         static_opponents=[
-            #"agent_code.rule_based_agent.callbacks",
-            #"agent_code.coin_collector_agent.callbacks",
-            #"agent_code.random_agent.callbacks",
-            #"agent_code.peaceful_agent.callbacks",
-            #"agent_code.my_agent.callbacks",
+            "agent_code.rule_based_agent.callbacks",
+            "agent_code.coin_collector_agent.callbacks",
             "agent_code.simple_agent.callbacks",
+            "agent_code.peaceful_agent.callbacks",
         ],
-        n_static_opponents=1,
-        n_self_play_opponents=2,
-        pool_size=32,
+        arrangements=[
+            OpponentArrangement(n_static=0, n_self_play=3, weight=3.0),
+            OpponentArrangement(n_static=1, n_self_play=2, weight=3.0),
+            OpponentArrangement(n_static=2, n_self_play=1, weight=2.0),
+            OpponentArrangement(n_static=3, n_self_play=0, weight=1.0),
+        ],
+        allow_repeat_static_opponents=True,
+        shuffle_opponent_order=True,
+        resample_every_n_rollouts=1,
+        pool_size=64,
         add_checkpoint_every_epochs=1,
         sample_strategy="latest_biased",
         latest_bias=0.1,

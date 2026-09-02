@@ -35,6 +35,7 @@ import numpy as np
 import torch
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.utils import get_schedule_fn
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv, VecMonitor
 from stable_baselines3.common.vec_env.base_vec_env import VecEnvObs, VecEnvStepReturn
@@ -530,6 +531,41 @@ def apply_ppo_hyperparams(model: MaskablePPO, ppo_cfg: PPOConfig) -> None:
         print(f"  ppo.n_steps changed ({old_n_steps} -> {ppo_cfg.n_steps}): rebuilt rollout buffer")
 
 
+class OpponentResampleCallback(BaseCallback):
+    """Draws a fresh OpponentPool arrangement and pushes it into the training
+    env at the start of every rollout (i.e. every `n_steps * n_envs`
+    timesteps SB3 collects), instead of only after every checkpoint save.
+
+    Without this, every one of the n_envs parallel games in a rollout -- and
+    every rollout for a full `save_every_timesteps` chunk of them -- plays
+    against the exact same fixed trio of opponents. That's exactly the kind
+    of narrow, memorizable target that lets a policy settle into a
+    single-opponent Nash equilibrium, or pick up exploits specific to one
+    opponent (or one team composition) that don't generalize. Resampling
+    frequently, combined with OpponentPool drawing a different arrangement
+    (mix of static bots vs self-play snapshots) each time, keeps the
+    training distribution of opponents wide throughout the run.
+    """
+
+    def __init__(self, pool: OpponentPool, every_n_rollouts: int = 1, verbose: int = 0):
+        super().__init__(verbose)
+        self.pool = pool
+        self.every_n_rollouts = max(1, every_n_rollouts)
+        self._rollout_count = 0
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_start(self) -> None:
+        self._rollout_count += 1
+        if (self._rollout_count - 1) % self.every_n_rollouts != 0:
+            return
+        opponents = self.pool.current_opponents()
+        self.training_env.env_method("set_opponents", opponents)
+        if self.verbose:
+            print(f"[opponents] rollout {self._rollout_count}: {self.pool.last_opponent_descriptions()}")
+
+
 def play_test_game(
     model,
     cfg: TrainingConfig,
@@ -642,6 +678,10 @@ def run(
     env = make_train_env(cfg, opponents, str(ckman.logs_dir))
     model = build_model(env, cfg, str(ckman.tensorboard_dir), device)
 
+    opponent_callback = OpponentResampleCallback(
+        pool, every_n_rollouts=cfg.self_play.resample_every_n_rollouts, verbose=1,
+    )
+
     timesteps_done = 0
     if resume_from:
         checkpoint_dir = (
@@ -664,6 +704,7 @@ def run(
             total_timesteps=chunk,
             reset_num_timesteps=False,
             tb_log_name="PPO",
+            callback=opponent_callback,
         )
         timesteps_done = model.num_timesteps
 
@@ -695,11 +736,10 @@ def run(
 
         if cfg.self_play.enabled:
             pool.maybe_add_checkpoint(ckpt_dir, timesteps_done)
-            opponents = pool.current_opponents()
-            env.env_method("set_opponents", opponents)  # Note: env is now VecMonitor
 
         if cfg.eval_every_save:
-            play_test_game(model, cfg, opponents, ckman, timesteps_done)
+            test_opponents = pool.current_opponents()
+            play_test_game(model, cfg, test_opponents, ckman, timesteps_done)
 
 
 def parse_args() -> argparse.Namespace:
@@ -720,10 +760,15 @@ def parse_args() -> argparse.Namespace:
                    help="Shorthand for --set self_play.static_opponents=... (comma-joined "
                         "internally). Override self_play.static_opponents with these module "
                         "paths (e.g. agent_code.rule_based_agent.callbacks).")
-    p.add_argument("--n-static-opponents", type=int, default=None,
-                   help="Shorthand for --set self_play.n_static_opponents=...")
-    p.add_argument("--n-self-play-opponents", type=int, default=None,
-                   help="Shorthand for --set self_play.n_self_play_opponents=...")
+    p.add_argument("--arrangements", type=str, default=None,
+                   help="Shorthand for --set self_play.arrangements=.... Describes the possible "
+                        "opponent-lineup shapes; every rollout draws one at random, weighted. "
+                        "All entries must sum to the same total (the game's fixed opponent-seat "
+                        "count). Two accepted formats -- shorthand (recommended on Windows/"
+                        "PowerShell, no quote characters needed): semicolon-separated "
+                        "'n_static,n_self_play,weight' triples, e.g. "
+                        "'0,3,3;1,2,3;2,1,2;3,0,1'. Or JSON (needs careful quoting on "
+                        "PowerShell): '[{\"n_static\":0,\"n_self_play\":3,\"weight\":3}]'")
     p.add_argument("--set", dest="overrides", type=str, nargs="*", default=[],
                    metavar="path.to.field=value",
                    help="Override any TrainingConfig field by dotted path, e.g. "
@@ -761,10 +806,8 @@ if __name__ == "__main__":
         overrides["n_shards"] = args.n_shards
     if args.static_opponents is not None:
         overrides["self_play.static_opponents"] = ",".join(args.static_opponents)
-    if args.n_static_opponents is not None:
-        overrides["self_play.n_static_opponents"] = args.n_static_opponents
-    if args.n_self_play_opponents is not None:
-        overrides["self_play.n_self_play_opponents"] = args.n_self_play_opponents
+    if args.arrangements is not None:
+        overrides["self_play.arrangements"] = args.arrangements
     for item in args.overrides:
         if "=" not in item:
             raise SystemExit(f"--set expects path.to.field=value, got: {item!r}")

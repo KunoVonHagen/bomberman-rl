@@ -6,7 +6,7 @@ import random
 import tempfile
 from typing import Callable, Dict, List, Optional, Tuple
 
-from .config import EnvConfig, SelfPlayConfig
+from .config import EnvConfig, SelfPlayConfig, OpponentArrangement
 from .checkpoint_manager import CheckpointManager
 
 OpponentPair = Tuple[Callable, Callable]
@@ -101,6 +101,13 @@ class OpponentPool:
         if cfg.enabled:
             self._checkpoints = list(ckman.list_checkpoints())[-cfg.pool_size:]
 
+        totals = {a.n_static + a.n_self_play for a in cfg.arrangements}
+        if len(totals) > 1:
+            raise ValueError(
+                "All self_play.arrangements must add up to the same total opponent "
+                f"count -- got totals {sorted(totals)}."
+            )
+
     def maybe_add_checkpoint(self, checkpoint_dir: Optional[pathlib.Path], _timesteps: int) -> None:
         """Call this after every saved checkpoint; it decides whether to add
         it to the self-play pool based on `add_checkpoint_every_epochs`."""
@@ -132,26 +139,75 @@ class OpponentPool:
         module = importlib.import_module(module_path)
         return (module.setup, module.act)
 
+    def _choose_arrangement(self) -> OpponentArrangement:
+        """Pick one lineup 'shape' for this rollout, weighted by
+        arrangement.weight. This is the main knob for variety: different
+        calls can come back with all-self-play, all-static, or anything in
+        between."""
+        arrangements = self.cfg.arrangements
+        if len(arrangements) == 1:
+            return arrangements[0]
+        weights = [max(0.0, a.weight) for a in arrangements]
+        if sum(weights) <= 0:
+            weights = [1.0] * len(arrangements)
+        return random.choices(arrangements, weights=weights, k=1)[0]
+
+    def _sample_static_opponents(self, k: int) -> List[str]:
+        if k <= 0:
+            return []
+        pool = self.cfg.static_opponents
+        if not pool:
+            raise ValueError(
+                f"OpponentPool needs to fill {k} opponent slot(s) with static agents "
+                "(self-play is disabled or its checkpoint pool is still empty) but "
+                "self_play.static_opponents is empty. Add at least one static "
+                "opponent module path to config.self_play.static_opponents."
+            )
+        if self.cfg.allow_repeat_static_opponents or k > len(pool):
+            return [random.choice(pool) for _ in range(k)]
+        return random.sample(pool, k=k)
+
     def current_opponents(self) -> List[OpponentPair]:
         """Returns the list of (setup_fn, act_fn) pairs to pass as
-        `opponents=` into WorldArgs/BombermanGymEnv for the next rollout."""
+        `opponents=` into WorldArgs/BombermanGymEnv for the next rollout.
+
+        Each call draws a fresh OpponentArrangement (see config.py) and fills
+        it: some checkpoint-based self-play opponents (if self-play is
+        enabled and the pool has anything in it yet) and the rest static,
+        scripted opponents. Slots requested from self-play that can't be
+        filled (empty pool, or self-play disabled) are transparently
+        backfilled with static opponents so every rollout still gets exactly
+        the number of seats the arrangement calls for -- the environment's
+        player count never changes, only who's sitting where."""
+        arrangement = self._choose_arrangement()
+        total_needed = arrangement.n_static + arrangement.n_self_play
+
         opponents: List[OpponentPair] = []
         descriptions: List[str] = []
 
-        if self.cfg.static_opponents:
-            k = min(self.cfg.n_static_opponents, len(self.cfg.static_opponents))
-            for path in random.sample(self.cfg.static_opponents, k=k):
-                opponents.append(self._resolve_static(path))
-                descriptions.append(path)
+        n_self_play_requested = arrangement.n_self_play if self.cfg.enabled else 0
+        self_play_filled = 0
+        for _ in range(n_self_play_requested):
+            ckpt = self._sample_checkpoint()
+            if ckpt is None:
+                break
+            opponents.append(self._checkpoint_opponent(ckpt))
+            descriptions.append(f"checkpoint:{ckpt.parent.parent.name}/{ckpt.name}")
+            self_play_filled += 1
 
-        if self.cfg.enabled:
-            for _ in range(self.cfg.n_self_play_opponents):
-                ckpt = self._sample_checkpoint()
-                if ckpt is not None:
-                    opponents.append(self._checkpoint_opponent(ckpt))
-                    descriptions.append(f"checkpoint:{ckpt.parent.parent.name}/{ckpt.name}")
+        n_static_needed = total_needed - self_play_filled
+        for path in self._sample_static_opponents(n_static_needed):
+            opponents.append(self._resolve_static(path))
+            descriptions.append(path)
 
-        self._last_descriptions = descriptions
+        if self.cfg.shuffle_opponent_order and opponents:
+            paired = list(zip(opponents, descriptions))
+            random.shuffle(paired)
+            opponents = [p[0] for p in paired]
+            descriptions = [p[1] for p in paired]
+
+        label = f"arrangement=(static:{n_static_needed},self_play:{self_play_filled})"
+        self._last_descriptions = [label, *descriptions]
         return opponents
 
     def last_opponent_descriptions(self) -> List[str]:
