@@ -20,6 +20,16 @@ Main training entrypoint. All tunable behaviour lives in config.py — edit
         are allowed here -- anything that would change the model's architecture
         or the environment's observation format is rejected, since that would
         desync a resumed run from the checkpoint it's loading.
+
+    python train.py --resume run_20260101-101500 --max-rollouts 200
+        Resume, but only run 200 more PPO rollouts in this process, then
+        exit (with a checkpoint saved) instead of continuing all the way to
+        cfg.total_timesteps. This is a per-process flag, not a config
+        field: it's never written into run_manifest.json, so it has no
+        effect unless passed on this exact invocation, and it always counts
+        from 0 -- regardless of how many rollouts previous processes for
+        this run already completed. Handy for chopping a long run into
+        fixed-length cluster jobs, each resuming where the last left off.
 -----------------------------------------------------------------------------
 """
 from __future__ import annotations
@@ -35,7 +45,7 @@ import numpy as np
 import torch
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.utils import get_schedule_fn
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv, VecMonitor
 from stable_baselines3.common.vec_env.base_vec_env import VecEnvObs, VecEnvStepReturn
@@ -566,6 +576,45 @@ class OpponentResampleCallback(BaseCallback):
             print(f"[opponents] rollout {self._rollout_count}: {self.pool.last_opponent_descriptions()}")
 
 
+class MaxRolloutsCallback(BaseCallback):
+    """Caps a single training *process* to at most `max_rollouts` PPO
+    rollouts (each `n_steps * n_envs` timesteps), independent of
+    cfg.total_timesteps and independent of how many rollouts any earlier
+    process already ran for this same run.
+
+    This is deliberately NOT config state: `max_rollouts` is passed in
+    fresh from the CLI every invocation and is never written into
+    run_manifest.json, so `self.rollouts_started` always starts at 0 when
+    a process starts -- including on `--resume`. There is no persisted
+    "rollouts so far" for this run to read back in, so a resumed process
+    given `--max-rollouts N` runs N more rollouts and stops, exactly like
+    a fresh run given the same flag would, regardless of how many
+    checkpoints or rollouts preceded it.
+
+    Stopping happens cleanly at a rollout boundary rather than mid-rollout:
+    once the cap is reached, `_on_step` returns False on the very first
+    step of the *next* rollout. That makes SB3's `collect_rollouts` abort
+    immediately and `model.learn()` return without ever finishing (or
+    training on) that rollout's buffer -- so no partial/corrupt rollout
+    data reaches the optimizer.
+    """
+
+    def __init__(self, max_rollouts: int | None, verbose: int = 0):
+        super().__init__(verbose)
+        self.max_rollouts = max_rollouts
+        self.rollouts_started = 0
+        self.limit_reached = False
+
+    def _on_rollout_start(self) -> None:
+        self.rollouts_started += 1
+
+    def _on_step(self) -> bool:
+        if self.max_rollouts is not None and self.rollouts_started > self.max_rollouts:
+            self.limit_reached = True
+            return False
+        return True
+
+
 def play_test_game(
     model,
     cfg: TrainingConfig,
@@ -650,6 +699,7 @@ def run(
     resume_from: str | None = None,
     resume_checkpoint: str | None = None,
     overrides: dict | None = None,
+    max_rollouts: int | None = None,
 ) -> None:
     freeze_support()
 
@@ -681,6 +731,12 @@ def run(
     opponent_callback = OpponentResampleCallback(
         pool, every_n_rollouts=cfg.self_play.resample_every_n_rollouts, verbose=1,
     )
+    max_rollouts_callback = MaxRolloutsCallback(max_rollouts, verbose=1)
+    learn_callback = CallbackList([opponent_callback, max_rollouts_callback])
+
+    if max_rollouts is not None:
+        print(f"[max-rollouts] capping this process to {max_rollouts} rollout(s), "
+              f"then stopping (run remains resumable afterwards)")
 
     timesteps_done = 0
     if resume_from:
@@ -704,7 +760,7 @@ def run(
             total_timesteps=chunk,
             reset_num_timesteps=False,
             tb_log_name="PPO",
-            callback=opponent_callback,
+            callback=learn_callback,
         )
         timesteps_done = model.num_timesteps
 
@@ -741,6 +797,13 @@ def run(
             test_opponents = pool.current_opponents()
             play_test_game(model, cfg, test_opponents, ckman, timesteps_done)
 
+        if max_rollouts_callback.limit_reached:
+            print(f"[max-rollouts] hit the {max_rollouts}-rollout cap for this process "
+                  f"at {timesteps_done} timesteps -- stopping here. "
+                  f"cfg.total_timesteps ({cfg.total_timesteps}) not yet reached; "
+                  f"resume this run (without --max-rollouts, or with a new one) to continue.")
+            break
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -752,6 +815,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-shards", type=int, default=None,
                    help="Override cfg.n_shards -- split n_envs across this many subprocesses for real "
                         "multi-core usage (n_envs must be divisible by n_shards).")
+    p.add_argument("--max-rollouts", type=int, default=None,
+                   help="Stop this training PROCESS after at most this many PPO rollouts "
+                        "(each cfg.ppo.n_steps * cfg.n_envs timesteps), then exit cleanly "
+                        "(with a checkpoint saved) instead of continuing to cfg.total_timesteps. "
+                        "This is a per-process cap only: it is never saved into "
+                        "run_manifest.json, so it does not carry over across --resume "
+                        "invocations, and on --resume it counts rollouts made by *this* "
+                        "process from 0, ignoring however many rollouts earlier processes "
+                        "already completed for the run. Useful for splitting a long run into "
+                        "cluster jobs with a fixed wall-clock budget each.")
     p.add_argument("--smoke-test", action="store_true",
                    help="Run a tiny, fast config (few envs, few timesteps, frequent saves, "
                         "eval disabled, self-play disabled, distinct run_name) to sanity-check "
@@ -819,4 +892,5 @@ if __name__ == "__main__":
         resume_from=args.resume,
         resume_checkpoint=args.checkpoint,
         overrides=overrides or None,
+        max_rollouts=args.max_rollouts,
     )
