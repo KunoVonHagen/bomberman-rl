@@ -1,37 +1,3 @@
-"""
-train.py
------------------------------------------------------------------------------
-Main training entrypoint. All tunable behaviour lives in config.py — edit
-`DEFAULT_CONFIG` there rather than this file.
-
-    python train.py
-        Start a fresh run using DEFAULT_CONFIG from config.py.
-
-    python train.py --resume run_20260101-101500
-        Resume the given run from its latest checkpoint, using the config
-        that run was originally created with (stored in its run_manifest.json).
-
-    python train.py --resume runs/run_20260101-101500 --checkpoint checkpoint_0016777216
-        Resume from a specific checkpoint instead of the latest one.
-
-    python train.py --resume run_20260101-101500 --set ppo.learning_rate=1e-4 ppo.ent_coef=0.0 total_timesteps=2_000_000_000
-        Resume, but override arbitrary model-independent hyperparameters for
-        the next phase of training. Only fields in TrainingConfig.RESUMABLE_FIELDS
-        are allowed here -- anything that would change the model's architecture
-        or the environment's observation format is rejected, since that would
-        desync a resumed run from the checkpoint it's loading.
-
-    python train.py --resume run_20260101-101500 --max-rollouts 200
-        Resume, but only run 200 more PPO rollouts in this process, then
-        exit (with a checkpoint saved) instead of continuing all the way to
-        cfg.total_timesteps. This is a per-process flag, not a config
-        field: it's never written into run_manifest.json, so it has no
-        effect unless passed on this exact invocation, and it always counts
-        from 0 -- regardless of how many rollouts previous processes for
-        this run already completed. Handy for chopping a long run into
-        fixed-length cluster jobs, each resuming where the last left off.
------------------------------------------------------------------------------
-"""
 from __future__ import annotations
 
 import argparse
@@ -47,16 +13,15 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.utils import get_schedule_fn
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv, VecMonitor
-from stable_baselines3.common.vec_env.base_vec_env import VecEnvObs, VecEnvStepReturn
+from stable_baselines3.common.vec_env import VecEnv, VecMonitor
 
 from environment import WorldArgs
 
-from agent_code.my_agent.gym_environment import BombermanGymEnv
-from agent_code.my_agent.model import BombermanFeatureExtractor
-from agent_code.my_agent.config import DEFAULT_CONFIG, TrainingConfig, PPOConfig
-from agent_code.my_agent.checkpoint_manager import CheckpointManager
-from agent_code.my_agent.opponent_pool import OpponentPool
+from agent_code.ppo_agent.gym_environment import BombermanGymEnv
+from agent_code.ppo_agent.model import BombermanFeatureExtractor
+from agent_code.ppo_agent.config import DEFAULT_CONFIG, TrainingConfig, PPOConfig
+from agent_code.ppo_agent.checkpoint_manager import CheckpointManager
+from agent_code.ppo_agent.opponent_pool import OpponentPool
 
 
 def mask_fn(env):
@@ -64,9 +29,9 @@ def mask_fn(env):
 
 
 def resolve_device(requested: str = "auto") -> str:
-    """Resolve 'auto' -> cuda if available else cpu, and print a clear,
-    unmissable diagnostic so a silent CPU fallback never goes unnoticed
-    in a scrollback log on the cluster."""
+    """
+    Resolve the device string to use for PyTorch (and SB3) training.
+    """
     if requested != "auto":
         device = requested
     else:
@@ -118,28 +83,25 @@ def build_world_args(
     )
 
 
-# --- ADD THIS NEW WRAPPER CLASS ---
 class NativeBatchedVecEnv(VecEnv):
     """
-    Adapter to make a natively batched Gymnasium Env (like BombermanGymEnv)
-    compatible with Stable-Baselines3's VecEnv API.
+    Wraps a BombermanGymEnv that already natively batches N envs in-process
+    to make it compatible with Stable-Baselines3's VecEnv API.
     """
 
     def __init__(self, batched_env):
         self.env = batched_env
         super().__init__(
             num_envs=self.env.n_envs,
-            observation_space=self.env.single_observation_space,  # NOT self.env.observation_space
-            action_space=self.env.single_action_space  # NOT self.env.action_space
+            observation_space=self.env.single_observation_space,
+            action_space=self.env.single_action_space
         )
         self._actions = None
         self._last_infos: list[dict] = []
 
     def reset(self, seed=None, options=None):
-        # Unpack the tuple from the underlying env
         obs, infos = self.env.reset(seed=seed, options=options)
         self._last_infos = infos
-        # Return ONLY obs, not the tuple - works around sb3_contrib bug
         return obs
 
     def step_async(self, actions: np.ndarray) -> None:
@@ -159,15 +121,11 @@ class NativeBatchedVecEnv(VecEnv):
         return self.env.close()
 
     def env_method(self, method_name: str, *args, **kwargs) -> list:
-        # Extract 'indices' before calling the underlying method
-        # (natively batched envs operate on all envs at once, so we filter after)
         indices = kwargs.pop('indices', None)
 
         result = getattr(self.env, method_name)(*args, **kwargs)
 
-        # Convert batched results to per-env list as SB3 expects
         if isinstance(result, np.ndarray) and result.ndim > 0 and result.shape[0] == self.num_envs:
-            # Batched array like action_masks: (n_envs, n_actions) -> list of (n_actions,) arrays
             per_env = [result[i] for i in range(self.num_envs)]
             if indices is not None:
                 return [per_env[i] for i in indices]
@@ -177,7 +135,6 @@ class NativeBatchedVecEnv(VecEnv):
                 return [result[i] for i in indices]
             return list(result)
         else:
-            # Scalar or single value - replicate for requested envs
             n = len(indices) if indices is not None else self.num_envs
             return [result] * n
 
@@ -223,15 +180,10 @@ class NativeBatchedVecEnv(VecEnv):
 
 def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, layer_config, shard_n_envs: int):
     """
-    Entry point for one shard subprocess. Owns a real BombermanGymEnv
-    simulating `shard_n_envs` games natively-batched (i.e. via its own
-    internal Python for-loop over that shard's envs). Talks to the parent
-    over a Pipe using the same verb set SB3's own SubprocVecEnv workers use,
-    so shard results can be concatenated like any other VecEnv batch.
+    Worker function for a single shard process.
+    It creates a BombermanGymEnv with the given world_args and handles commands from the parent process via the remote pipe.
     """
     parent_remote.close()
-    from environment import WorldArgs
-    from agent_code.my_agent.gym_environment import BombermanGymEnv
 
     world_args = WorldArgs(**world_args_kwargs)
     env = BombermanGymEnv(world_args, opponents=opponents, layer_config=layer_config, n_envs=shard_n_envs)
@@ -278,21 +230,8 @@ def _concat_obs(obs_list: list) -> dict:
 
 class ShardedNativeBatchedVecEnv(VecEnv):
     """
-    Runs several BombermanGymEnv batches in separate OS processes ("shards"),
-    each natively-batched in-process, and concatenates their outputs into one
-    big batch for SB3 -- functionally a drop-in replacement for
-    NativeBatchedVecEnv when you want actual multi-core usage.
-
-    Why this exists: BombermanGymEnv.step()/reset() loop over envs with a
-    plain Python `for env in range(self.n_envs): self._advance(env, ...)`.
-    That means simulating N envs in ONE process is single-threaded no matter
-    how many CPU cores are requested -- more n_envs just makes that loop
-    longer, and extra cores sit idle. Sharding cfg.n_envs across
-    `n_shards` OS processes lets those per-shard loops run in parallel
-    instead of sequentially, without touching the env's internals. The
-    long-term fix is vectorizing _advance() itself with numpy across the
-    batch dimension; this is the practical fix that doesn't require
-    rewriting the game logic.
+    Wraps N BombermanGymEnv shards, each of which natively batches M envs in-process,
+    to make it compatible with Stable-Baselines3's VecEnv API.
     """
 
     def __init__(self, cfg: TrainingConfig, opponents, log_dir: str, n_shards: int):
@@ -446,14 +385,13 @@ def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
             n_envs=cfg.n_envs
         )
         vec_env = NativeBatchedVecEnv(env)
-    # Wrap with VecMonitor to track ep_rew_mean and ep_len_mean
+
     return VecMonitor(vec_env, filename=None)
 
 
 def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str) -> NativeBatchedVecEnv:
     world_args = build_world_args(cfg, log_dir, save_replay=True, replay_path=replay_path)
 
-    # For testing, we usually just want 1 game playing out
     env = BombermanGymEnv(
         world_args,
         opponents=opponents,
@@ -464,8 +402,9 @@ def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str
     return NativeBatchedVecEnv(env)
 
 def architecture_info(cfg: TrainingConfig) -> dict:
-    """Static description of the model, written once into run_manifest.json
-    so a run folder is self-describing without needing this script."""
+    """
+    Return a dict describing the model architecture and policy configuration for this run.
+    """
     return {
         "policy": "MultiInputPolicy",
         "algorithm": "MaskablePPO",
@@ -498,18 +437,8 @@ def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str, device: 
 
 
 def apply_ppo_hyperparams(model: MaskablePPO, ppo_cfg: PPOConfig) -> None:
-    """Re-apply every PPOConfig field onto an already-constructed/loaded model.
-
-    This exists because loading a checkpoint (MaskablePPO.load / ckman.load_model)
-    restores the hyperparameters that were saved *into that checkpoint* -- so
-    building a fresh model from an updated cfg and then loading weights on top
-    of it silently reverts learning_rate, clip_range, ent_coef, etc. back to
-    whatever they were when the checkpoint was written. Call this right after
-    loading to make --set overrides on --resume actually take effect.
-
-    Every field is safe to just assign except `n_steps`, which sizes the
-    rollout buffer that was already allocated at model-construction time --
-    that one requires rebuilding the buffer, not just flipping an int.
+    """
+    Update an existing MaskablePPO model's hyperparameters to match a new PPOConfig.
     """
     model.learning_rate = ppo_cfg.learning_rate
     model.lr_schedule = get_schedule_fn(ppo_cfg.learning_rate)
@@ -523,7 +452,7 @@ def apply_ppo_hyperparams(model: MaskablePPO, ppo_cfg: PPOConfig) -> None:
     model.vf_coef = ppo_cfg.vf_coef
     model.n_epochs = ppo_cfg.n_epochs
     model.target_kl = ppo_cfg.target_kl
-    model.batch_size = ppo_cfg.batch_size  # only read at train()-time; safe to assign directly
+    model.batch_size = ppo_cfg.batch_size
 
     if model.n_steps != ppo_cfg.n_steps:
         old_n_steps = model.n_steps
@@ -542,19 +471,8 @@ def apply_ppo_hyperparams(model: MaskablePPO, ppo_cfg: PPOConfig) -> None:
 
 
 class OpponentResampleCallback(BaseCallback):
-    """Draws a fresh OpponentPool arrangement and pushes it into the training
-    env at the start of every rollout (i.e. every `n_steps * n_envs`
-    timesteps SB3 collects), instead of only after every checkpoint save.
-
-    Without this, every one of the n_envs parallel games in a rollout -- and
-    every rollout for a full `save_every_timesteps` chunk of them -- plays
-    against the exact same fixed trio of opponents. That's exactly the kind
-    of narrow, memorizable target that lets a policy settle into a
-    single-opponent Nash equilibrium, or pick up exploits specific to one
-    opponent (or one team composition) that don't generalize. Resampling
-    frequently, combined with OpponentPool drawing a different arrangement
-    (mix of static bots vs self-play snapshots) each time, keeps the
-    training distribution of opponents wide throughout the run.
+    """
+    A callback that resamples opponents at the end of each training episode.
     """
 
     def __init__(self, pool: OpponentPool, every_n_rollouts: int = 1, verbose: int = 0):
@@ -577,26 +495,8 @@ class OpponentResampleCallback(BaseCallback):
 
 
 class MaxRolloutsCallback(BaseCallback):
-    """Caps a single training *process* to at most `max_rollouts` PPO
-    rollouts (each `n_steps * n_envs` timesteps), independent of
-    cfg.total_timesteps and independent of how many rollouts any earlier
-    process already ran for this same run.
-
-    This is deliberately NOT config state: `max_rollouts` is passed in
-    fresh from the CLI every invocation and is never written into
-    run_manifest.json, so `self.rollouts_started` always starts at 0 when
-    a process starts -- including on `--resume`. There is no persisted
-    "rollouts so far" for this run to read back in, so a resumed process
-    given `--max-rollouts N` runs N more rollouts and stops, exactly like
-    a fresh run given the same flag would, regardless of how many
-    checkpoints or rollouts preceded it.
-
-    Stopping happens cleanly at a rollout boundary rather than mid-rollout:
-    once the cap is reached, `_on_step` returns False on the very first
-    step of the *next* rollout. That makes SB3's `collect_rollouts` abort
-    immediately and `model.learn()` return without ever finishing (or
-    training on) that rollout's buffer -- so no partial/corrupt rollout
-    data reaches the optimizer.
+    """
+    A callback that stops training after a maximum number of rollouts.
     """
 
     def __init__(self, max_rollouts: int | None, verbose: int = 0):
@@ -656,11 +556,9 @@ def run_eval_suite(
     n_episodes: int = 10,
     bot_paths: list[str] | None = None,
 ) -> dict[str, float]:
-    """Evaluate the current model (deterministic policy) against a battery
-    of fixed scripted bots, independent of the self-play opponent mix used
-    for training. Returns {bot_path: mean_reward}. Use this to tell whether
-    self-play reward gains reflect real skill growth or just co-evolved
-    exploitation of your own policy's blind spots."""
+    """
+    Run a suite of evaluation games against a set of bots and return the average rewards.
+    """
     bot_paths = bot_paths if bot_paths is not None else EVAL_SUITE_BOTS
     results: dict[str, float] = {}
 
@@ -764,11 +662,9 @@ def run(
         )
         timesteps_done = model.num_timesteps
 
-        # Get metrics from the monitor (now they'll be available!)
         ep_rew_mean = model.logger.name_to_value.get("rollout/ep_rew_mean")
         ep_len_mean = model.logger.name_to_value.get("rollout/ep_len_mean")
 
-        # Print them explicitly
         if ep_rew_mean is not None:
             print(f"  ep_rew_mean: {ep_rew_mean:.4f}")
         if ep_len_mean is not None:
@@ -856,10 +752,10 @@ def parse_args() -> argparse.Namespace:
 def build_smoke_test_config(base_cfg: TrainingConfig) -> TrainingConfig:
     cfg = copy.deepcopy(base_cfg)
     cfg.run_name = f"smoketest_{datetime.now():%Y%m%d-%H%M%S}"
-    cfg.total_timesteps = cfg.ppo.n_steps * cfg.n_envs * 3  # a handful of rollouts
-    cfg.save_every_timesteps = cfg.ppo.n_steps * cfg.n_envs  # save after every rollout
-    cfg.eval_every_save = True  # exercise play_test_game() too
-    cfg.self_play.enabled = False  # keep it simple/fast; opponent pool has its own paths to check separately
+    cfg.total_timesteps = cfg.ppo.n_steps * cfg.n_envs * 3
+    cfg.save_every_timesteps = cfg.ppo.n_steps * cfg.n_envs
+    cfg.eval_every_save = True
+    cfg.self_play.enabled = False
     return cfg
 
 

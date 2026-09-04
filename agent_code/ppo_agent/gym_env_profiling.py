@@ -1,11 +1,10 @@
 import time
 import pathlib
-import numpy as np  # Added import for array operations
+import numpy as np
 
-from agent_code.my_agent.gym_environment import BombermanGymEnv
+from agent_code.ppo_agent.gym_environment import BombermanGymEnv
 from environment import WorldArgs
 from agent_code.my_agent.callbacks import setup as my_agent_setup, act as my_agent_act
-from agent_code.random_agent.callbacks import setup as random_agent_setup, act as random_agent_act
 
 CLASSIC_ENV_ARGS = WorldArgs(
     scenario="classic",
@@ -33,12 +32,11 @@ def benchmark_environment(n_envs=8, total_steps=50000, opponents=None):
     if opponents is None:
         opponents = [(my_agent_setup, my_agent_act)] * 3
 
-    # 1. Initialize the environment with the desired number of parallel games
     env = BombermanGymEnv(
         CLASSIC_ENV_ARGS,
         opponents=opponents,
-        n_envs=n_envs,  # <--- KEY CHANGE: Tell the env how many games to run internally
-        auto_reset=True  # Ensures finished games instantly restart without slowing down the loop
+        n_envs=n_envs,
+        auto_reset=True
     )
 
     print(f"Profiling batched environment with {n_envs} parallel games for {total_steps} steps...")
@@ -47,26 +45,16 @@ def benchmark_environment(n_envs=8, total_steps=50000, opponents=None):
     total_completed_games = 0
     start_time = time.perf_counter()
 
-    # Initial reset
     obs, _ = env.reset()
-
-    # 2. Step Loop instead of Episode Loop
     for step in range(total_steps):
-        # The action_space is now a MultiDiscrete([6, 6, 6...]) matching n_envs.
-        # .sample() automatically returns an array of shape (n_envs,) with random actions.
         actions = env.action_space.sample()
-
-        # Step returns batched data: terminateds and truncateds are boolean arrays of shape (n_envs,)
         obs, rewards, terminateds, truncateds, infos = env.step(actions)
-
-        # 3. Count how many individual games finished on this specific tick
         finished_this_tick = np.sum(terminateds | truncateds)
         total_completed_games += finished_this_tick
 
     elapsed_time = time.perf_counter() - start_time
     env.close()
 
-    # 4. Calculate throughput metrics
     total_individual_game_steps = n_envs * total_steps
     steps_per_second = total_individual_game_steps / elapsed_time if elapsed_time > 0 else float("inf")
 

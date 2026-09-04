@@ -5,6 +5,7 @@ import copy
 import pathlib
 from datetime import datetime
 from typing import Optional, List
+import numpy as np
 
 from .config import TrainingConfig
 
@@ -12,14 +13,12 @@ from .config import TrainingConfig
 def _json_safe(obj):
     """json.dumps(default=...) fallback for common non-serializable types
     that sneak into metadata dicts (numpy scalars/arrays, pathlib.Path)."""
-    try:
-        import numpy as np
-        if isinstance(obj, np.generic):
-            return obj.item()
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-    except ImportError:
-        pass
+
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+
     if isinstance(obj, pathlib.Path):
         return str(obj)
     raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
@@ -92,11 +91,10 @@ class CheckpointManager:
         (self.run_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2))
 
     def update_manifest_config(self, architecture_info: Optional[dict] = None) -> None:
-        """Re-persist the manifest with the current (possibly overridden)
-        self.config, preserving the existing architecture block unless a
-        new one is given. Call this after mutating self.config in-place
-        (e.g. applying --static-opponents on resume) so the change survives
-        a future resume instead of being silently dropped."""
+        """
+        Update the run_manifest.json with the current config and architecture info.
+        If architecture_info is None, it will be read from the existing manifest.
+        """
         info = architecture_info
         if info is None:
             existing = self.read_manifest() if self.manifest_path.exists() else {}
