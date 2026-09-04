@@ -16,7 +16,7 @@ source ~/envs/bomberman/bin/activate
 
 cd $HOME/bomberman-rl
 
-RUN_NAME="${RUN_NAME:-bomberman_ppo_selfplay}"
+RUN_NAME="${RUN_NAME:-bomberman_ppo_short_$(date +%Y%m%d_%H%M%S)}"
 
 TOTAL_SECONDS=$((72 * 3600))
 LIVE_CHECK_INTERVAL=300
