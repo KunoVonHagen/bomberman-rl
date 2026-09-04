@@ -1,6 +1,5 @@
 import events as e
 
-# Naive rewards matching actual scoring system
 SIMPLE_EVENT_REWARDS = {
     e.MOVED_LEFT: 0,
     e.MOVED_RIGHT: 0,
@@ -24,8 +23,6 @@ SIMPLE_EVENT_REWARDS = {
     e.SURVIVED_ROUND: 0,
 }
 
-
-# Shaped rewards based on game events
 EVENT_REWARDS = {
     e.MOVED_LEFT: 0,
     e.MOVED_RIGHT: 0,
@@ -49,9 +46,6 @@ EVENT_REWARDS = {
     e.SURVIVED_ROUND: 0.0,
 }
 
-
-
-# Dense shaping
 COIN_SHAPING_COEF = 0.05
 CRATE_SHAPING_COEF = 0.02
 DANGER_PENALTY_COEF = 0.05

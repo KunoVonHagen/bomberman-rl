@@ -1,31 +1,16 @@
 import pickle
-from collections import namedtuple, deque
+from collections import namedtuple
 from pathlib import Path
 from typing import List, Tuple, Callable, Optional, Dict, Any, Iterable, Set
 
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-
-try:
-    from numba import njit
-    _NUMBA_AVAILABLE = True
-except ImportError:  # pragma: no cover - graceful, correctness-preserving fallback
-    _NUMBA_AVAILABLE = False
-
-    def njit(*args, **kwargs):
-        # No-op decorator so the exact same Python implementation below still
-        # runs correctly (just without JIT compilation) if numba isn't installed.
-        def _wrap(fn):
-            return fn
-        if len(args) == 1 and callable(args[0]) and not kwargs:
-            return args[0]
-        return _wrap
+from numba import njit
 
 import settings as s
 import events as e
-from agent_code.my_agent.rewards import (
-    SIMPLE_EVENT_REWARDS,
+from agent_code.ppo_agent.rewards import (
     EVENT_REWARDS,
     CRATE_SHAPING_COEF,
     COIN_SHAPING_COEF,
@@ -34,7 +19,6 @@ from agent_code.my_agent.rewards import (
     TRAP_SHAPING_COEF
 )
 
-# Kept for drop-in compatibility with callers that construct WorldArgs(...).
 WorldArgs = namedtuple(
     "WorldArgs",
     ["no_gui", "fps", "turn_based", "update_interval", "save_replay", "replay",
@@ -45,10 +29,8 @@ WorldArgs = namedtuple(
 
 class _NullLogger:
     """
-    Minimal logger that does nothing, for use in the gym environment when
-    no logging is desired. This avoids the overhead of checking for a logger
-    in the main loop and allows the environment to be used in contexts where
-    logging is not set up or desired.
+    A logger that does nothing. Used as a default logger for AgentHandle instances
+    when no logger is provided. This prevents the need for null checks before logging.
     """
     __slots__ = ()
 
@@ -67,10 +49,7 @@ _NULL_LOGGER = _NullLogger()
 
 class AgentHandle:
     """
-    A handle for an agent in the environment, used to track its state and
-    interactions with the environment. This class is used to represent both
-    the learning agent and its opponents, providing a consistent interface
-    for managing their state, score, and events during the game.
+    Represents an agent in the Bomberman environment, tracking its state, score, and events.
     """
 
     __slots__ = ("name", "train", "logger", "x", "y", "score", "total_score",
@@ -220,7 +199,7 @@ NUM_FEATURES = len(FEATURE_NAMES)
 
 def resolve_layer_groups(requested: Optional[Iterable[str]]) -> Set[str]:
     """
-    Given a requested set of layer groups, resolve it to the full set of groups that should be enabled, including dependencies and the base group.
+    Resolves a set of requested layer groups, including their dependencies.
     """
     if requested is None:
         return set(LAYER_GROUPS.keys())
@@ -251,11 +230,7 @@ def resolve_layer_groups(requested: Optional[Iterable[str]]) -> Set[str]:
 @njit(cache=True)
 def _time_aware_bfs_kernel(starts, start_counts, occ, W, H, T, dist, visited, qx, qy, qt):
     """
-    Batched time-aware BFS: computes earliest arrival times for every environment
-    in a single call. All arrays carry a leading n_envs axis.
-    starts: (n_envs, max_starts, 2), start_counts: (n_envs,)
-    occ: (n_envs, T+1, W, H), dist: (n_envs, W, H) (written in place)
-    visited: (n_envs, W, H, T+1), qx/qy/qt: (n_envs, W*H*(T+1)) scratch
+    Batched time-aware BFS. starts/occ/dist/visited: (n_envs, W, H, T+1).
     """
     n_envs = starts.shape[0]
     for env in range(n_envs):
@@ -370,14 +345,10 @@ def _forecast_kernel(bomb_x, bomb_y, bomb_timer, bomb_counts, blast_tensor,
                      exp_x, exp_y, exp_timer, exp_counts,
                      wall, crate, T, ET, danger_out, occ_out):
     """
-    Batched fused danger-forecast + occupancy-forecast computation.
-    bomb_*: (n_envs, MAX_BOMBS) padded, bomb_counts: (n_envs,)
-    exp_*: (n_envs, MAX_EXPLOSION_CELLS) padded, exp_counts: (n_envs,)
-    wall: (W, H) shared, crate: (n_envs, W, H)
-    danger_out: (n_envs, T, W, H), occ_out: (n_envs, T+1, W, H)
+    Batched forecast of danger and occupied maps. All inputs/outputs are (n_envs, ...) arrays.
     """
     n_envs = bomb_counts.shape[0]
-    W, H = wall.shape
+    width, height = wall.shape
 
     for env in range(n_envs):
         nb = bomb_counts[env]
@@ -394,19 +365,19 @@ def _forecast_kernel(bomb_x, bomb_y, bomb_timer, bomb_counts, blast_tensor,
                 bt = bomb_timer[env, i]
                 if bt <= t < bt + ET:
                     blast = blast_tensor[bomb_x[env, i], bomb_y[env, i]]
-                    for xx in range(W):
-                        for yy in range(H):
+                    for xx in range(width):
+                        for yy in range(height):
                             if blast[xx, yy] > d[xx, yy]:
                                 d[xx, yy] = blast[xx, yy]
 
-            for xx in range(W):
-                for yy in range(H):
+            for xx in range(width):
+                for yy in range(height):
                     if d[xx, yy] > 0.0:
                         remaining_crates[xx, yy] = False
 
             o = occ_out[env, t]
-            for xx in range(W):
-                for yy in range(H):
+            for xx in range(width):
+                for yy in range(height):
                     v = wall[xx, yy] or remaining_crates[xx, yy]
                     o[xx, yy] = v or d[xx, yy] > 0.0
             for i in range(nb):
@@ -414,28 +385,13 @@ def _forecast_kernel(bomb_x, bomb_y, bomb_timer, bomb_counts, blast_tensor,
                     o[bomb_x[env, i], bomb_y[env, i]] = True
 
         of = occ_out[env, T]
-        for xx in range(W):
-            for yy in range(H):
+        for xx in range(width):
+            for yy in range(height):
                 of[xx, yy] = wall[xx, yy] or remaining_crates[xx, yy]
 
 class BombermanGymEnv(gym.Env):
     """
-    Natively batched Bomberman environment: one instance simulates `n_envs`
-    independent games inside a single process.
-
-    API (VecEnv-flavored, NOT plain single-env gymnasium):
-      * reset()            -> (obs, infos); obs arrays have a leading n_envs dim
-      * step(actions)      -> (obs, rewards, terminated, truncated, infos);
-                              actions is an (n_envs,) array of action indices
-      * finished envs are auto-reset; the last observation of the finished
-        episode is stored (un-batched) in infos[i]["terminal_observation"]
-      * single_observation_space / single_action_space describe one game,
-        observation_space / action_space describe the batch.
-
-    All heavy numeric work (forecast, time-aware BFS, distance fields,
-    normalization, centering, features) is executed for all envs at once on
-    one contiguous (n_envs, L, W, H) tensor. Per-env Python logic (opponent
-    callbacks, moves, coins, bombs) runs in a short loop per env.
+    A Gymnasium environment for the Bomberman game, supporting multiple parallel games and various observation layers.
     """
 
     metadata = {"render_modes": ["human"]}
@@ -465,9 +421,6 @@ class BombermanGymEnv(gym.Env):
                 f"supports up to MAX_OPPONENTS={MAX_OPPONENTS}"
             )
 
-        # One handle set per parallel game. Opponent act_fns are shared
-        # callables; each env gets its own handles so that stateful
-        # opponents (events, position, bombs_left) stay per-game.
         self.agents: List[AgentHandle] = [AgentHandle("RLAgent") for _ in range(self.n_envs)]
         self.opponent_handles: List[List[AgentHandle]] = [
             [AgentHandle(f"OpponentAgent{i}") for i in range(MAX_OPPONENTS)]
@@ -481,8 +434,6 @@ class BombermanGymEnv(gym.Env):
             for handle, (setup_fn, _act_fn) in zip(handles, opponents):
                 setup_fn(handle)
 
-        # NOTE API CHANGE: reward functions receive the env index of the game
-        # the reward is being computed for.
         self.reward_fn = reward_fn or self.shaped_reward
 
         self.width, self.height = s.COLS, s.ROWS
@@ -519,12 +470,10 @@ class BombermanGymEnv(gym.Env):
         E = self.n_envs
         W, H = self.width, self.height
 
-        # ---- batched tensors -------------------------------------------------
         self.grid_tensor = np.zeros((E, self.n_observation_layers, W, H), dtype=np.float32)
         self._centered_tensor = np.zeros_like(self.grid_tensor)
         self._features = np.zeros((E, NUM_FEATURES), dtype=np.float32)
 
-        # ---- batched game state ----------------------------------------------
         self.rounds = np.zeros(E, dtype=np.int64)
         self.step_counts = np.zeros(E, dtype=np.int64)
         self.arena = np.zeros((E, W, H), dtype=np.int8)
@@ -546,7 +495,6 @@ class BombermanGymEnv(gym.Env):
         self._initial_coin_count = np.zeros(E, dtype=np.int64)
         self._initial_n_opponents = MAX_OPPONENTS
 
-        # NaN plays the role the old `None` played for the per-env prev values.
         self._prev_coin_dist = np.full(E, np.nan)
         self._prev_crate_dist = np.full(E, np.nan)
         self._prev_bomb_danger = np.zeros(E)
@@ -555,7 +503,6 @@ class BombermanGymEnv(gym.Env):
         self.agent_actions: List[Dict[Any, str]] = [{} for _ in range(E)]
         self._replays: List[Optional[Dict[str, Any]]] = [None] * E
 
-        # ---- scratch buffers, allocated once, shared by all envs -------------
         T_bfs = self._BT + self._ET
         self._ta_bfs_visited = np.zeros((E, W, H, T_bfs + 1), dtype=np.bool_)
         max_nodes_ta = W * H * (T_bfs + 1)
@@ -569,8 +516,6 @@ class BombermanGymEnv(gym.Env):
         self._ms_bfs_qx = np.empty((E, max_nodes_ms), dtype=np.int32)
         self._ms_bfs_qy = np.empty((E, max_nodes_ms), dtype=np.int32)
 
-        # Padded bomb/explosion buffers fed to the forecast kernel. At most one
-        # live bomb per agent, at most one active explosion per bomb.
         self._MAX_BOMBS = 1 + MAX_OPPONENTS
         self._MAX_EXPLOSION_CELLS = self._MAX_BOMBS * (1 + 4 * s.BOMB_POWER)
         self._fc_bomb_x = np.zeros((E, self._MAX_BOMBS), dtype=np.int64)
@@ -582,7 +527,6 @@ class BombermanGymEnv(gym.Env):
         self._fc_exp_timer = np.zeros((E, self._MAX_EXPLOSION_CELLS), dtype=np.int64)
         self._fc_exp_counts = np.zeros(E, dtype=np.int64)
 
-        # ---- spaces -----------------------------------------------------------
         self.single_observation_space = spaces.Dict({
             "grid_tensor": spaces.Box(
                 low=-1.0, high=1.0,
@@ -604,7 +548,6 @@ class BombermanGymEnv(gym.Env):
         self.single_action_space = spaces.Discrete(len(ACTIONS))
         self.action_space = spaces.MultiDiscrete(np.full(E, len(ACTIONS), dtype=np.int64))
 
-        # ---- env-independent precomputation (shared by ALL envs) -------------
         wall_mask = self._build_wall_mask()
         self._wall_layer = np.where(wall_mask == -1, 1.0, 0.0).astype(np.float32)
         self._wall_bool = self._wall_layer.astype(bool)
@@ -617,7 +560,6 @@ class BombermanGymEnv(gym.Env):
             xs_, ys_ = zip(*coords)
             self._blast_tensor[x, y, list(xs_), list(ys_)] = 1.0
 
-    # ------------------------------------------------------------------ helpers
 
     @staticmethod
     def available_layer_groups() -> Dict[str, List[int]]:
@@ -627,7 +569,8 @@ class BombermanGymEnv(gym.Env):
     def feature_names() -> Tuple[str, ...]:
         return FEATURE_NAMES
 
-    def _build_wall_mask(self) -> np.ndarray:
+    @staticmethod
+    def _build_wall_mask() -> np.ndarray:
         WALL = -1
         arena = np.zeros((s.COLS, s.ROWS), dtype=np.int8)
         arena[:1, :] = WALL
@@ -658,8 +601,6 @@ class BombermanGymEnv(gym.Env):
                 break
             coords.append((x, y - i))
         return coords
-
-    # ------------------------------------------------------------ round lifecycle
 
     def _generate_round_layout(self):
         WALL, FREE, CRATE = -1, 0, 1
@@ -766,7 +707,6 @@ class BombermanGymEnv(gym.Env):
             self._prev_bomb_danger[env] = self._bomb_danger_now(env)
             self._prev_trap_dist[env] = self._trapped_opponent_distance_now(env)
 
-    # --------------------------------------------------------- tensor refreshing
 
     def _refresh_dynamic_layers(self):
         gt = self.grid_tensor
@@ -942,7 +882,6 @@ class BombermanGymEnv(gym.Env):
             self._compute_mobility()
         self._compute_distance_fields()
 
-    # ---------------------------------------------------- observation assembly
 
     def _get_centered_tensor(self) -> np.ndarray:
         """Batched centering: (n_envs, L, W, H) with each env centered on its agent."""
@@ -1047,7 +986,7 @@ class BombermanGymEnv(gym.Env):
         f[:, FEATURE_SAFE_DOWN] = _safe_dir(ax, ay + 1)
         f[:, FEATURE_SAFE_LEFT] = _safe_dir(ax - 1, ay)
         f[:, FEATURE_SAFE_WAIT] = _safe_dir(ax, ay)
-        # dropping a bomb is only safe if at least one escape move remains
+
         f[:, FEATURE_SAFE_BOMB] = np.maximum(
             np.maximum(f[:, FEATURE_SAFE_UP], f[:, FEATURE_SAFE_RIGHT]),
             np.maximum(f[:, FEATURE_SAFE_DOWN], f[:, FEATURE_SAFE_LEFT]),
@@ -1064,14 +1003,10 @@ class BombermanGymEnv(gym.Env):
         grid_tensor = self._normalize_observation(self._get_centered_tensor())
         grid_tensor = self._select_output_layers(grid_tensor)
         features = self._compute_global_features()
-        # Copies: internal buffers are reused every step, but callers (e.g.
-        # replay buffers) are allowed to hold on to observations.
         return {
             "grid_tensor": grid_tensor.copy() if self._full_output else grid_tensor,
             "features": features.copy(),
         }
-
-    # ------------------------------------------------------------------- API
 
     def set_opponents(self, opponents):
         if len(opponents) > MAX_OPPONENTS:
@@ -1135,7 +1070,6 @@ class BombermanGymEnv(gym.Env):
             self._finalize_replay_and_save(int(env))
 
         if self.auto_reset and done_idx.size:
-            # stash terminal observations BEFORE the buffers are reused
             for env in done_idx:
                 infos[int(env)]["terminal_observation"] = {
                     "grid_tensor": obs["grid_tensor"][int(env)].copy(),
@@ -1182,8 +1116,6 @@ class BombermanGymEnv(gym.Env):
         self._update_explosions(env)
         self._update_bombs(env)
         self._evaluate_explosions(env)
-
-    # ------------------------------------------------------------------ replay
 
     def _start_replay_recording(self, env: int) -> None:
         if not getattr(self.args, "save_replay", False):
@@ -1243,8 +1175,6 @@ class BombermanGymEnv(gym.Env):
         finally:
             self._replays[env] = None
 
-    # ------------------------------------------------------------- state access
-
     def _build_shared_state(self, env: int) -> Dict[str, Any]:
         field = np.array(self.arena[env])
 
@@ -1289,8 +1219,12 @@ class BombermanGymEnv(gym.Env):
         raise ValueError("handle does not belong to this environment")
 
     def _load_game_state(self, game_state: dict, env: int = 0) -> None:
-        self.rounds[env] = game_state.get("round", self.rounds[env])
-        self.step_counts[env] = game_state.get("step", self.step_counts[env])
+        prev_round = int(self.rounds[env])
+        new_round = int(game_state.get("round", prev_round))
+        new_step = int(game_state.get("step", self.step_counts[env]))
+
+        self.rounds[env] = new_round
+        self.step_counts[env] = new_step
 
         self.arena[env] = np.asarray(game_state["field"], dtype=np.int8)
 
@@ -1336,6 +1270,11 @@ class BombermanGymEnv(gym.Env):
             self.coins_collectable[env, :len(coins)] = True
         self.coins_collectable[env, len(coins):] = False
 
+        is_new_round = (new_round != prev_round) or (new_step <= 1)
+        if is_new_round:
+            self._initial_crate_count[env] = int(np.sum(self.arena[env] == 1))
+            self._initial_coin_count[env] = len(coins)
+
         explosion_map = np.asarray(
             game_state.get("explosion_map", np.zeros((self.width, self.height)))
         )
@@ -1368,8 +1307,6 @@ class BombermanGymEnv(gym.Env):
             "grid_tensor": obs["grid_tensor"][env],
             "features": obs["features"][env],
         }
-
-    # -------------------------------------------------------------- game logic
 
     def _tile_is_free(self, env: int, x, y) -> bool:
         if self.arena[env, x, y] != 0:
@@ -1475,7 +1412,6 @@ class BombermanGymEnv(gym.Env):
                         owner.add_event(e.CRATE_DESTROYED)
                         if self._enable_crate_potential:
                             g[CRATE_POTENTIAL_LAYER] -= self._blast_tensor[:, :, x, y]
-                        # reveal coins that were hidden under this crate
                         for ci in range(self.n_coins[env]):
                             if (not self.coins_collectable[env, ci]
                                     and self.coins_xy[env, ci, 0] == x
@@ -1523,8 +1459,6 @@ class BombermanGymEnv(gym.Env):
                             owner.update_score(kill_reward)
         self.active_agents[env] = [a for a in active if not a.dead]
 
-    # ---------------------------------------------------------------- rewards
-
     def shaped_reward(self, env: int) -> float:
         """RECONSTRUCTED default reward -- port your original body here."""
         agent = self.agents[env]
@@ -1534,7 +1468,7 @@ class BombermanGymEnv(gym.Env):
 
         coin_now = self._coin_distance_now(env)
         prev = self._prev_coin_dist[env]
-        if prev == prev and coin_now is not None:  # prev not NaN
+        if prev == prev and coin_now is not None:
             total += COIN_SHAPING_COEF * (prev - coin_now)
         self._prev_coin_dist[env] = np.nan if coin_now is None else coin_now
 
@@ -1595,34 +1529,26 @@ class BombermanGymEnv(gym.Env):
         W, H = self.width, self.height
         gt = self.grid_tensor
 
-        # Initialize all actions as valid (True)
         masks = np.ones((E, len(ACTIONS)), dtype=np.bool_)
 
         ax = np.fromiter((a.x for a in self.agents), dtype=np.int64, count=E)
         ay = np.fromiter((a.y for a in self.agents), dtype=np.int64, count=E)
 
-        # Helper to check if a direction is blocked by walls/crates/danger
         occ_layer = gt[:, OCCUPIED_MAP_LAYERS[0]] > 0
         dng_layer = gt[:, DANGER_MAP_LAYERS[0]] > 0
 
         def is_blocked(dx, dy):
             tx = np.clip(ax + dx, 0, W - 1)
             ty = np.clip(ay + dy, 0, H - 1)
-            # Out of bounds check
             oob = (ax + dx < 0) | (ax + dx >= W) | (ay + dy < 0) | (ay + dy >= H)
             return oob | occ_layer[np.arange(E), tx, ty] | dng_layer[np.arange(E), tx, ty]
 
-        # Mask movement directions if they lead to walls/crates/explosions
         masks[:, ACTION_INDICES["UP"]] = ~is_blocked(0, -1)
         masks[:, ACTION_INDICES["DOWN"]] = ~is_blocked(0, 1)
         masks[:, ACTION_INDICES["LEFT"]] = ~is_blocked(-1, 0)
         masks[:, ACTION_INDICES["RIGHT"]] = ~is_blocked(1, 0)
 
-        # Mask BOMB if the agent has no bombs left
         bombs_left = np.fromiter((a.bombs_left for a in self.agents), dtype=np.bool_, count=E)
         masks[:, ACTION_INDICES["BOMB"]] = bombs_left
-
-        # WAIT is almost always valid, but you could mask it if standing in immediate danger
-        # For now, we leave WAIT as always valid (True)
 
         return masks

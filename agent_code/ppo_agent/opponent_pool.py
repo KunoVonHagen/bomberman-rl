@@ -5,18 +5,20 @@ import pathlib
 import random
 import tempfile
 from typing import Callable, Dict, List, Optional, Tuple
+from sb3_contrib import MaskablePPO
 
 from .config import EnvConfig, SelfPlayConfig, OpponentArrangement
 from .checkpoint_manager import CheckpointManager
+from agent_code.ppo_agent.gym_environment import BombermanGymEnv, ACTION_INDICES
+from environment import WorldArgs
 
 OpponentPair = Tuple[Callable, Callable]
 
 
 class _CheckpointOpponent:
     """
-    Wraps a saved checkpoint as an opponent for self-play.
-    The model is loaded lazily on first use, and the Gym environment is also created lazily.
-    This allows the opponent to be pickled and sent to subprocesses without loading the model or environment until needed.
+    Wraps a MaskablePPO checkpoint as an opponent for the BombermanGymEnv.
+    Lazily loads the model and environment on first use, and caches them for subsequent calls.
     """
 
     def __init__(self, model_path: str, env_cfg: EnvConfig):
@@ -38,16 +40,12 @@ class _CheckpointOpponent:
 
     def _ensure_ready(self):
         if self._model is None:
-            from sb3_contrib import MaskablePPO
             self._model = MaskablePPO.load(
                 self.model_path,
                 custom_objects={"n_envs": 1, "n_steps": 1},
             )
 
         if self._obs_env is None:
-            from agent_code.my_agent.gym_environment import BombermanGymEnv, ACTION_INDICES
-            from environment import WorldArgs
-
             log_dir = tempfile.mkdtemp(prefix="checkpoint_opponent_")
             world_args = WorldArgs(
                 scenario=self.env_cfg.scenario,
@@ -140,10 +138,10 @@ class OpponentPool:
         return (module.setup, module.act)
 
     def _choose_arrangement(self) -> OpponentArrangement:
-        """Pick one lineup 'shape' for this rollout, weighted by
-        arrangement.weight. This is the main knob for variety: different
-        calls can come back with all-self-play, all-static, or anything in
-        between."""
+        """
+        Randomly choose one of the configured opponent arrangements, weighted by
+        their `weight` attribute. If all weights are <= 0, treat them as equal
+        """
         arrangements = self.cfg.arrangements
         if len(arrangements) == 1:
             return arrangements[0]
@@ -168,17 +166,10 @@ class OpponentPool:
         return random.sample(pool, k=k)
 
     def current_opponents(self) -> List[OpponentPair]:
-        """Returns the list of (setup_fn, act_fn) pairs to pass as
-        `opponents=` into WorldArgs/BombermanGymEnv for the next rollout.
-
-        Each call draws a fresh OpponentArrangement (see config.py) and fills
-        it: some checkpoint-based self-play opponents (if self-play is
-        enabled and the pool has anything in it yet) and the rest static,
-        scripted opponents. Slots requested from self-play that can't be
-        filled (empty pool, or self-play disabled) are transparently
-        backfilled with static opponents so every rollout still gets exactly
-        the number of seats the arrangement calls for -- the environment's
-        player count never changes, only who's sitting where."""
+        """
+        Return a list of (setup, act) callables for the opponents to use in the next match.
+        The list is shuffled if `shuffle_opponent_order` is True.
+        """
         arrangement = self._choose_arrangement()
         total_needed = arrangement.n_static + arrangement.n_self_play
 
@@ -211,7 +202,7 @@ class OpponentPool:
         return opponents
 
     def last_opponent_descriptions(self) -> List[str]:
-        """Plain-string description of the opponents returned by the most
-        recent current_opponents() call — safe to put in JSON metadata,
-        unlike the (setup, act) callables themselves."""
+        """
+        Return a list of human-readable descriptions of the opponents used in the last call to `current_opponents()`.
+        """
         return list(self._last_descriptions)

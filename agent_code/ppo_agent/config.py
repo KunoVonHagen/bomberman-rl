@@ -1,16 +1,3 @@
-"""
-config.py
------------------------------------------------------------------------------
-Central place for ALL training hyperparameters and settings. Everything the
-training script needs to build the model, the environment, and to control
-checkpointing / self-play lives here as a plain dataclass. Edit
-`DEFAULT_CONFIG` at the bottom (or build your own `TrainingConfig`) instead
-of touching train.py.
-
-The whole config is dumped into each run's `run_manifest.json` so a run is
-always self-describing and reproducible.
------------------------------------------------------------------------------
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict, is_dataclass, fields as dataclass_fields
@@ -19,21 +6,9 @@ import json
 
 
 def _coerce_dataclass_list(cls, raw: str) -> list:
-    """Parse a List[<dataclass>] override. Two supported formats:
-
-    1. JSON: '[{"n_static":0,"n_self_play":3,"weight":3.0}, ...]'
-       Flexible, but painful to quote on Windows/PowerShell (which will
-       silently strip the double quotes from a bareword-adjacent quoted
-       substring on a native command line -- ["n_static":0] becomes
-       [n_static:0], which is invalid JSON).
-
-    2. Shorthand: semicolon-separated entries, each a comma-separated list
-       of that dataclass's field values in declaration order (trailing
-       fields with defaults may be omitted). For OpponentArrangement
-       (n_static, n_self_play, weight) that's "n_static,n_self_play[,weight]":
-           "0,3,3;1,2,3;2,1,2;3,0,1"
-       No quote characters needed at all -- safe to wrap in single quotes
-       (or leave bare) in any shell.
+    """
+    Coerce a raw string into a list of dataclass instances of type `cls`.
+    The raw string can be a JSON array of objects, or a semicolon-separated list of comma-separated values corresponding to the dataclass fields.
     """
     trimmed = raw.strip()
     if trimmed.startswith("[") or trimmed.startswith("{"):
@@ -61,15 +36,15 @@ def _coerce_dataclass_list(cls, raw: str) -> list:
 
 
 def _coerce_value(current, raw):
-    """Turn a raw CLI string into the same type as the field it's replacing.
-    Only used by TrainingConfig.apply_overrides -- if `raw` isn't a string
-    (already the right type), it's returned unchanged."""
+    """
+    Coerce a raw string value into the type of `current`. Handles bool, int, float, list, and None.
+    """
     if not isinstance(raw, str):
         return raw
     if isinstance(current, bool):
         return raw.strip().lower() in ("1", "true", "yes", "y", "on")
     if isinstance(current, int) and not isinstance(current, bool):
-        return int(float(raw))  # float() first so "1e6" style works for int fields too
+        return int(float(raw))
     if isinstance(current, float):
         return float(raw)
     if isinstance(current, list):
@@ -77,20 +52,22 @@ def _coerce_value(current, raw):
             return _coerce_dataclass_list(type(current[0]), raw)
         return [x for x in raw.split(",") if x]
     if current is None:
-        # Optional[...] field currently unset (e.g. clip_range_vf). Try float,
-        # allow an explicit "none"/"null" to keep it unset, else pass through as str.
         if raw.strip().lower() in ("none", "null", ""):
             return None
         try:
             return float(raw)
         except ValueError:
             return raw
-    return raw  # str / Literal fields
+    return raw
 
 
 @dataclass
 class PPOConfig:
-    """Passed straight through to sb3_contrib.MaskablePPO."""
+    """
+    Hyperparameters for the PPO algorithm. These are passed directly to the
+    Stable Baselines3 MaskablePPO constructor. See:
+    https://stable-baselines3.readthedocs.io/en/master/modules/ppo.html
+    """
     learning_rate: float = 3e-4
     n_steps: int = 1024
     batch_size: int = 256
@@ -106,7 +83,10 @@ class PPOConfig:
 
 @dataclass
 class EnvConfig:
-    """Everything needed to build a WorldArgs + BombermanGymEnv."""
+    """
+    Configuration for the Bomberman environment.
+    These are passed to the BombermanGymEnv constructor.
+    """
     scenario: str = "classic"
     seed: Optional[int] = None
     silence_errors: bool = True
@@ -137,19 +117,10 @@ class EnvConfig:
 
 @dataclass(frozen=True)
 class OpponentArrangement:
-    """One possible 'shape' of the opponent lineup for a rollout -- e.g.
-    (n_static=1, n_self_play=2) or (n_static=3, n_self_play=0).
-
-    SelfPlayConfig.arrangements holds a menu of these. Every time
-    OpponentPool builds a fresh lineup it draws one arrangement at random
-    (weighted by `weight`), then fills its n_static/n_self_play slots. This
-    is what lets training rotate through genuinely different team
-    compositions -- all self-play, a scripted bot mixed in, an all-static
-    lineup, etc. -- instead of grinding against one fixed mix.
-
-    All arrangements in a given SelfPlayConfig must add up to the same
-    total (n_static + n_self_play): the number of opponent seats is a
-    property of the game/environment, only *who* fills them should vary.
+    """
+    Represents a single opponent lineup configuration for self-play.
+    The agent will face `n_static` static opponents and `n_self_play` self-play opponents in each game.
+    The `weight` determines how often this arrangement is sampled relative to others.
     """
     n_static: int = 1
     n_self_play: int = 2
@@ -158,8 +129,10 @@ class OpponentArrangement:
 
 @dataclass
 class SelfPlayConfig:
-    """Controls whether/how the agent trains against its own past checkpoints,
-    plus how varied the opponent lineups it faces are."""
+    """
+    Configuration for self-play training.
+    This allows the agent to train against a mix of static opponents and its own previous checkpoints.
+    """
     enabled: bool = False
     static_opponents: List[str] = field(default_factory=list)
 
@@ -176,10 +149,6 @@ class SelfPlayConfig:
     latest_bias: float = 0.5
 
     def __post_init__(self):
-        self.arrangements = [
-            a if isinstance(a, OpponentArrangement) else OpponentArrangement(**a)
-            for a in self.arrangements
-        ]
         totals = {a.n_static + a.n_self_play for a in self.arrangements}
         if len(totals) > 1:
             raise ValueError(
@@ -192,7 +161,7 @@ class SelfPlayConfig:
 @dataclass
 class TrainingConfig:
     run_name: Optional[str] = None
-    runs_dir: str = "runs"
+    runs_dir: str = "../ppo_agent/runs"
     n_envs: int = 32
     n_shards: int = 1
     total_timesteps: int = 50_000_000
@@ -241,14 +210,10 @@ class TrainingConfig:
     }
 
     def apply_overrides(self, overrides: dict, *, restrict_to: set | None = None) -> list:
-        """Apply {"dotted.path": raw_value} overrides in place. raw_value may be a
-        CLI string (coerced to match the existing field's type) or an already-typed
-        value. If `restrict_to` is given, any path not in it raises ValueError --
-        pass TrainingConfig.RESUMABLE_FIELDS here when resuming a run so a typo or
-        an over-eager override can't quietly change the model's architecture out
-        from under its own checkpoint.
-
-        Returns a list of (path, old_value, new_value) for logging.
+        """
+        Apply a dictionary of dotted-key overrides to this config object.
+        If `restrict_to` is provided, only keys in that set are allowed to be overridden.
+        Returns a list of (dotted_key, old_value, new_value) for each applied override.
         """
         applied = []
         for dotted_key, raw_value in overrides.items():
@@ -286,10 +251,9 @@ class TrainingConfig:
 
     @staticmethod
     def _migrate_self_play_dict(sp: dict) -> dict:
-        """Old run_manifest.json files (written before `arrangements` existed)
-        store a single scalar `n_static_opponents`/`n_self_play_opponents`
-        pair instead. Translate those into an equivalent one-item
-        `arrangements` list so old runs still resume cleanly."""
+        """
+        Migrate old self_play config dicts that used 'n_static_opponents' and 'n_self_play_opponents' to the new 'arrangements' format.
+        """
         sp = dict(sp)
         n_static = sp.pop("n_static_opponents", None)
         n_self_play = sp.pop("n_self_play_opponents", None)
@@ -313,13 +277,13 @@ class TrainingConfig:
 
 DEFAULT_CONFIG = TrainingConfig(
     run_name=None,
-    n_envs=256,
-    n_shards=32,
+    n_envs=32,
+    n_shards=8,
     total_timesteps=1_000_000_000,
     save_every_timesteps=128 * 1024 * 8,
     ppo=PPOConfig(
         learning_rate=2e-4,
-        n_steps=1024,
+        n_steps=256,
         batch_size=8192,
         n_epochs=7,
         gamma=0.99,
