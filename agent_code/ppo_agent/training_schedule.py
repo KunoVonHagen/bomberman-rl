@@ -18,9 +18,9 @@ DEFAULT_SCHEDULE = [
         "overrides": {
             "self_play.static_opponents": STATIC_OPPONENT_POOL,
             "self_play.arrangements": "0,3,1.0",
-            "ppo.learning_rate": 5e-4,
-            "ppo.n_steps": 8192,
-            "ppo.batch_size": 8192,
+            "ppo.learning_rate": 1e-4,
+            "ppo.n_steps": 2048,
+            "ppo.batch_size": 4096,
             "rewards.coin_collected": 1.0,
             "rewards.killed_opponent": 5.0,
             "rewards.waited": -0.01,
@@ -33,17 +33,17 @@ DEFAULT_SCHEDULE = [
             "rewards.danger_penalty_coef": 0.05,
             "rewards.escape_bonus_coef": 0.05,
             "rewards.trap_shaping_coef": 0.10,
-            "save_every_timesteps": 256 * 8192 * 8,
+            "save_every_timesteps": 256 * 2048 * 4,
         },
     },
     {
         "at": 0.30,
         "overrides": {
             "ppo.learning_rate": 1e-5,
-            "ppo.n_steps": 1024,
+            "ppo.n_steps": 512,
             "ppo.batch_size": 2048,
             "self_play.arrangements": "0,3,3.0;1,2,2.0;2,1,1.0",
-            "save_every_timesteps": 256 * 1024 * 8,
+            "save_every_timesteps": 256 * 512 * 8,
         },
     },
     {
