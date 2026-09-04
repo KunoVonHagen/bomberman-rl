@@ -3,7 +3,7 @@
 #SBATCH --partition=gpu_h100
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-gpu=32
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -16,4 +16,4 @@ source ~/envs/bomberman/bin/activate
 
 cd $HOME/bomberman-rl
 
-srun python -m agent_code.my_agent.train "$@"
+srun python -m agent_code.my_agent.train

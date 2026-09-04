@@ -6,6 +6,7 @@ import multiprocessing as mp
 import pathlib
 from datetime import datetime
 from multiprocessing import freeze_support
+from typing import Optional
 
 import numpy as np
 import torch
@@ -19,7 +20,13 @@ from environment import WorldArgs
 
 from agent_code.ppo_agent.gym_environment import BombermanGymEnv
 from agent_code.ppo_agent.model import BombermanFeatureExtractor
-from agent_code.ppo_agent.config import DEFAULT_CONFIG, TrainingConfig, PPOConfig
+from agent_code.ppo_agent.config import (
+    DEFAULT_CONFIG,
+    TrainingConfig,
+    PPOConfig,
+    RewardConfig,
+    load_overrides_file,
+)
 from agent_code.ppo_agent.checkpoint_manager import CheckpointManager
 from agent_code.ppo_agent.opponent_pool import OpponentPool
 
@@ -178,7 +185,8 @@ class NativeBatchedVecEnv(VecEnv):
         return [None] * self.num_envs
 
 
-def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, layer_config, shard_n_envs: int):
+def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, layer_config,
+                   shard_n_envs: int, reward_config: Optional[RewardConfig] = None):
     """
     Worker function for a single shard process.
     It creates a BombermanGymEnv with the given world_args and handles commands from the parent process via the remote pipe.
@@ -186,7 +194,10 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
     parent_remote.close()
 
     world_args = WorldArgs(**world_args_kwargs)
-    env = BombermanGymEnv(world_args, opponents=opponents, layer_config=layer_config, n_envs=shard_n_envs)
+    env = BombermanGymEnv(
+        world_args, opponents=opponents, layer_config=layer_config,
+        n_envs=shard_n_envs, reward_config=reward_config,
+    )
 
     while True:
         try:
@@ -264,7 +275,8 @@ class ShardedNativeBatchedVecEnv(VecEnv):
             )
             p = ctx.Process(
                 target=_shard_worker,
-                args=(work_remote, remote, world_args_kwargs, opponents, e.layer_config, self.shard_size),
+                args=(work_remote, remote, world_args_kwargs, opponents, e.layer_config,
+                      self.shard_size, cfg.rewards),
                 daemon=True,
             )
             p.start()
@@ -382,7 +394,8 @@ def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
             world_args,
             opponents=opponents,
             layer_config=cfg.env.layer_config,
-            n_envs=cfg.n_envs
+            n_envs=cfg.n_envs,
+            reward_config=cfg.rewards,
         )
         vec_env = NativeBatchedVecEnv(env)
 
@@ -396,7 +409,8 @@ def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str
         world_args,
         opponents=opponents,
         layer_config=cfg.env.layer_config,
-        n_envs=1
+        n_envs=1,
+        reward_config=cfg.rewards,
     )
 
     return NativeBatchedVecEnv(env)
@@ -492,6 +506,55 @@ class OpponentResampleCallback(BaseCallback):
         self.training_env.env_method("set_opponents", opponents)
         if self.verbose:
             print(f"[opponents] rollout {self._rollout_count}: {self.pool.last_opponent_descriptions()}")
+
+
+class LiveOverridesCallback(BaseCallback):
+    """
+    A callback that checks for live overrides to the training configuration and applies them.
+    """
+
+    def __init__(self, cfg: TrainingConfig, ckman: CheckpointManager, model, pool: OpponentPool, verbose: int = 1):
+        super().__init__(verbose)
+        self.cfg = cfg
+        self.ckman = ckman
+        self.model = model
+        self.pool = pool
+        self.path = ckman.run_dir / "live_overrides.json"
+        self._last_mtime: float | None = None
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_start(self) -> None:
+        if not self.path.exists():
+            return
+        mtime = self.path.stat().st_mtime
+        if mtime == self._last_mtime:
+            return
+        self._last_mtime = mtime
+
+        try:
+            overrides = load_overrides_file(self.path)
+        except (ValueError, OSError) as exc:
+            print(f"[live-overrides] failed to read {self.path}: {exc}")
+            return
+
+        try:
+            applied = self.cfg.apply_overrides(overrides, restrict_to=TrainingConfig.RESUMABLE_FIELDS)
+        except ValueError as exc:
+            print(f"[live-overrides] rejected {self.path}: {exc}")
+            return
+
+        if not applied:
+            return
+
+        print(f"[live-overrides] applying {len(applied)} change(s) from {self.path}:")
+        for dotted_key, old, new in applied:
+            print(f"    {dotted_key}: {old!r} -> {new!r}")
+
+        apply_ppo_hyperparams(self.model, self.cfg.ppo)
+        self.training_env.env_method("set_reward_config", self.cfg.rewards)
+        self.ckman.update_manifest_config()
 
 
 class MaxRolloutsCallback(BaseCallback):
@@ -597,6 +660,7 @@ def run(
     resume_from: str | None = None,
     resume_checkpoint: str | None = None,
     overrides: dict | None = None,
+    overrides_file: str | None = None,
     max_rollouts: int | None = None,
 ) -> None:
     freeze_support()
@@ -604,19 +668,40 @@ def run(
     if resume_from:
         ckman = CheckpointManager.resume(resume_from, runs_dir=cfg.runs_dir)
         cfg = ckman.config
+
+        merged: dict = {}
+        auto_path = ckman.run_dir / "config_overrides.json"
+        if auto_path.exists():
+            merged.update(load_overrides_file(auto_path))
+            print(f"Found {auto_path}, applying its overrides")
+        if overrides_file:
+            merged.update(load_overrides_file(overrides_file))
         if overrides:
-            applied = cfg.apply_overrides(overrides, restrict_to=TrainingConfig.RESUMABLE_FIELDS)
+            merged.update(overrides)
+
+        if merged:
+            applied = cfg.apply_overrides(merged, restrict_to=TrainingConfig.RESUMABLE_FIELDS)
             ckman.update_manifest_config()
             print("Applied overrides on resume:")
             for path, old, new in applied:
                 print(f"  {path}: {old!r} -> {new!r}")
         print(f"Resuming run '{cfg.run_name}' from {ckman.run_dir}")
     else:
+        merged = {}
+        if overrides_file:
+            merged.update(load_overrides_file(overrides_file))
         if overrides:
+            merged.update(overrides)
+        if merged:
             cfg = copy.deepcopy(cfg)
-            cfg.apply_overrides(overrides)
+            cfg.apply_overrides(merged)
         ckman = CheckpointManager.new(cfg, architecture_info(cfg))
         print(f"Starting new run '{cfg.run_name}' in {ckman.run_dir}")
+        print(
+            f"Tip: drop a 'config_overrides.json' into {ckman.run_dir} and it will be "
+            f"applied automatically next time you --resume this run, and a "
+            f"'live_overrides.json' there will be hot-applied while this process is running."
+        )
 
     device = resolve_device(cfg.device)
 
@@ -630,7 +715,6 @@ def run(
         pool, every_n_rollouts=cfg.self_play.resample_every_n_rollouts, verbose=1,
     )
     max_rollouts_callback = MaxRolloutsCallback(max_rollouts, verbose=1)
-    learn_callback = CallbackList([opponent_callback, max_rollouts_callback])
 
     if max_rollouts is not None:
         print(f"[max-rollouts] capping this process to {max_rollouts} rollout(s), "
@@ -650,6 +734,9 @@ def run(
             print(f"Loaded checkpoint {checkpoint_dir.name} ({timesteps_done} timesteps)")
         else:
             print("No checkpoint found in this run yet — starting from scratch.")
+
+    live_overrides_callback = LiveOverridesCallback(cfg, ckman, model, pool, verbose=1)
+    learn_callback = CallbackList([opponent_callback, max_rollouts_callback, live_overrides_callback])
 
     while timesteps_done < cfg.total_timesteps:
         chunk = min(cfg.save_every_timesteps, cfg.total_timesteps - timesteps_done)
@@ -705,6 +792,14 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--resume", type=str, default=None, help="Run name or path to resume from")
     p.add_argument("--checkpoint", type=str, default=None, help="Specific checkpoint name to resume from (default: latest)")
+    p.add_argument("--overrides-file", type=str, default=None,
+                   help="Path to a JSON file of {'dotted.key': value} overrides -- the file-based "
+                        "counterpart to --set, for when you don't want a long CLI command. On "
+                        "--resume, a 'config_overrides.json' sitting in the run's own directory is "
+                        "also applied automatically (no flag needed); this flag layers on top of "
+                        "that, and --set layers on top of both. Also see 'live_overrides.json' in "
+                        "the run directory, which is hot-applied mid-run without restarting "
+                        "(e.g. to anneal reward-shaping coefficients over the course of training).")
     p.add_argument("--device", type=str, default=None, choices=["auto", "cuda", "cpu"],
                    help="Override cfg.device. Use 'cuda' to force GPU and hard-fail if unavailable.")
     p.add_argument("--n-envs", type=int, default=None, help="Override cfg.n_envs for this run.")
@@ -788,5 +883,6 @@ if __name__ == "__main__":
         resume_from=args.resume,
         resume_checkpoint=args.checkpoint,
         overrides=overrides or None,
+        overrides_file=args.overrides_file,
         max_rollouts=args.max_rollouts,
     )

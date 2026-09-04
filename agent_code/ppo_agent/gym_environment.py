@@ -16,8 +16,10 @@ from agent_code.ppo_agent.rewards import (
     COIN_SHAPING_COEF,
     ESCAPE_BONUS_COEF,
     DANGER_PENALTY_COEF,
-    TRAP_SHAPING_COEF
+    TRAP_SHAPING_COEF,
+    build_event_rewards,
 )
+from agent_code.ppo_agent.config import RewardConfig
 
 WorldArgs = namedtuple(
     "WorldArgs",
@@ -401,6 +403,7 @@ class BombermanGymEnv(gym.Env):
         args,
         opponents: List[Tuple[Callable[["AgentHandle"], None], Callable[["AgentHandle", dict], "Optional[str]"]]],
         reward_fn=None,
+        reward_config: Optional[RewardConfig] = None,
         render_mode=None,
         layer_config: Optional[Iterable[str]] = None,
         n_envs: int = 1,
@@ -408,6 +411,7 @@ class BombermanGymEnv(gym.Env):
     ):
         super().__init__()
         self.args = args
+        self.set_reward_config(reward_config)
         self.n_envs = int(n_envs)
         if self.n_envs < 1:
             raise ValueError("n_envs must be >= 1")
@@ -1008,6 +1012,30 @@ class BombermanGymEnv(gym.Env):
             "features": features.copy(),
         }
 
+    def set_reward_config(self, reward_config: Optional[RewardConfig]) -> None:
+        """
+        (Re)build the event-reward table and shaping coefficients this env's
+        shaped_reward() uses. Safe to call at any time, including mid-run
+        via VecEnv.env_method("set_reward_config", cfg.rewards) -- e.g. to
+        anneal shaping coefficients towards zero later in training without
+        restarting the process. Passing None resets to the static defaults
+        in rewards.py.
+        """
+        if reward_config is None:
+            self._event_rewards = EVENT_REWARDS
+            self._coin_shaping_coef = COIN_SHAPING_COEF
+            self._crate_shaping_coef = CRATE_SHAPING_COEF
+            self._danger_penalty_coef = DANGER_PENALTY_COEF
+            self._escape_bonus_coef = ESCAPE_BONUS_COEF
+            self._trap_shaping_coef = TRAP_SHAPING_COEF
+        else:
+            self._event_rewards = build_event_rewards(reward_config)
+            self._coin_shaping_coef = reward_config.coin_shaping_coef
+            self._crate_shaping_coef = reward_config.crate_shaping_coef
+            self._danger_penalty_coef = reward_config.danger_penalty_coef
+            self._escape_bonus_coef = reward_config.escape_bonus_coef
+            self._trap_shaping_coef = reward_config.trap_shaping_coef
+
     def set_opponents(self, opponents):
         if len(opponents) > MAX_OPPONENTS:
             raise ValueError(
@@ -1460,31 +1488,35 @@ class BombermanGymEnv(gym.Env):
         self.active_agents[env] = [a for a in active if not a.dead]
 
     def shaped_reward(self, env: int) -> float:
-        """RECONSTRUCTED default reward -- port your original body here."""
+        """
+        Default reward. Event rewards and shaping coefficients come from
+        self._event_rewards / self._*_coef (see set_reward_config), not
+        module constants, so they can be changed live mid-run.
+        """
         agent = self.agents[env]
         total = 0.0
         for ev in agent.events:
-            total += EVENT_REWARDS.get(ev, 0.0)
+            total += self._event_rewards.get(ev, 0.0)
 
         coin_now = self._coin_distance_now(env)
         prev = self._prev_coin_dist[env]
         if prev == prev and coin_now is not None:
-            total += COIN_SHAPING_COEF * (prev - coin_now)
+            total += self._coin_shaping_coef * (prev - coin_now)
         self._prev_coin_dist[env] = np.nan if coin_now is None else coin_now
 
         crate_now = self._crate_distance_now(env) if agent.bombs_left else None
         prev = self._prev_crate_dist[env]
         if prev == prev and crate_now is not None:
-            total += CRATE_SHAPING_COEF * (prev - crate_now)
+            total += self._crate_shaping_coef * (prev - crate_now)
         self._prev_crate_dist[env] = np.nan if crate_now is None else crate_now
 
         danger_now = self._bomb_danger_now(env)
-        total += ESCAPE_BONUS_COEF * (self._prev_bomb_danger[env] - danger_now)
-        total -= DANGER_PENALTY_COEF * danger_now
+        total += self._escape_bonus_coef * (self._prev_bomb_danger[env] - danger_now)
+        total -= self._danger_penalty_coef * danger_now
         self._prev_bomb_danger[env] = danger_now
 
         trap_now = self._trapped_opponent_distance_now(env)
-        total += TRAP_SHAPING_COEF * (self._prev_trap_dist[env] - trap_now)
+        total += self._trap_shaping_coef * (self._prev_trap_dist[env] - trap_now)
         self._prev_trap_dist[env] = trap_now
         return total
 

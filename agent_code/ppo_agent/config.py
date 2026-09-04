@@ -61,6 +61,40 @@ def _coerce_value(current, raw):
     return raw
 
 
+def load_overrides_file(path) -> dict:
+    """
+    Load a dict of dotted-key overrides from a JSON file, e.g.:
+
+        {
+            "rewards.coin_shaping_coef": 0.0,
+            "rewards.crate_shaping_coef": 0.0,
+            "ppo.ent_coef": 0.005
+        }
+
+    Values may be given as their native JSON type (numbers, bools, strings)
+    -- they pass straight through TrainingConfig.apply_overrides()'s
+    coercion unchanged when they're already the right type, so quoting
+    numbers as strings (e.g. "0.01") also works fine if that's more
+    convenient to hand-edit.
+
+    This is the file-based counterpart to `--set path.to.field=value` on
+    the CLI: point --overrides-file at one of these, or drop a file named
+    'config_overrides.json' in a run's directory and it's picked up
+    automatically on --resume (see train.py:run()).
+    """
+    import pathlib as _pathlib
+    path = _pathlib.Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"overrides file not found: {path}")
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"overrides file {path} must contain a JSON object of "
+            f"'dotted.key': value pairs, got {type(data).__name__}"
+        )
+    return data
+
+
 @dataclass
 class PPOConfig:
     """
@@ -113,6 +147,32 @@ class EnvConfig:
         "crate_distance",
         "coin_distance",
     ])
+
+
+@dataclass
+class RewardConfig:
+    """
+    Configuration for the reward shaping in the Bomberman environment.
+    These are passed to the BombermanGymEnv constructor.
+    """
+    waited: float = -0.01
+    invalid_action: float = -0.2
+    bomb_dropped: float = 0.0
+    bomb_exploded: float = 0.0
+    crate_destroyed: float = 0.3
+    coin_found: float = 0.0
+    coin_collected: float = 1.0
+    killed_opponent: float = 5.0
+    killed_self: float = -1.0
+    got_killed: float = -5.0
+    opponent_eliminated: float = 0.0
+    survived_round: float = 0.0
+
+    coin_shaping_coef: float = 0.05
+    crate_shaping_coef: float = 0.02
+    danger_penalty_coef: float = 0.05
+    escape_bonus_coef: float = 0.05
+    trap_shaping_coef: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -177,6 +237,7 @@ class TrainingConfig:
     ppo: PPOConfig = field(default_factory=PPOConfig)
     env: EnvConfig = field(default_factory=EnvConfig)
     self_play: SelfPlayConfig = field(default_factory=SelfPlayConfig)
+    rewards: RewardConfig = field(default_factory=RewardConfig)
 
     RESUMABLE_FIELDS: ClassVar[set] = {
         "total_timesteps",
@@ -207,6 +268,23 @@ class TrainingConfig:
         "self_play.add_checkpoint_every_epochs",
         "self_play.sample_strategy",
         "self_play.latest_bias",
+        "rewards.waited",
+        "rewards.invalid_action",
+        "rewards.bomb_dropped",
+        "rewards.bomb_exploded",
+        "rewards.crate_destroyed",
+        "rewards.coin_found",
+        "rewards.coin_collected",
+        "rewards.killed_opponent",
+        "rewards.killed_self",
+        "rewards.got_killed",
+        "rewards.opponent_eliminated",
+        "rewards.survived_round",
+        "rewards.coin_shaping_coef",
+        "rewards.crate_shaping_coef",
+        "rewards.danger_penalty_coef",
+        "rewards.escape_bonus_coef",
+        "rewards.trap_shaping_coef",
     }
 
     def apply_overrides(self, overrides: dict, *, restrict_to: set | None = None) -> list:
@@ -247,6 +325,7 @@ class TrainingConfig:
         d["ppo"] = PPOConfig(**d.get("ppo", {}))
         d["env"] = EnvConfig(**d.get("env", {}))
         d["self_play"] = SelfPlayConfig(**cls._migrate_self_play_dict(d.get("self_play", {})))
+        d["rewards"] = RewardConfig(**d.get("rewards", {}))
         return cls(**d)
 
     @staticmethod
@@ -263,6 +342,11 @@ class TrainingConfig:
                 "n_self_play": n_self_play if n_self_play is not None else 2,
                 "weight": 1.0,
             }]
+        if "arrangements" in sp:
+            sp["arrangements"] = [
+                a if isinstance(a, OpponentArrangement) else OpponentArrangement(**a)
+                for a in sp["arrangements"]
+            ]
         return sp
 
     def save(self, path: str) -> None:
