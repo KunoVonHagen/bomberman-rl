@@ -799,7 +799,8 @@ def parse_args() -> argparse.Namespace:
                         "also applied automatically (no flag needed); this flag layers on top of "
                         "that, and --set layers on top of both. Also see 'live_overrides.json' in "
                         "the run directory, which is hot-applied mid-run without restarting "
-                        "(e.g. to anneal reward-shaping coefficients over the course of training).")
+                        "(e.g. to anneal reward shaping, PPO hyperparameters, or the self-play "
+                        "opponent mix over the course of training -- see training_schedule.py).")
     p.add_argument("--device", type=str, default=None, choices=["auto", "cuda", "cpu"],
                    help="Override cfg.device. Use 'cuda' to force GPU and hard-fail if unavailable.")
     p.add_argument("--n-envs", type=int, default=None, help="Override cfg.n_envs for this run.")

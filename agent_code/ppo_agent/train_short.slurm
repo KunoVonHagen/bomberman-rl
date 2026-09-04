@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=bomberman-ppo
-#SBATCH --partition=gpu_h100
+#SBATCH --job-name=bomberman-ppo-short
+#SBATCH --partition=gpu_h100_short
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-gpu=16
-#SBATCH --time=72:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL

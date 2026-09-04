@@ -361,15 +361,15 @@ class TrainingConfig:
 
 DEFAULT_CONFIG = TrainingConfig(
     run_name=None,
-    n_envs=32,
-    n_shards=8,
-    total_timesteps=1_000_000_000,
-    save_every_timesteps=128 * 1024 * 8,
+    n_envs=256,
+    n_shards=32,
+    total_timesteps=1_000_000_000_000,
+    save_every_timesteps=256 * 8192 * 8,
     ppo=PPOConfig(
         learning_rate=2e-4,
-        n_steps=256,
+        n_steps=8192,
         batch_size=8192,
-        n_epochs=7,
+        n_epochs=8,
         gamma=0.99,
         gae_lambda=0.97,
         clip_range=0.2,
@@ -386,6 +386,7 @@ DEFAULT_CONFIG = TrainingConfig(
             "agent_code.coin_collector_agent.callbacks",
             "agent_code.simple_agent.callbacks",
             "agent_code.peaceful_agent.callbacks",
+            "agent_code.my_agent.callbacks",
         ],
         arrangements=[
             OpponentArrangement(n_static=0, n_self_play=3, weight=3.0),
