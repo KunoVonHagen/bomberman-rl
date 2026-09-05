@@ -508,19 +508,45 @@ class OpponentResampleCallback(BaseCallback):
             print(f"[opponents] rollout {self._rollout_count}: {self.pool.last_opponent_descriptions()}")
 
 
+def _read_and_apply_live_overrides(path: pathlib.Path, cfg: TrainingConfig) -> list:
+    """
+    Read a live overrides file and apply any changes to the given TrainingConfig.
+    """
+    if not path.exists():
+        return []
+    try:
+        overrides = load_overrides_file(path)
+    except (ValueError, OSError) as exc:
+        print(f"[live-overrides] failed to read {path}: {exc}")
+        return []
+    try:
+        return cfg.apply_overrides(overrides, restrict_to=TrainingConfig.RESUMABLE_FIELDS)
+    except ValueError as exc:
+        print(f"[live-overrides] rejected {path}: {exc}")
+        return []
+
+
 class LiveOverridesCallback(BaseCallback):
     """
     A callback that checks for live overrides to the training configuration and applies them.
     """
 
-    def __init__(self, cfg: TrainingConfig, ckman: CheckpointManager, model, pool: OpponentPool, verbose: int = 1):
+    def __init__(
+        self,
+        cfg: TrainingConfig,
+        ckman: CheckpointManager,
+        model,
+        pool: OpponentPool,
+        verbose: int = 1,
+        initial_mtime: float | None = None,
+    ):
         super().__init__(verbose)
         self.cfg = cfg
         self.ckman = ckman
         self.model = model
         self.pool = pool
         self.path = ckman.run_dir / "live_overrides.json"
-        self._last_mtime: float | None = None
+        self._last_mtime: float | None = initial_mtime
 
     def _on_step(self) -> bool:
         return True
@@ -533,18 +559,7 @@ class LiveOverridesCallback(BaseCallback):
             return
         self._last_mtime = mtime
 
-        try:
-            overrides = load_overrides_file(self.path)
-        except (ValueError, OSError) as exc:
-            print(f"[live-overrides] failed to read {self.path}: {exc}")
-            return
-
-        try:
-            applied = self.cfg.apply_overrides(overrides, restrict_to=TrainingConfig.RESUMABLE_FIELDS)
-        except ValueError as exc:
-            print(f"[live-overrides] rejected {self.path}: {exc}")
-            return
-
+        applied = _read_and_apply_live_overrides(self.path, self.cfg)
         if not applied:
             return
 
@@ -705,6 +720,16 @@ def run(
 
     device = resolve_device(cfg.device)
 
+    live_overrides_path = ckman.run_dir / "live_overrides.json"
+    initial_applied = _read_and_apply_live_overrides(live_overrides_path, cfg)
+    initial_mtime = live_overrides_path.stat().st_mtime if live_overrides_path.exists() else None
+    if initial_applied:
+        print(f"[live-overrides] found {live_overrides_path} before the first rollout -- "
+              f"applying {len(initial_applied)} change(s) now so training starts with them:")
+        for dotted_key, old, new in initial_applied:
+            print(f"    {dotted_key}: {old!r} -> {new!r}")
+        ckman.update_manifest_config()
+
     pool = OpponentPool(ckman, cfg.self_play)
     opponents = pool.current_opponents()
 
@@ -735,7 +760,9 @@ def run(
         else:
             print("No checkpoint found in this run yet — starting from scratch.")
 
-    live_overrides_callback = LiveOverridesCallback(cfg, ckman, model, pool, verbose=1)
+    live_overrides_callback = LiveOverridesCallback(
+        cfg, ckman, model, pool, verbose=1, initial_mtime=initial_mtime,
+    )
     learn_callback = CallbackList([opponent_callback, max_rollouts_callback, live_overrides_callback])
 
     while timesteps_done < cfg.total_timesteps:
