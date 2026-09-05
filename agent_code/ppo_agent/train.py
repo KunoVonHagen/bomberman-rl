@@ -450,7 +450,25 @@ def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str, device: 
     )
 
 
-def apply_ppo_hyperparams(model: MaskablePPO, ppo_cfg: PPOConfig) -> None:
+def _resize_rollout_buffer(model: MaskablePPO, new_n_steps: int) -> None:
+    old_n_steps = model.n_steps
+    buffer_cls = type(model.rollout_buffer)
+    model.n_steps = new_n_steps
+    model.rollout_buffer = buffer_cls(
+        new_n_steps,
+        model.observation_space,
+        model.action_space,
+        device=model.device,
+        gamma=model.gamma,
+        gae_lambda=model.gae_lambda,
+        n_envs=model.n_envs,
+    )
+    print(f"  ppo.n_steps changed ({old_n_steps} -> {new_n_steps}): rebuilt rollout buffer")
+
+
+def apply_ppo_hyperparams(
+    model: MaskablePPO, ppo_cfg: PPOConfig, *, defer_n_steps_resize: bool = False,
+) -> None:
     """
     Update an existing MaskablePPO model's hyperparameters to match a new PPOConfig.
     """
@@ -468,20 +486,28 @@ def apply_ppo_hyperparams(model: MaskablePPO, ppo_cfg: PPOConfig) -> None:
     model.target_kl = ppo_cfg.target_kl
     model.batch_size = ppo_cfg.batch_size
 
-    if model.n_steps != ppo_cfg.n_steps:
-        old_n_steps = model.n_steps
-        buffer_cls = type(model.rollout_buffer)
-        model.n_steps = ppo_cfg.n_steps
-        model.rollout_buffer = buffer_cls(
-            ppo_cfg.n_steps,
-            model.observation_space,
-            model.action_space,
-            device=model.device,
-            gamma=model.gamma,
-            gae_lambda=model.gae_lambda,
-            n_envs=model.n_envs,
-        )
-        print(f"  ppo.n_steps changed ({old_n_steps} -> {ppo_cfg.n_steps}): rebuilt rollout buffer")
+    if model.n_steps == ppo_cfg.n_steps:
+        return
+
+    if not defer_n_steps_resize:
+        _resize_rollout_buffer(model, ppo_cfg.n_steps)
+        return
+
+    model._pending_n_steps = ppo_cfg.n_steps
+    if getattr(model, "_train_wrapped_for_pending_resize", False):
+        return
+
+    model._train_wrapped_for_pending_resize = True
+    original_train = model.train
+
+    def _train_then_resize(*args, **kwargs):
+        result = original_train(*args, **kwargs)
+        model.train = original_train
+        model._train_wrapped_for_pending_resize = False
+        _resize_rollout_buffer(model, model._pending_n_steps)
+        return result
+
+    model.train = _train_then_resize
 
 
 class OpponentResampleCallback(BaseCallback):
@@ -510,7 +536,8 @@ class OpponentResampleCallback(BaseCallback):
 
 def _read_and_apply_live_overrides(path: pathlib.Path, cfg: TrainingConfig) -> list:
     """
-    Read a live overrides file and apply any changes to the given TrainingConfig.
+    Read a live-overrides JSON file (if present) and apply it to `cfg`, restricted
+    to TrainingConfig.RESUMABLE_FIELDS.
     """
     if not path.exists():
         return []
@@ -567,7 +594,7 @@ class LiveOverridesCallback(BaseCallback):
         for dotted_key, old, new in applied:
             print(f"    {dotted_key}: {old!r} -> {new!r}")
 
-        apply_ppo_hyperparams(self.model, self.cfg.ppo)
+        apply_ppo_hyperparams(self.model, self.cfg.ppo, defer_n_steps_resize=True)
         self.training_env.env_method("set_reward_config", self.cfg.rewards)
         self.ckman.update_manifest_config()
 
@@ -720,16 +747,6 @@ def run(
 
     device = resolve_device(cfg.device)
 
-    live_overrides_path = ckman.run_dir / "live_overrides.json"
-    initial_applied = _read_and_apply_live_overrides(live_overrides_path, cfg)
-    initial_mtime = live_overrides_path.stat().st_mtime if live_overrides_path.exists() else None
-    if initial_applied:
-        print(f"[live-overrides] found {live_overrides_path} before the first rollout -- "
-              f"applying {len(initial_applied)} change(s) now so training starts with them:")
-        for dotted_key, old, new in initial_applied:
-            print(f"    {dotted_key}: {old!r} -> {new!r}")
-        ckman.update_manifest_config()
-
     pool = OpponentPool(ckman, cfg.self_play)
     opponents = pool.current_opponents()
 
@@ -759,6 +776,18 @@ def run(
             print(f"Loaded checkpoint {checkpoint_dir.name} ({timesteps_done} timesteps)")
         else:
             print("No checkpoint found in this run yet — starting from scratch.")
+
+    live_overrides_path = ckman.run_dir / "live_overrides.json"
+    initial_applied = _read_and_apply_live_overrides(live_overrides_path, cfg)
+    initial_mtime = live_overrides_path.stat().st_mtime if live_overrides_path.exists() else None
+    if initial_applied:
+        print(f"[live-overrides] found {live_overrides_path} before the first rollout -- "
+              f"applying {len(initial_applied)} change(s) now so training starts with them:")
+        for dotted_key, old, new in initial_applied:
+            print(f"    {dotted_key}: {old!r} -> {new!r}")
+        apply_ppo_hyperparams(model, cfg.ppo)
+        env.env_method("set_reward_config", cfg.rewards)
+        ckman.update_manifest_config()
 
     live_overrides_callback = LiveOverridesCallback(
         cfg, ckman, model, pool, verbose=1, initial_mtime=initial_mtime,
