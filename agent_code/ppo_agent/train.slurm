@@ -18,9 +18,6 @@ cd $HOME/bomberman-rl
 
 RUN_NAME="${RUN_NAME:-bomberman_ppo_$(date +%Y%m%d_%H%M%S)}"
 
-TOTAL_SECONDS=$((72 * 3600))
-LIVE_CHECK_INTERVAL=300
-
 RUN_ROOT=$(python -c "from agent_code.ppo_agent.config import DEFAULT_CONFIG; print(DEFAULT_CONFIG.runs_dir)")
 RUN_DIR="$RUN_ROOT/$RUN_NAME"
 
@@ -35,17 +32,4 @@ else
     TRAIN_ARGS=(--set "run_name=$RUN_NAME")
 fi
 
-python -m agent_code.ppo_agent.training_schedule \
-    --run-dir "$RUN_DIR" \
-    --total-seconds "$TOTAL_SECONDS" \
-    --check-interval "$LIVE_CHECK_INTERVAL" &
-SCHEDULER_PID=$!
-
-cleanup() {
-    kill "$SCHEDULER_PID" 2>/dev/null
-}
-trap cleanup EXIT
-
 srun python -m agent_code.ppo_agent.train "${TRAIN_ARGS[@]}" --device cuda
-
-cleanup
