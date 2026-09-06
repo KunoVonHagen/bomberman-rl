@@ -364,10 +364,10 @@ DEFAULT_CONFIG = TrainingConfig(
     n_envs=256,
     n_shards=32,
     total_timesteps=1_000_000_000_000,
-    save_every_timesteps=256 * 8192 * 8,
+    save_every_timesteps=256 * 1024 * 4,
     ppo=PPOConfig(
         learning_rate=1e-4,
-        n_steps=4096,
+        n_steps=1024,
         batch_size=4096,
         n_epochs=8,
         gamma=0.99,
@@ -382,17 +382,13 @@ DEFAULT_CONFIG = TrainingConfig(
     self_play=SelfPlayConfig(
         enabled=True,
         static_opponents=[
+            "agent_code.my_agent.callbacks",
+            "agent_code.simple_agent.callbacks",
             "agent_code.rule_based_agent.callbacks",
             "agent_code.coin_collector_agent.callbacks",
-            "agent_code.simple_agent.callbacks",
-            "agent_code.peaceful_agent.callbacks",
-            "agent_code.my_agent.callbacks",
         ],
         arrangements=[
             OpponentArrangement(n_static=0, n_self_play=3, weight=1.0),
-            OpponentArrangement(n_static=1, n_self_play=2, weight=2.0),
-            OpponentArrangement(n_static=2, n_self_play=1, weight=2.0),
-            OpponentArrangement(n_static=3, n_self_play=0, weight=1.0),
         ],
         allow_repeat_static_opponents=True,
         shuffle_opponent_order=True,

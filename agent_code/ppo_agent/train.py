@@ -29,6 +29,7 @@ from agent_code.ppo_agent.config import (
 )
 from agent_code.ppo_agent.checkpoint_manager import CheckpointManager
 from agent_code.ppo_agent.opponent_pool import OpponentPool
+from agent_code.ppo_agent.training_schedule import DEFAULT_SCHEDULE, load_schedule
 
 
 def mask_fn(env):
@@ -534,69 +535,86 @@ class OpponentResampleCallback(BaseCallback):
             print(f"[opponents] rollout {self._rollout_count}: {self.pool.last_opponent_descriptions()}")
 
 
-def _read_and_apply_live_overrides(path: pathlib.Path, cfg: TrainingConfig) -> list:
+def apply_schedule_up_to(
+    cfg: TrainingConfig,
+    schedule: list[dict],
+    timesteps_done: int,
+    applied_idx: int,
+    *,
+    model=None,
+    env=None,
+    ckman: Optional[CheckpointManager] = None,
+    verbose: bool = True,
+) -> int:
     """
-    Read a live-overrides JSON file (if present) and apply it to `cfg`, restricted
-    to TrainingConfig.RESUMABLE_FIELDS.
+    Apply all stages in the training schedule up to the current count of timesteps done.
+    Returns the index of the last stage that was applied.
     """
-    if not path.exists():
-        return []
-    try:
-        overrides = load_overrides_file(path)
-    except (ValueError, OSError) as exc:
-        print(f"[live-overrides] failed to read {path}: {exc}")
-        return []
-    try:
-        return cfg.apply_overrides(overrides, restrict_to=TrainingConfig.RESUMABLE_FIELDS)
-    except ValueError as exc:
-        print(f"[live-overrides] rejected {path}: {exc}")
-        return []
+    target_idx = applied_idx
+    for i, stage in enumerate(schedule):
+        if timesteps_done >= stage["at_timesteps"]:
+            target_idx = i
+    if target_idx == applied_idx:
+        return applied_idx
+
+    any_applied = False
+    for i in range(applied_idx + 1, target_idx + 1):
+        stage = schedule[i]
+        applied = cfg.apply_overrides(stage["overrides"], restrict_to=TrainingConfig.RESUMABLE_FIELDS)
+        if applied:
+            any_applied = True
+            if verbose:
+                print(f"[schedule] stage {i} (at_timesteps>={stage['at_timesteps']}, "
+                      f"timesteps={timesteps_done}/{cfg.total_timesteps}) activated:")
+                for dotted_key, old, new in applied:
+                    print(f"    {dotted_key}: {old!r} -> {new!r}")
+
+    if any_applied:
+        if model is not None:
+            apply_ppo_hyperparams(model, cfg.ppo, defer_n_steps_resize=True)
+        if env is not None:
+            env.env_method("set_reward_config", cfg.rewards)
+        if ckman is not None:
+            ckman.update_manifest_config()
+
+    return target_idx
 
 
-class LiveOverridesCallback(BaseCallback):
+class ScheduleCallback(BaseCallback):
     """
-    A callback that checks for live overrides to the training configuration and applies them.
+    A callback that applies training schedule overrides at the start of each rollout.
     """
 
     def __init__(
         self,
         cfg: TrainingConfig,
         ckman: CheckpointManager,
-        model,
         pool: OpponentPool,
+        schedule: list[dict],
+        applied_idx: int = -1,
         verbose: int = 1,
-        initial_mtime: float | None = None,
     ):
         super().__init__(verbose)
         self.cfg = cfg
         self.ckman = ckman
-        self.model = model
         self.pool = pool
-        self.path = ckman.run_dir / "live_overrides.json"
-        self._last_mtime: float | None = initial_mtime
+        self.schedule = schedule
+        self.applied_idx = applied_idx
 
     def _on_step(self) -> bool:
         return True
 
     def _on_rollout_start(self) -> None:
-        if not self.path.exists():
-            return
-        mtime = self.path.stat().st_mtime
-        if mtime == self._last_mtime:
-            return
-        self._last_mtime = mtime
-
-        applied = _read_and_apply_live_overrides(self.path, self.cfg)
-        if not applied:
-            return
-
-        print(f"[live-overrides] applying {len(applied)} change(s) from {self.path}:")
-        for dotted_key, old, new in applied:
-            print(f"    {dotted_key}: {old!r} -> {new!r}")
-
-        apply_ppo_hyperparams(self.model, self.cfg.ppo, defer_n_steps_resize=True)
-        self.training_env.env_method("set_reward_config", self.cfg.rewards)
-        self.ckman.update_manifest_config()
+        self.applied_idx = apply_schedule_up_to(
+            self.cfg,
+            self.schedule,
+            self.model.num_timesteps,
+            self.applied_idx,
+            model=self.model,
+            env=self.training_env,
+            ckman=self.ckman,
+            verbose=bool(self.verbose),
+        )
 
 
 class MaxRolloutsCallback(BaseCallback):
@@ -704,6 +722,7 @@ def run(
     overrides: dict | None = None,
     overrides_file: str | None = None,
     max_rollouts: int | None = None,
+    schedule: list[dict] | None = DEFAULT_SCHEDULE,
 ) -> None:
     freeze_support()
 
@@ -741,8 +760,7 @@ def run(
         print(f"Starting new run '{cfg.run_name}' in {ckman.run_dir}")
         print(
             f"Tip: drop a 'config_overrides.json' into {ckman.run_dir} and it will be "
-            f"applied automatically next time you --resume this run, and a "
-            f"'live_overrides.json' there will be hot-applied while this process is running."
+            f"applied automatically next time you --resume this run."
         )
 
     device = resolve_device(cfg.device)
@@ -777,22 +795,17 @@ def run(
         else:
             print("No checkpoint found in this run yet — starting from scratch.")
 
-    live_overrides_path = ckman.run_dir / "live_overrides.json"
-    initial_applied = _read_and_apply_live_overrides(live_overrides_path, cfg)
-    initial_mtime = live_overrides_path.stat().st_mtime if live_overrides_path.exists() else None
-    if initial_applied:
-        print(f"[live-overrides] found {live_overrides_path} before the first rollout -- "
-              f"applying {len(initial_applied)} change(s) now so training starts with them:")
-        for dotted_key, old, new in initial_applied:
-            print(f"    {dotted_key}: {old!r} -> {new!r}")
-        apply_ppo_hyperparams(model, cfg.ppo)
-        env.env_method("set_reward_config", cfg.rewards)
-        ckman.update_manifest_config()
+    schedule_applied_idx = -1
+    if schedule:
+        schedule_applied_idx = apply_schedule_up_to(
+            cfg, schedule, timesteps_done, schedule_applied_idx,
+            model=model, env=env, ckman=ckman, verbose=True,
+        )
 
-    live_overrides_callback = LiveOverridesCallback(
-        cfg, ckman, model, pool, verbose=1, initial_mtime=initial_mtime,
+    schedule_callback = ScheduleCallback(
+        cfg, ckman, pool, schedule or [], applied_idx=schedule_applied_idx, verbose=1,
     )
-    learn_callback = CallbackList([opponent_callback, max_rollouts_callback, live_overrides_callback])
+    learn_callback = CallbackList([opponent_callback, max_rollouts_callback, schedule_callback])
 
     while timesteps_done < cfg.total_timesteps:
         chunk = min(cfg.save_every_timesteps, cfg.total_timesteps - timesteps_done)
@@ -853,10 +866,20 @@ def parse_args() -> argparse.Namespace:
                         "counterpart to --set, for when you don't want a long CLI command. On "
                         "--resume, a 'config_overrides.json' sitting in the run's own directory is "
                         "also applied automatically (no flag needed); this flag layers on top of "
-                        "that, and --set layers on top of both. Also see 'live_overrides.json' in "
-                        "the run directory, which is hot-applied mid-run without restarting "
-                        "(e.g. to anneal reward shaping, PPO hyperparameters, or the self-play "
-                        "opponent mix over the course of training -- see training_schedule.py).")
+                        "that, and --set layers on top of both.")
+    p.add_argument("--schedule-file", type=str, default=None,
+                   help="Path to a JSON file describing the curriculum schedule (see "
+                        "training_schedule.py for the format and the built-in default) used to "
+                        "anneal reward shaping, PPO hyperparameters, and the self-play opponent "
+                        "mix as training progresses. Stages are keyed by an absolute count of "
+                        "timesteps reached so far (not wall-clock time, not a fraction), and are applied "
+                        "directly by this same process as it trains -- no second process or "
+                        "on-disk live-overrides file needed, and --resume picks the schedule back "
+                        "up at the right stage automatically. Defaults to the built-in curriculum; "
+                        "pass --no-schedule to disable scheduling entirely.")
+    p.add_argument("--no-schedule", action="store_true",
+                   help="Disable the curriculum schedule entirely (cfg stays exactly as configured "
+                        "/ overridden, for the whole run). Ignored if --schedule-file is also given.")
     p.add_argument("--device", type=str, default=None, choices=["auto", "cuda", "cpu"],
                    help="Override cfg.device. Use 'cuda' to force GPU and hard-fail if unavailable.")
     p.add_argument("--n-envs", type=int, default=None, help="Override cfg.n_envs for this run.")
@@ -935,6 +958,13 @@ if __name__ == "__main__":
         key, _, value = item.partition("=")
         overrides[key.strip()] = value.strip()
 
+    if args.schedule_file is not None:
+        schedule = load_schedule(args.schedule_file)
+    elif args.no_schedule:
+        schedule = None
+    else:
+        schedule = DEFAULT_SCHEDULE
+
     run(
         cfg,
         resume_from=args.resume,
@@ -942,4 +972,5 @@ if __name__ == "__main__":
         overrides=overrides or None,
         overrides_file=args.overrides_file,
         max_rollouts=args.max_rollouts,
+        schedule=schedule,
     )
