@@ -221,7 +221,7 @@ class SelfPlayConfig:
 @dataclass
 class TrainingConfig:
     run_name: Optional[str] = None
-    runs_dir: str = "../ppo_agent/runs"
+    runs_dir: str = "runs"
     n_envs: int = 32
     n_shards: int = 1
     total_timesteps: int = 50_000_000
