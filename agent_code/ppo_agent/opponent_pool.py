@@ -42,6 +42,7 @@ class _CheckpointOpponent:
         if self._model is None:
             self._model = MaskablePPO.load(
                 self.model_path,
+                device="cpu",
                 custom_objects={"n_envs": 1, "n_steps": 1},
             )
 
