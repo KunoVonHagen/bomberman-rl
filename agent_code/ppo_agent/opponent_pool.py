@@ -7,7 +7,7 @@ import tempfile
 from typing import Callable, Dict, List, Optional, Tuple
 from sb3_contrib import MaskablePPO
 
-from .config import EnvConfig, SelfPlayConfig, OpponentArrangement
+from .config import EnvConfig, SelfPlayConfig, OpponentArrangement, ScenarioArrangement
 from .checkpoint_manager import CheckpointManager
 from agent_code.ppo_agent.gym_environment import BombermanGymEnv, ACTION_INDICES
 from environment import WorldArgs
@@ -150,6 +150,30 @@ class OpponentPool:
         if sum(weights) <= 0:
             weights = [1.0] * len(arrangements)
         return random.choices(arrangements, weights=weights, k=1)[0]
+
+    def _choose_scenario_arrangement(self) -> ScenarioArrangement:
+        """
+        Randomly choose one entry from env_cfg.scenario_mix, weighted by
+        `weight` -- same convention as _choose_arrangement for opponents.
+        """
+        mix = self.env_cfg.scenario_mix
+        if len(mix) == 1:
+            return mix[0]
+        weights = [max(0.0, a.weight) for a in mix]
+        if sum(weights) <= 0:
+            weights = [1.0] * len(mix)
+        return random.choices(mix, weights=weights, k=1)[0]
+
+    def current_scenario(self) -> str:
+        """
+        Return the scenario to use for the next batch of rounds, drawn from
+        env_cfg.scenario_mix (e.g. to mix "coin-heaven" into training for
+        generalization). Falls back to env_cfg.scenario if no mix is set.
+        """
+        mix = self.env_cfg.scenario_mix
+        if not mix:
+            return self.env_cfg.scenario
+        return self._choose_scenario_arrangement().scenario
 
     def _sample_static_opponents(self, k: int) -> List[str]:
         if k <= 0:

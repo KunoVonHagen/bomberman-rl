@@ -482,7 +482,7 @@ class BombermanGymEnv(gym.Env):
         self.step_counts = np.zeros(E, dtype=np.int64)
         self.arena = np.zeros((E, W, H), dtype=np.int8)
 
-        max_coins = int(s.SCENARIOS[args.scenario]["COIN_COUNT"])
+        max_coins = max(int(info["COIN_COUNT"]) for info in s.SCENARIOS.values())
         self.coins_xy = np.zeros((E, max_coins, 2), dtype=np.int64)
         self.coins_collectable = np.zeros((E, max_coins), dtype=bool)
         self.n_coins = np.zeros(E, dtype=np.int64)
@@ -1011,6 +1011,21 @@ class BombermanGymEnv(gym.Env):
             "grid_tensor": grid_tensor.copy() if self._full_output else grid_tensor,
             "features": features.copy(),
         }
+
+    def set_scenario(self, scenario: str) -> None:
+        """
+        Set the scenario for the environment. This method allows you to change the scenario
+        of the environment after it has been initialized. The scenario determines the layout
+        of the arena, including the placement of walls, crates, and coins.
+        """
+        if scenario not in s.SCENARIOS:
+            raise ValueError(
+                f"Unknown scenario {scenario!r}. Available: {sorted(s.SCENARIOS)}"
+            )
+        try:
+            self.args = self.args._replace(scenario=scenario)
+        except AttributeError:
+            self.args.scenario = scenario
 
     def set_reward_config(self, reward_config: Optional[RewardConfig]) -> None:
         """
