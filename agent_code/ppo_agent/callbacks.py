@@ -10,7 +10,7 @@ from agent_code.ppo_agent.config import DEFAULT_CONFIG
 from agent_code.ppo_agent.gym_environment import ACTION_INDICES, BombermanGymEnv, WorldArgs
 
 RUN: str = "run_20260831-190704"
-CHECKPOINT: Optional[str] = "checkpoint_0253638656"
+CHECKPOINT: Optional[str] = "checkpoint_0143654912"
 DETERMINISTIC: bool = True
 
 _ACTION_NAMES = {v: k for k, v in ACTION_INDICES.items() if k is not None}
@@ -28,31 +28,29 @@ def _resolve_run_dir() -> pathlib.Path:
         )
     return run_dir
 
-
-def setup(self):
-    """
-    Called once at the start of a match.
-    Loads the trained MaskablePPO checkpoint and prepares a BombermanGymEnv for observation conversion.
-    """
-
-    run_dir = _resolve_run_dir()
-    ckman = CheckpointManager.resume(str(run_dir))
-    env_cfg = ckman.config.env
-
-    ckpt_dir = (
-        ckman.get_checkpoint(CHECKPOINT) if CHECKPOINT
-        else ckman.latest_checkpoint()
-    )
-    if ckpt_dir is None:
-        raise FileNotFoundError(f"ppo_agent: run '{run_dir}' has no saved checkpoints")
-
-    self.logger.info(f"ppo_agent: loading {ckpt_dir} (run={run_dir.name})")
-
-    model = MaskablePPO.load(
-        str(ckpt_dir / "model.zip"),
+def _load_model(run_dir: pathlib.Path, checkpoint: Optional[str] = None) -> MaskablePPO:
+    """Load a MaskablePPO model from a run directory and optional checkpoint name."""
+    manager = CheckpointManager.resume(str(run_dir))
+    if checkpoint is None:
+        checkpoint_path = manager.latest_checkpoint()
+    else:
+        checkpoint_path = manager.get_checkpoint(checkpoint)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"ppo_agent: no checkpoint found at '{checkpoint_path}' -- set CHECKPOINT at the top of "
+            f"callbacks.py to a valid checkpoint name or None for the latest."
+        )
+    return MaskablePPO.load(
+        checkpoint_path / "model.zip",
         device="cpu",
-        custom_objects={"n_envs": 1, "n_steps": 1},
+        custom_objects={"n_envs": 1, "n_steps": 1}
     )
+
+def _get_dummy_env(run_dir: pathlib.Path) -> BombermanGymEnv:
+    """Get a dummy BombermanGymEnv for the given run directory."""
+    manager = CheckpointManager.resume(run_dir)
+    manifest = manager.read_manifest()
+    env_cfg = manager.config.env
 
     world_args = WorldArgs(
         scenario=env_cfg.scenario,
@@ -72,14 +70,25 @@ def setup(self):
     )
 
     dummy_opponents = [((lambda handle: None), (lambda handle, state: "WAIT"))] * 3
-    obs_env = BombermanGymEnv(
+    return BombermanGymEnv(
         world_args,
         opponents=dummy_opponents,
         layer_config=env_cfg.layer_config,
     )
 
-    self._ppo_model = model
-    self._ppo_obs_env = obs_env
+
+def setup(self):
+    """
+    Called once at the start of a match.
+    Loads the trained MaskablePPO checkpoint and prepares a BombermanGymEnv for observation conversion.
+    """
+
+    _RUN_DIR = _resolve_run_dir()
+
+    self._ppo_model = _load_model(_RUN_DIR, CHECKPOINT).policy
+    self._ppo_obs_env = _get_dummy_env(_RUN_DIR)
+
+    self._ppo_model.requires_grad_(False)
 
 
 def act(self, game_state: dict) -> str:
