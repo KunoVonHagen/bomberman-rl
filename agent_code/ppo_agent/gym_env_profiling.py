@@ -7,7 +7,7 @@ from environment import WorldArgs
 from agent_code.my_agent.callbacks import setup as my_agent_setup, act as my_agent_act
 
 CLASSIC_ENV_ARGS = WorldArgs(
-    scenario="classic",
+    scenario="coin-heaven",
     seed=None,
     silence_errors=True,
     no_gui=True,

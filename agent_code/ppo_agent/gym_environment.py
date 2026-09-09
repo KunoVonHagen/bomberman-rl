@@ -1246,6 +1246,24 @@ class BombermanGymEnv(gym.Env):
                 return self._agent_state_dict(env, handle, self._build_shared_state(env))
         raise ValueError("handle does not belong to this environment")
 
+    def _ensure_coin_capacity(self, min_coins: int) -> None:
+        """
+        Ensure that the coin arrays have enough capacity for at least `min_coins` coins.
+        If the current capacity is less than `min_coins`, the arrays are resized to accommodate
+        the new capacity.
+        """
+        current = self.coins_xy.shape[1]
+        if min_coins <= current:
+            return
+        E = self.n_envs
+        new_xy = np.zeros((E, min_coins, 2), dtype=self.coins_xy.dtype)
+        new_xy[:, :current] = self.coins_xy
+        self.coins_xy = new_xy
+
+        new_collectable = np.zeros((E, min_coins), dtype=bool)
+        new_collectable[:, :current] = self.coins_collectable
+        self.coins_collectable = new_collectable
+
     def _load_game_state(self, game_state: dict, env: int = 0) -> None:
         prev_round = int(self.rounds[env])
         new_round = int(game_state.get("round", prev_round))
@@ -1290,8 +1308,7 @@ class BombermanGymEnv(gym.Env):
         ]
 
         coins = game_state.get("coins", [])
-        if len(coins) > self.coins_xy.shape[1]:
-            raise ValueError("game_state contains more coins than this env was sized for")
+        self._ensure_coin_capacity(len(coins))
         self.n_coins[env] = len(coins)
         if coins:
             self.coins_xy[env, :len(coins)] = coins
