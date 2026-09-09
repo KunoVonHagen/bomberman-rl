@@ -115,6 +115,18 @@ class PPOConfig:
     target_kl: float = 0.02
 
 
+@dataclass(frozen=True)
+class ScenarioArrangement:
+    """
+    One entry in a training-scenario mix: play `scenario` for the next batch
+    of rounds with probability proportional to `weight` (see
+    EnvConfig.scenario_mix). Parsed the same way as OpponentArrangement --
+    "classic,0.85;coin-heaven,0.15" or JSON.
+    """
+    scenario: str = "classic"
+    weight: float = 1.0
+
+
 @dataclass
 class EnvConfig:
     """
@@ -134,6 +146,9 @@ class EnvConfig:
     fps: int = 60
     replay: Optional[str] = None
     continue_without_training: bool = False
+    scenario_mix: List[ScenarioArrangement] = field(
+        default_factory=lambda: [ScenarioArrangement(scenario="classic", weight=1.0)]
+    )
 
     layer_config: List[str] = field(default_factory=lambda: [
         "base",
@@ -247,6 +262,7 @@ class TrainingConfig:
         "n_envs",
         "n_shards",
         "n_demonstration_episodes",
+        "env.scenario_mix",
         "ppo.learning_rate",
         "ppo.n_steps",
         "ppo.batch_size",

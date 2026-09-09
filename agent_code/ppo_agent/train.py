@@ -531,8 +531,11 @@ class OpponentResampleCallback(BaseCallback):
             return
         opponents = self.pool.current_opponents()
         self.training_env.env_method("set_opponents", opponents)
+        scenario = self.pool.current_scenario()
+        self.training_env.env_method("set_scenario", scenario)
         if self.verbose:
             print(f"[opponents] rollout {self._rollout_count}: {self.pool.last_opponent_descriptions()}")
+            print(f"[scenario] rollout {self._rollout_count}: {scenario}")
 
 
 def apply_schedule_up_to(
@@ -670,6 +673,13 @@ EVAL_SUITE_BOTS = [
     "agent_code.peaceful_agent.callbacks",
 ]
 
+EVAL_SUITE_GENERALIZATION_CASES: list[tuple[str, int]] = [
+    ("coin-heaven", 0),
+    ("empty", 0),
+    ("classic", 1),
+    ("classic", 2),
+]
+
 
 def run_eval_suite(
     model,
@@ -678,24 +688,30 @@ def run_eval_suite(
     timesteps_done: int,
     n_episodes: int = 10,
     bot_paths: list[str] | None = None,
+    generalization_cases: list[tuple[str, int]] | None = None,
+    generalization_opponent: str = "agent_code.rule_based_agent.callbacks",
 ) -> dict[str, float]:
     """
-    Run a suite of evaluation games against a set of bots and return the average rewards.
+    Run a suite of evaluation games against a set of bots (all at the standard 1v3
+    "classic" table) plus a set of generalization cases that vary the scenario and/or
+    opponent count, and return the average rewards for each.
     """
     bot_paths = bot_paths if bot_paths is not None else EVAL_SUITE_BOTS
+    generalization_cases = (
+        generalization_cases if generalization_cases is not None else EVAL_SUITE_GENERALIZATION_CASES
+    )
     results: dict[str, float] = {}
 
-    for bot_path in bot_paths:
-        opponents = [OpponentPool._resolve_static(bot_path)] * 3
-        bot_short_name = bot_path.split(".")[1]
-        rewards = []
+    def _play_episodes(opponents, scenario: str, tag: str) -> float:
+        case_cfg = cfg
+        if scenario != cfg.env.scenario:
+            case_cfg = copy.deepcopy(cfg)
+            case_cfg.env.scenario = scenario
 
+        rewards = []
         for i in range(n_episodes):
-            replay_path = (
-                ckman.replays_dir
-                / f"eval_{bot_short_name}_{timesteps_done:010d}_{i}.pkl"
-            )
-            test_env = make_test_env(cfg, opponents, str(ckman.logs_dir), str(replay_path))
+            replay_path = ckman.replays_dir / f"eval_{tag}_{timesteps_done:010d}_{i}.pkl"
+            test_env = make_test_env(case_cfg, opponents, str(ckman.logs_dir), str(replay_path))
             obs = test_env.reset()
             done = False
             total_reward = 0.0
@@ -707,10 +723,21 @@ def run_eval_suite(
                 done = bool(dones[0])
             test_env.close()
             rewards.append(total_reward)
+        return float(sum(rewards) / len(rewards))
 
-        mean_reward = float(sum(rewards) / len(rewards))
+    for bot_path in bot_paths:
+        opponents = [OpponentPool._resolve_static(bot_path)] * 3
+        bot_short_name = bot_path.split(".")[1]
+        mean_reward = _play_episodes(opponents, cfg.env.scenario, bot_short_name)
         results[bot_path] = mean_reward
-        print(f"  eval vs {bot_short_name}: {mean_reward:.2f} (n={n_episodes})")
+        print(f"  eval vs {bot_short_name} ({cfg.env.scenario}, 3 opp): {mean_reward:.2f} (n={n_episodes})")
+
+    for scenario, n_opponents in generalization_cases:
+        opponents = [OpponentPool._resolve_static(generalization_opponent)] * n_opponents
+        tag = f"gen_{scenario}_{n_opponents}opp"
+        mean_reward = _play_episodes(opponents, scenario, tag)
+        results[tag] = mean_reward
+        print(f"  eval generalization [{scenario}, {n_opponents} opp]: {mean_reward:.2f} (n={n_episodes})")
 
     return results
 
@@ -907,11 +934,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--arrangements", type=str, default=None,
                    help="Shorthand for --set self_play.arrangements=.... Describes the possible "
                         "opponent-lineup shapes; every rollout draws one at random, weighted. "
-                        "All entries must sum to the same total (the game's fixed opponent-seat "
-                        "count). Two accepted formats -- shorthand (recommended on Windows/"
-                        "PowerShell, no quote characters needed): semicolon-separated "
-                        "'n_static,n_self_play,weight' triples, e.g. "
-                        "'0,3,3;1,2,3;2,1,2;3,0,1'. Or JSON (needs careful quoting on "
+                        "Entries do NOT need to share the same total -- mixing different totals "
+                        "(including 0, i.e. no opponents at all) is recommended so the agent "
+                        "generalizes to coin-only / reduced-opponent play instead of collapsing "
+                        "outside a fixed opponent count. Each entry's n_static + n_self_play must "
+                        "still fit within the game's opponent seats (<= 3). Two accepted formats "
+                        "-- shorthand (recommended on Windows/PowerShell, no quote characters "
+                        "needed): semicolon-separated 'n_static,n_self_play,weight' triples, e.g. "
+                        "'0,0,1;0,3,3;1,2,3;2,1,2;3,0,1'. Or JSON (needs careful quoting on "
                         "PowerShell): '[{\"n_static\":0,\"n_self_play\":3,\"weight\":3}]'")
     p.add_argument("--set", dest="overrides", type=str, nargs="*", default=[],
                    metavar="path.to.field=value",
