@@ -120,6 +120,9 @@ class CheckpointManager:
         ckpt_dir = self._checkpoint_dir(timesteps)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+        for _leaky_attr in ("train", "collect_rollouts", "predict"):
+            model.__dict__.pop(_leaky_attr, None)
+
         model.save(str(ckpt_dir / "model.zip"))
 
         metadata = {"timesteps": timesteps, "saved_at": datetime.now().isoformat()}

@@ -495,20 +495,6 @@ def apply_ppo_hyperparams(
         return
 
     model._pending_n_steps = ppo_cfg.n_steps
-    if getattr(model, "_train_wrapped_for_pending_resize", False):
-        return
-
-    model._train_wrapped_for_pending_resize = True
-    original_train = model.train
-
-    def _train_then_resize(*args, **kwargs):
-        result = original_train(*args, **kwargs)
-        model.train = original_train
-        model._train_wrapped_for_pending_resize = False
-        _resize_rollout_buffer(model, model._pending_n_steps)
-        return result
-
-    model.train = _train_then_resize
 
 
 class OpponentResampleCallback(BaseCallback):
@@ -608,6 +594,12 @@ class ScheduleCallback(BaseCallback):
         return True
 
     def _on_rollout_start(self) -> None:
+        pending = getattr(self.model, "_pending_n_steps", None)
+        if pending is not None:
+            if pending != self.model.n_steps:
+                _resize_rollout_buffer(self.model, pending)
+            self.model._pending_n_steps = None
+
         self.applied_idx = apply_schedule_up_to(
             self.cfg,
             self.schedule,
