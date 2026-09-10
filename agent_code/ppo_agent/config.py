@@ -223,15 +223,6 @@ class SelfPlayConfig:
     sample_strategy: Literal["uniform", "latest_biased"] = "latest_biased"
     latest_bias: float = 0.5
 
-    def __post_init__(self):
-        totals = {a.n_static + a.n_self_play for a in self.arrangements}
-        if len(totals) > 1:
-            raise ValueError(
-                "All self_play.arrangements must add up to the same total opponent "
-                f"count (the game's player count is fixed) -- got totals {sorted(totals)}. "
-                "Vary the static/self-play *mix* between arrangements, not the total."
-            )
-
 
 @dataclass
 class TrainingConfig:
@@ -339,10 +330,23 @@ class TrainingConfig:
     def from_dict(cls, d: dict) -> "TrainingConfig":
         d = dict(d)
         d["ppo"] = PPOConfig(**d.get("ppo", {}))
-        d["env"] = EnvConfig(**d.get("env", {}))
+        d["env"] = EnvConfig(**cls._migrate_env_dict(d.get("env", {})))
         d["self_play"] = SelfPlayConfig(**cls._migrate_self_play_dict(d.get("self_play", {})))
         d["rewards"] = RewardConfig(**d.get("rewards", {}))
         return cls(**d)
+
+    @staticmethod
+    def _migrate_env_dict(env: dict) -> dict:
+        """
+        Migrate an env config dict from older versions to the current format.
+        """
+        env = dict(env)
+        if "scenario_mix" in env:
+            env["scenario_mix"] = [
+                a if isinstance(a, ScenarioArrangement) else ScenarioArrangement(**a)
+                for a in env["scenario_mix"]
+            ]
+        return env
 
     @staticmethod
     def _migrate_self_play_dict(sp: dict) -> dict:
