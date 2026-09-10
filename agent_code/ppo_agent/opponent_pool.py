@@ -100,13 +100,6 @@ class OpponentPool:
         if cfg.enabled:
             self._checkpoints = list(ckman.list_checkpoints())[-cfg.pool_size:]
 
-        totals = {a.n_static + a.n_self_play for a in cfg.arrangements}
-        if len(totals) > 1:
-            raise ValueError(
-                "All self_play.arrangements must add up to the same total opponent "
-                f"count -- got totals {sorted(totals)}."
-            )
-
     def maybe_add_checkpoint(self, checkpoint_dir: Optional[pathlib.Path], _timesteps: int) -> None:
         """Call this after every saved checkpoint; it decides whether to add
         it to the self-play pool based on `add_checkpoint_every_epochs`."""
