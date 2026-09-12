@@ -120,7 +120,14 @@ def _obs_to_tensors(observation: dict, device: torch.device) -> dict:
     feats = observation["features"]
     grid = grid if torch.is_tensor(grid) else torch.as_tensor(np.asarray(grid), dtype=torch.float32)
     feats = feats if torch.is_tensor(feats) else torch.as_tensor(np.asarray(feats), dtype=torch.float32)
-    return {"grid_tensor": grid.to(device), "features": feats.to(device)}
+    non_blocking = device.type == "cuda"
+    if non_blocking:
+        grid = grid.pin_memory()
+        feats = feats.pin_memory()
+    return {
+        "grid_tensor": grid.to(device, non_blocking=non_blocking),
+        "features": feats.to(device, non_blocking=non_blocking),
+    }
 
 
 def _is_vectorized(observation: dict, observation_space: gym.spaces.Dict) -> bool:
@@ -188,6 +195,8 @@ class MaskableDQN:
         self.q_net_target.eval()
 
         self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.learning_rate)
+        self._amp_enabled = self.device.type == "cuda"
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self._amp_enabled)
 
         self.replay_buffer: Optional[DictReplayBuffer] = None
 
@@ -275,7 +284,7 @@ class MaskableDQN:
         dones = torch.as_tensor(batch["dones"], device=self.device, dtype=torch.float32)
         next_masks = torch.as_tensor(batch["next_action_masks"], device=self.device, dtype=torch.bool)
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self._amp_enabled):
             next_q = self.q_net_target(next_obs)
             next_q = next_q.masked_fill(~next_masks, float("-inf"))
             next_q = torch.nan_to_num(next_q, neginf=0.0)
@@ -283,15 +292,18 @@ class MaskableDQN:
             target = rewards + (1.0 - dones) * self.gamma * next_q_max
 
         self.q_net.train()
-        q_values_all = self.q_net(obs)
-        q_values = q_values_all.gather(1, actions.unsqueeze(1)).squeeze(1)
-        loss = F.smooth_l1_loss(q_values, target)
+        with torch.autocast(device_type=self.device.type, enabled=self._amp_enabled):
+            q_values_all = self.q_net(obs)
+            q_values = q_values_all.gather(1, actions.unsqueeze(1)).squeeze(1)
+            loss = F.smooth_l1_loss(q_values, target)
 
         self.optimizer.zero_grad()
-        loss.backward()
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(self.optimizer)
         clip_at = self.max_grad_norm if (self.max_grad_norm is not None and self.max_grad_norm > 0) else float("inf")
         grad_norm = nn.utils.clip_grad_norm_(self.q_net.parameters(), clip_at)
-        self.optimizer.step()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
 
         with torch.no_grad():
             td_error = (target - q_values).abs().mean()
@@ -409,6 +421,7 @@ class MaskableDQN:
             "q_net_state_dict": self.q_net.state_dict(),
             "q_net_target_state_dict": self.q_net_target.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
         }
         torch.save(checkpoint, path)
 
@@ -432,6 +445,11 @@ class MaskableDQN:
             try:
                 model.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             except ValueError:
+                pass
+        if checkpoint.get("scaler_state_dict") is not None:
+            try:
+                model.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            except (ValueError, RuntimeError):
                 pass
 
         model.num_timesteps = checkpoint.get("num_timesteps", 0)

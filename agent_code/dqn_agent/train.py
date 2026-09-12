@@ -38,6 +38,7 @@ def resolve_device(requested: str = "auto") -> str:
         print(f"[device] GPU: {torch.cuda.get_device_name(idx)}")
         props = torch.cuda.get_device_properties(idx)
         print(f"[device] Total VRAM: {props.total_memory / 1024**3:.1f} GB")
+        torch.backends.cudnn.benchmark = True
     elif device == "cuda":
         raise RuntimeError(
             "device='cuda' was requested/forced but torch.cuda.is_available() "
