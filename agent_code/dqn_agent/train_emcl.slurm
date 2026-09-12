@@ -7,11 +7,11 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=gz300@uni-heidelberg.de
+#SBATCH --mail-user=ha300@uni-heidelberg.de
 
-source /cluster/projects/jweber/envs/bomberman/bin/activate
+source /cluster/projects/dwiest/envs/bomberman/bin/activate
 
-cd /cluster/projects/jweber/bomberman-rl
+cd /cluster/projects/dwiest/bomberman-rl
 
 RUN_NAME="${RUN_NAME:-bomberman_dqn_$(date +%Y%m%d_%H%M%S)}"
 

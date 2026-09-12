@@ -7,7 +7,7 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=gz300@uni-heidelberg.de
+#SBATCH --mail-user=ha300@uni-heidelberg.de
 
 module purge
 module load devel/python/3.11.7-gnu-14.2
