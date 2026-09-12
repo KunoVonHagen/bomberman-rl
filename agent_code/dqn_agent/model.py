@@ -195,6 +195,10 @@ class MaskableDQN:
         self._last_obs = None
         self._last_action_masks = None
         self.last_loss_mean: Optional[float] = None
+        self.n_updates = 0
+        self.last_grad_norm: Optional[float] = None
+        self.last_mean_q: Optional[float] = None
+        self.last_td_error: Optional[float] = None
 
     def _sample_masked_actions(self, action_masks: np.ndarray) -> np.ndarray:
         """Sample actions only from valid mask choices."""
@@ -253,7 +257,7 @@ class MaskableDQN:
                 self.buffer_size, n_envs, self.observation_space, self.n_actions,
             )
 
-    def train_step(self) -> Optional[float]:
+    def train_step(self) -> Optional[dict]:
         """Run one gradient step on a minibatch from the replay buffer."""
         if self.replay_buffer is None or len(self.replay_buffer) < max(self.batch_size, 1):
             return None
@@ -274,16 +278,26 @@ class MaskableDQN:
             target = rewards + (1.0 - dones) * self.gamma * next_q_max
 
         self.q_net.train()
-        q_values = self.q_net(obs).gather(1, actions.unsqueeze(1)).squeeze(1)
+        q_values_all = self.q_net(obs)
+        q_values = q_values_all.gather(1, actions.unsqueeze(1)).squeeze(1)
         loss = F.smooth_l1_loss(q_values, target)
 
         self.optimizer.zero_grad()
         loss.backward()
-        if self.max_grad_norm is not None and self.max_grad_norm > 0:
-            nn.utils.clip_grad_norm_(self.q_net.parameters(), self.max_grad_norm)
+        clip_at = self.max_grad_norm if (self.max_grad_norm is not None and self.max_grad_norm > 0) else float("inf")
+        grad_norm = nn.utils.clip_grad_norm_(self.q_net.parameters(), clip_at)
         self.optimizer.step()
 
-        return float(loss.item())
+        with torch.no_grad():
+            td_error = (target - q_values).abs().mean()
+            mean_q = q_values_all.mean()
+
+        return {
+            "loss": float(loss.item()),
+            "grad_norm": float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm),
+            "mean_q": float(mean_q.item()),
+            "td_error": float(td_error.item()),
+        }
 
     def update_target(self) -> None:
         """Blend the target network toward the online network."""
@@ -305,6 +319,9 @@ class MaskableDQN:
             cb.on_training_start(self, env)
 
         losses = []
+        grad_norms = []
+        mean_qs = []
+        td_errors = []
         while self.num_timesteps < target_num_timesteps:
             for cb in callbacks:
                 cb.on_rollout_start(self, env)
@@ -338,9 +355,13 @@ class MaskableDQN:
             if self.num_timesteps >= self.learning_starts and self._steps_since_train >= self.train_freq:
                 n_updates = self.gradient_steps if self.gradient_steps > 0 else self._steps_since_train
                 for _ in range(max(1, n_updates)):
-                    loss = self.train_step()
-                    if loss is not None:
-                        losses.append(loss)
+                    metrics = self.train_step()
+                    if metrics is not None:
+                        losses.append(metrics["loss"])
+                        grad_norms.append(metrics["grad_norm"])
+                        mean_qs.append(metrics["mean_q"])
+                        td_errors.append(metrics["td_error"])
+                        self.n_updates += 1
                 self._steps_since_train = 0
 
             crossed = (
@@ -351,6 +372,9 @@ class MaskableDQN:
                 self.update_target()
 
         self.last_loss_mean = float(np.mean(losses)) if losses else None
+        self.last_grad_norm = float(np.mean(grad_norms)) if grad_norms else None
+        self.last_mean_q = float(np.mean(mean_qs)) if mean_qs else None
+        self.last_td_error = float(np.mean(td_errors)) if td_errors else None
 
     def _hyperparams(self) -> dict:
         """Return the optimizer and training hyperparameters."""
@@ -381,6 +405,7 @@ class MaskableDQN:
             "hyperparams": self._hyperparams(),
             "num_timesteps": self.num_timesteps,
             "exploration_rate": self.exploration_rate,
+            "n_updates": self.n_updates,
             "q_net_state_dict": self.q_net.state_dict(),
             "q_net_target_state_dict": self.q_net_target.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
@@ -411,5 +436,5 @@ class MaskableDQN:
 
         model.num_timesteps = checkpoint.get("num_timesteps", 0)
         model.exploration_rate = checkpoint.get("exploration_rate", model.exploration_initial_eps)
+        model.n_updates = checkpoint.get("n_updates", 0)
         return model
-
