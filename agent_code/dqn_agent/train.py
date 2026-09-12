@@ -4,6 +4,7 @@ import argparse
 import copy
 import multiprocessing as mp
 import pathlib
+import time
 from collections import deque
 from multiprocessing import freeze_support
 from typing import Optional
@@ -428,6 +429,36 @@ class OpponentResampleCallback:
             print(f"[scenario] timesteps={model.num_timesteps}: distribution: {scenario_str}")
 
 
+def _format_metrics_table(sections: "dict[str, dict[str, object]]") -> str:
+    """Render nested metric sections"""
+    key_col: list[str] = []
+    val_col: list[str] = []
+    for section, metrics in sections.items():
+        if not metrics:
+            continue
+        key_col.append(f"{section}/")
+        val_col.append("")
+        for k, v in metrics.items():
+            key_col.append(f"   {k}")
+            if isinstance(v, float):
+                val_col.append(f"{v:.4g}")
+            else:
+                val_col.append(str(v))
+
+    if not key_col:
+        return ""
+
+    key_width = max(len(k) for k in key_col) + 2
+    val_width = max(len(v) for v in val_col) + 2
+    border = "-" * (key_width + val_width + 3)
+
+    lines = [border]
+    for k, v in zip(key_col, val_col):
+        lines.append(f"| {k.ljust(key_width - 1)}| {v.ljust(val_width - 1)}|")
+    lines.append(border)
+    return "\n".join(lines)
+
+
 class ProgressLoggingCallback:
     """Logs rolling training statistics periodically to stdout and optionally TensorBoard."""
 
@@ -436,12 +467,17 @@ class ProgressLoggingCallback:
         self.verbose = verbose
         self._next_log_at = 0
         self._writer = None
+        self._start_time: Optional[float] = None
+        self._start_timesteps = 0
+        self._iteration = 0
         if tensorboard_dir is not None:
             from torch.utils.tensorboard import SummaryWriter
             self._writer = SummaryWriter(tensorboard_dir)
 
     def on_training_start(self, model: MaskableDQN, env) -> None:
         self._next_log_at = model.num_timesteps + self.every_n_timesteps
+        self._start_time = time.time()
+        self._start_timesteps = model.num_timesteps
 
     def on_rollout_start(self, model: MaskableDQN, env) -> None:
         pass
@@ -450,29 +486,69 @@ class ProgressLoggingCallback:
         if model.num_timesteps < self._next_log_at:
             return
         self._next_log_at = model.num_timesteps + self.every_n_timesteps
+        self._iteration += 1
 
         ep_rew_mean = env.ep_rew_mean()
         ep_len_mean = env.ep_len_mean()
 
+        elapsed = max(time.time() - (self._start_time or time.time()), 1e-8)
+        fps = int((model.num_timesteps - self._start_timesteps) / elapsed)
+
+        rollout: dict[str, object] = {}
+        if ep_len_mean is not None:
+            rollout["ep_len_mean"] = ep_len_mean
+        if ep_rew_mean is not None:
+            rollout["ep_rew_mean"] = ep_rew_mean
+        rollout["exploration_rate"] = model.exploration_rate
+
+        time_stats: dict[str, object] = {
+            "fps": fps,
+            "iterations": self._iteration,
+            "time_elapsed": int(elapsed),
+            "total_timesteps": model.num_timesteps,
+        }
+
+        train: dict[str, object] = {}
+        learning_rate = getattr(model, "learning_rate", None)
+        if learning_rate is not None:
+            train["learning_rate"] = learning_rate
+        if model.last_loss_mean is not None:
+            train["loss"] = model.last_loss_mean
+
+        n_updates = getattr(model, "n_updates", None)
+        if n_updates is None:
+            n_updates = getattr(model, "_n_updates", None)
+        if n_updates is not None:
+            train["n_updates"] = n_updates
+        grad_norm = getattr(model, "last_grad_norm", None)
+        if grad_norm is not None:
+            train["grad_norm"] = grad_norm
+        mean_q = getattr(model, "last_mean_q", None)
+        if mean_q is not None:
+            train["mean_q"] = mean_q
+        td_error = getattr(model, "last_td_error", None)
+        if td_error is not None:
+            train["td_error"] = td_error
+
+        replay_buffer = getattr(model, "replay_buffer", None)
+        buffer_size = getattr(model, "buffer_size", None)
+        if replay_buffer is not None and buffer_size:
+            try:
+                train["buffer_fill"] = len(replay_buffer) / buffer_size
+            except TypeError:
+                pass
+
         if self.verbose:
-            parts = [f"[progress] timesteps={model.num_timesteps}"]
-            if ep_rew_mean is not None:
-                parts.append(f"ep_rew_mean={ep_rew_mean:.4f}")
-            if ep_len_mean is not None:
-                parts.append(f"ep_len_mean={ep_len_mean:.1f}")
-            if model.last_loss_mean is not None:
-                parts.append(f"loss_mean={model.last_loss_mean:.5f}")
-            parts.append(f"exploration_rate={model.exploration_rate:.4f}")
-            print("  ".join(parts))
+            print(_format_metrics_table({"rollout": rollout, "time": time_stats, "train": train}))
 
         if self._writer is not None:
-            if ep_rew_mean is not None:
-                self._writer.add_scalar("rollout/ep_rew_mean", ep_rew_mean, model.num_timesteps)
-            if ep_len_mean is not None:
-                self._writer.add_scalar("rollout/ep_len_mean", ep_len_mean, model.num_timesteps)
-            if model.last_loss_mean is not None:
-                self._writer.add_scalar("train/loss_mean", model.last_loss_mean, model.num_timesteps)
-            self._writer.add_scalar("train/exploration_rate", model.exploration_rate, model.num_timesteps)
+            for key, value in rollout.items():
+                self._writer.add_scalar(f"rollout/{key}", value, model.num_timesteps)
+            for key, value in time_stats.items():
+                if key != "iterations":
+                    self._writer.add_scalar(f"time/{key}", value, model.num_timesteps)
+            for key, value in train.items():
+                self._writer.add_scalar(f"train/{key}", value, model.num_timesteps)
             self._writer.flush()
 
 
@@ -678,7 +754,7 @@ def run(
         cfg, ckman, schedule or [], applied_idx=schedule_applied_idx, verbose=1,
     )
     progress_callback = ProgressLoggingCallback(
-        tensorboard_dir=str(ckman.tensorboard_dir), every_n_timesteps=5_000, verbose=1,
+        tensorboard_dir=str(ckman.tensorboard_dir), every_n_timesteps=15_000, verbose=1,
     )
     learn_callbacks = [opponent_callback, schedule_callback, progress_callback]
 
