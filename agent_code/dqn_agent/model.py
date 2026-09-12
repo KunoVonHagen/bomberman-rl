@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from typing import Optional, Tuple
 
 import numpy as np
@@ -199,6 +200,10 @@ class MaskableDQN:
         self.last_grad_norm: Optional[float] = None
         self.last_mean_q: Optional[float] = None
         self.last_td_error: Optional[float] = None
+        self._loss_window: deque = deque(maxlen=100)
+        self._grad_norm_window: deque = deque(maxlen=100)
+        self._mean_q_window: deque = deque(maxlen=100)
+        self._td_error_window: deque = deque(maxlen=100)
 
     def _sample_masked_actions(self, action_masks: np.ndarray) -> np.ndarray:
         """Sample actions only from valid mask choices."""
@@ -318,10 +323,6 @@ class MaskableDQN:
         for cb in callbacks:
             cb.on_training_start(self, env)
 
-        losses = []
-        grad_norms = []
-        mean_qs = []
-        td_errors = []
         while self.num_timesteps < target_num_timesteps:
             for cb in callbacks:
                 cb.on_rollout_start(self, env)
@@ -357,11 +358,15 @@ class MaskableDQN:
                 for _ in range(max(1, n_updates)):
                     metrics = self.train_step()
                     if metrics is not None:
-                        losses.append(metrics["loss"])
-                        grad_norms.append(metrics["grad_norm"])
-                        mean_qs.append(metrics["mean_q"])
-                        td_errors.append(metrics["td_error"])
+                        self._loss_window.append(metrics["loss"])
+                        self._grad_norm_window.append(metrics["grad_norm"])
+                        self._mean_q_window.append(metrics["mean_q"])
+                        self._td_error_window.append(metrics["td_error"])
                         self.n_updates += 1
+                        self.last_loss_mean = float(np.mean(self._loss_window))
+                        self.last_grad_norm = float(np.mean(self._grad_norm_window))
+                        self.last_mean_q = float(np.mean(self._mean_q_window))
+                        self.last_td_error = float(np.mean(self._td_error_window))
                 self._steps_since_train = 0
 
             crossed = (
@@ -370,11 +375,6 @@ class MaskableDQN:
             )
             if crossed:
                 self.update_target()
-
-        self.last_loss_mean = float(np.mean(losses)) if losses else None
-        self.last_grad_norm = float(np.mean(grad_norms)) if grad_norms else None
-        self.last_mean_q = float(np.mean(mean_qs)) if mean_qs else None
-        self.last_td_error = float(np.mean(td_errors)) if td_errors else None
 
     def _hyperparams(self) -> dict:
         """Return the optimizer and training hyperparameters."""
