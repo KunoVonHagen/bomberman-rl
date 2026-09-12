@@ -428,6 +428,54 @@ class OpponentResampleCallback:
             print(f"[scenario] timesteps={model.num_timesteps}: distribution: {scenario_str}")
 
 
+class ProgressLoggingCallback:
+    """Logs rolling training statistics periodically to stdout and optionally TensorBoard."""
+
+    def __init__(self, tensorboard_dir: Optional[str] = None, every_n_timesteps: int = 5_000, verbose: int = 1):
+        self.every_n_timesteps = max(1, every_n_timesteps)
+        self.verbose = verbose
+        self._next_log_at = 0
+        self._writer = None
+        if tensorboard_dir is not None:
+            from torch.utils.tensorboard import SummaryWriter
+            self._writer = SummaryWriter(tensorboard_dir)
+
+    def on_training_start(self, model: MaskableDQN, env) -> None:
+        self._next_log_at = model.num_timesteps + self.every_n_timesteps
+
+    def on_rollout_start(self, model: MaskableDQN, env) -> None:
+        pass
+
+    def on_step(self, model: MaskableDQN, env) -> None:
+        if model.num_timesteps < self._next_log_at:
+            return
+        self._next_log_at = model.num_timesteps + self.every_n_timesteps
+
+        ep_rew_mean = env.ep_rew_mean()
+        ep_len_mean = env.ep_len_mean()
+
+        if self.verbose:
+            parts = [f"[progress] timesteps={model.num_timesteps}"]
+            if ep_rew_mean is not None:
+                parts.append(f"ep_rew_mean={ep_rew_mean:.4f}")
+            if ep_len_mean is not None:
+                parts.append(f"ep_len_mean={ep_len_mean:.1f}")
+            if model.last_loss_mean is not None:
+                parts.append(f"loss_mean={model.last_loss_mean:.5f}")
+            parts.append(f"exploration_rate={model.exploration_rate:.4f}")
+            print("  ".join(parts))
+
+        if self._writer is not None:
+            if ep_rew_mean is not None:
+                self._writer.add_scalar("rollout/ep_rew_mean", ep_rew_mean, model.num_timesteps)
+            if ep_len_mean is not None:
+                self._writer.add_scalar("rollout/ep_len_mean", ep_len_mean, model.num_timesteps)
+            if model.last_loss_mean is not None:
+                self._writer.add_scalar("train/loss_mean", model.last_loss_mean, model.num_timesteps)
+            self._writer.add_scalar("train/exploration_rate", model.exploration_rate, model.num_timesteps)
+            self._writer.flush()
+
+
 class ScheduleCallback:
     """Applies training schedule overrides at the start of each rollout."""
 
@@ -629,7 +677,10 @@ def run(
     schedule_callback = ScheduleCallback(
         cfg, ckman, schedule or [], applied_idx=schedule_applied_idx, verbose=1,
     )
-    learn_callbacks = [opponent_callback, schedule_callback]
+    progress_callback = ProgressLoggingCallback(
+        tensorboard_dir=str(ckman.tensorboard_dir), every_n_timesteps=5_000, verbose=1,
+    )
+    learn_callbacks = [opponent_callback, schedule_callback, progress_callback]
 
     while timesteps_done < cfg.total_timesteps:
         chunk = min(cfg.save_every_timesteps, cfg.total_timesteps - timesteps_done)
