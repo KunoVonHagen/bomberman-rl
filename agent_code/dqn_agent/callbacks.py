@@ -6,10 +6,10 @@ from typing import Optional
 
 from environment import WorldArgs
 
-from .checkpoint_manager import CheckpointManager
-from .config import DEFAULT_CONFIG
-from .gym_environment import ACTION_INDICES, BombermanGymEnv
-from .model import MaskableDQN
+from agent_code.dqn_agent.checkpoint_manager import CheckpointManager
+from agent_code.dqn_agent.config import DEFAULT_CONFIG
+from agent_code.dqn_agent.gym_environment import ACTION_INDICES, BombermanGymEnv
+from agent_code.dqn_agent.model import MaskableDQN
 
 RUN: str = "run_20260901-120000"
 CHECKPOINT: Optional[str] = None
