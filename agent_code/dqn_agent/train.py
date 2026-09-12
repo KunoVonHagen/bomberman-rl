@@ -489,6 +489,10 @@ class ProgressLoggingCallback:
         self._next_log_at = model.num_timesteps + self.every_n_timesteps
         self._iteration += 1
 
+        refresh = getattr(model, "refresh_metrics", None)
+        if callable(refresh):
+            refresh()
+
         ep_rew_mean = env.ep_rew_mean()
         ep_len_mean = env.ep_len_mean()
 
@@ -764,6 +768,10 @@ def run(
 
         model.learn(env=env, total_timesteps=chunk, callbacks=learn_callbacks)
         timesteps_done = model.num_timesteps
+
+        refresh = getattr(model, "refresh_metrics", None)
+        if callable(refresh):
+            refresh()
 
         ep_rew_mean = env.ep_rew_mean()
         ep_len_mean = env.ep_len_mean()

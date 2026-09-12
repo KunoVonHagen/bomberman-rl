@@ -310,10 +310,10 @@ class MaskableDQN:
             mean_q = q_values_all.mean()
 
         return {
-            "loss": float(loss.item()),
-            "grad_norm": float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm),
-            "mean_q": float(mean_q.item()),
-            "td_error": float(td_error.item()),
+            "loss": loss.detach(),
+            "grad_norm": grad_norm.detach() if torch.is_tensor(grad_norm) else torch.tensor(float(grad_norm), device=self.device),
+            "mean_q": mean_q.detach(),
+            "td_error": td_error.detach(),
         }
 
     def update_target(self) -> None:
@@ -321,6 +321,22 @@ class MaskableDQN:
         with torch.no_grad():
             for target_param, param in zip(self.q_net_target.parameters(), self.q_net.parameters()):
                 target_param.data.mul_(1.0 - self.tau).add_(self.tau * param.data)
+
+    def refresh_metrics(self) -> None:
+        """Materialize rolling metric windows into their cached mean values with a single CPU sync."""
+        if not self._loss_window:
+            return
+        means = torch.stack([
+            torch.stack(list(self._loss_window)).mean(),
+            torch.stack(list(self._grad_norm_window)).mean(),
+            torch.stack(list(self._mean_q_window)).mean(),
+            torch.stack(list(self._td_error_window)).mean(),
+        ])
+        loss_m, grad_m, q_m, td_m = means.tolist()  # single sync
+        self.last_loss_mean = loss_m
+        self.last_grad_norm = grad_m
+        self.last_mean_q = q_m
+        self.last_td_error = td_m
 
     def learn(self, env, total_timesteps: int, callbacks: Optional[list] = None) -> None:
         """Collect experience and train for the next training chunk."""
@@ -375,10 +391,6 @@ class MaskableDQN:
                         self._mean_q_window.append(metrics["mean_q"])
                         self._td_error_window.append(metrics["td_error"])
                         self.n_updates += 1
-                        self.last_loss_mean = float(np.mean(self._loss_window))
-                        self.last_grad_norm = float(np.mean(self._grad_norm_window))
-                        self.last_mean_q = float(np.mean(self._mean_q_window))
-                        self.last_td_error = float(np.mean(self._td_error_window))
                 self._steps_since_train = 0
 
             crossed = (
