@@ -110,28 +110,23 @@ DEFAULT_SCHEDULE = [
 
 
 def load_schedule(path: str | None) -> list[dict]:
-    """Load a schedule (a list of {"at_timesteps": absolute_step_count, "overrides": {...}}
-    stages) from a JSON file, or return the built-in DEFAULT_SCHEDULE if path is None."""
+    """Load a schedule from a JSON file or return the built-in default."""
     if path is None:
         return DEFAULT_SCHEDULE
     data = json.loads(pathlib.Path(path).read_text())
     if not isinstance(data, list) or not all(
-        isinstance(s, dict) and "at_timesteps" in s and "overrides" in s for s in data
+        isinstance(stage, dict) and "at_timesteps" in stage and "overrides" in stage for stage in data
     ):
         raise ValueError(
             f"schedule file {path} must be a JSON list of "
             f'{{"at_timesteps": <absolute count of total_timesteps>, "overrides": {{...}}}} '
             f"objects"
         )
-    return sorted(data, key=lambda s: s["at_timesteps"])
+    return sorted(data, key=lambda stage: stage["at_timesteps"])
 
 
 def stage_index_for_timesteps(schedule: list[dict], timesteps_done: int) -> int:
-    """
-    Given a schedule and a count of timesteps done, return the index of the
-    last stage whose "at_timesteps" threshold is less than or equal to
-    timesteps_done. Returns -1 if no stages have been reached yet.
-    """
+    """Return the last schedule stage reached by the run."""
     target_idx = -1
     for i, stage in enumerate(schedule):
         if timesteps_done >= stage["at_timesteps"]:

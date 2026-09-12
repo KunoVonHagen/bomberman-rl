@@ -4,15 +4,12 @@ import argparse
 import copy
 import multiprocessing as mp
 import pathlib
+from collections import deque
 from multiprocessing import freeze_support
 from typing import Optional
 
 import numpy as np
 import torch
-from stable_baselines3.common.callbacks import BaseCallback, CallbackList
-from stable_baselines3.common.utils import get_schedule_fn, LinearSchedule
-from stable_baselines3.common.type_aliases import TrainFreq, TrainFrequencyUnit
-from stable_baselines3.common.vec_env import VecEnv, VecMonitor
 
 from environment import WorldArgs
 
@@ -21,11 +18,12 @@ from .checkpoint_manager import CheckpointManager
 from .gym_environment import BombermanGymEnv
 from .model import BombermanFeatureExtractor, MaskableDQN
 from .opponent_pool import OpponentPool, OpponentSampler
+from .schedules import LinearSchedule
 from .training_schedule import DEFAULT_SCHEDULE, load_schedule
 
 
 def resolve_device(requested: str = "auto") -> str:
-    """Resolve the device string to use for PyTorch (and SB3) training."""
+    """Resolve the device string for training."""
     if requested != "auto":
         device = requested
     else:
@@ -58,36 +56,34 @@ def build_world_args(
     save_replay: bool,
     replay_path: str | None = None,
 ) -> WorldArgs:
-    e = cfg.env
+    """Build the environment arguments for a training run."""
+    env_cfg = cfg.env
     return WorldArgs(
-        scenario=e.scenario,
-        seed=e.seed,
-        silence_errors=e.silence_errors,
-        no_gui=e.no_gui,
-        make_video=e.make_video,
+        scenario=env_cfg.scenario,
+        seed=env_cfg.seed,
+        silence_errors=env_cfg.silence_errors,
+        no_gui=env_cfg.no_gui,
+        make_video=env_cfg.make_video,
         save_replay=save_replay,
-        save_stats=e.save_stats,
-        turn_based=e.turn_based,
-        update_interval=e.update_interval,
+        save_stats=env_cfg.save_stats,
+        turn_based=env_cfg.turn_based,
+        update_interval=env_cfg.update_interval,
         log_dir=log_dir,
-        match_name=e.match_name,
-        fps=e.fps,
-        replay=replay_path or e.replay,
-        continue_without_training=e.continue_without_training,
+        match_name=env_cfg.match_name,
+        fps=env_cfg.fps,
+        replay=replay_path or env_cfg.replay,
+        continue_without_training=env_cfg.continue_without_training,
     )
 
 
-class NativeBatchedVecEnv(VecEnv):
-    """Wraps a BombermanGymEnv that natively batches N envs in-process as an SB3 VecEnv."""
+class NativeBatchedVecEnv:
+    """Wrap a native batched Bomberman env with a vec-env-like interface."""
 
-    def __init__(self, batched_env):
+    def __init__(self, batched_env: BombermanGymEnv):
         self.env = batched_env
-        super().__init__(
-            num_envs=self.env.n_envs,
-            observation_space=self.env.single_observation_space,
-            action_space=self.env.single_action_space
-        )
-        self._actions = None
+        self.num_envs = self.env.n_envs
+        self.single_observation_space = self.env.single_observation_space
+        self.single_action_space = self.env.single_action_space
         self._last_infos: list[dict] = []
 
     def reset(self, seed=None, options=None):
@@ -95,47 +91,29 @@ class NativeBatchedVecEnv(VecEnv):
         self._last_infos = infos
         return obs
 
-    def step_async(self, actions: np.ndarray) -> None:
-        self._actions = actions
-
-    def step_wait(self):
-        obs, rewards, terminated, truncated, infos = self.env.step(self._actions)
+    def step(self, actions: np.ndarray):
+        obs, rewards, terminated, truncated, infos = self.env.step(actions)
         dones = terminated | truncated
         self._last_infos = infos
         return obs, rewards, dones, infos
-
-    def step(self, actions: np.ndarray):
-        self.step_async(actions)
-        return self.step_wait()
 
     def close(self) -> None:
         return self.env.close()
 
     def env_method(self, method_name: str, *args, **kwargs) -> list:
-        indices = kwargs.pop('indices', None)
-
+        indices = kwargs.pop("indices", None)
         result = getattr(self.env, method_name)(*args, **kwargs)
 
         if isinstance(result, np.ndarray) and result.ndim > 0 and result.shape[0] == self.num_envs:
             per_env = [result[i] for i in range(self.num_envs)]
-            if indices is not None:
-                return [per_env[i] for i in indices]
-            return per_env
+            return [per_env[i] for i in indices] if indices is not None else per_env
         elif isinstance(result, list) and len(result) == self.num_envs:
-            if indices is not None:
-                return [result[i] for i in indices]
-            return list(result)
-        else:
-            n = len(indices) if indices is not None else self.num_envs
-            return [result] * n
+            return [result[i] for i in indices] if indices is not None else list(result)
+        n = len(indices) if indices is not None else self.num_envs
+        return [result] * n
 
     def action_masks(self) -> np.ndarray:
         return self.env.action_masks()
-
-    def env_is_wrapped(self, wrapper_class: type, indices: list[int] | None = None) -> list[bool]:
-        if indices is None:
-            return [False] * self.num_envs
-        return [False] * len(indices)
 
     def get_attr(self, attr_name: str, indices: list[int] | None = None) -> list:
         attr = getattr(self.env, attr_name)
@@ -162,8 +140,11 @@ class NativeBatchedVecEnv(VecEnv):
             else:
                 setattr(self.env, attr_name, values[0] if isinstance(values, (list, np.ndarray)) else values)
 
-    def get_images(self) -> list[np.ndarray]:
-        return [None] * self.num_envs
+
+def _concat_obs(obs_list: list) -> dict:
+    """Concatenate observations across shards along the batch axis."""
+    keys = obs_list[0].keys()
+    return {k: np.concatenate([o[k] for o in obs_list], axis=0) for k in keys}
 
 
 def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, layer_config,
@@ -211,20 +192,16 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
             raise NotImplementedError(f"Unknown shard command: {cmd!r}")
 
 
-def _concat_obs(obs_list: list) -> dict:
-    """Dict obs -> concatenate each key across shards along the batch axis."""
-    keys = obs_list[0].keys()
-    return {k: np.concatenate([o[k] for o in obs_list], axis=0) for k in keys}
-
-
-class ShardedNativeBatchedVecEnv(VecEnv):
-    """Wraps N BombermanGymEnv shards, each natively batching M envs, as an SB3 VecEnv."""
+class ShardedNativeBatchedVecEnv:
+    """Wraps N BombermanGymEnv shards, each natively batching M envs, as a
+    single duck-typed vec-env, using multiprocessing pipes."""
 
     def __init__(self, cfg: TrainingConfig, opponents, log_dir: str, n_shards: int):
         if cfg.n_envs % n_shards != 0:
             raise ValueError(f"cfg.n_envs ({cfg.n_envs}) must be divisible by n_shards ({n_shards})")
         self.n_shards = n_shards
         self.shard_size = cfg.n_envs // n_shards
+        self.num_envs = cfg.n_envs
         self._cfg = cfg
 
         ctx = mp.get_context("spawn")
@@ -259,10 +236,8 @@ class ShardedNativeBatchedVecEnv(VecEnv):
             work_remote.close()
 
         self.remotes[0].send(("get_spaces", None))
-        obs_space, act_space = self.remotes[0].recv()
-
-        super().__init__(num_envs=cfg.n_envs, observation_space=obs_space, action_space=act_space)
-        self._actions = None
+        self.single_observation_space, self.single_action_space = self.remotes[0].recv()
+        self._last_infos: list[dict] = []
 
     def reset(self, seed=None, options=None):
         for remote in self.remotes:
@@ -272,11 +247,8 @@ class ShardedNativeBatchedVecEnv(VecEnv):
         self._last_infos = [info for infos in info_lists for info in infos]
         return _concat_obs(list(obs_list))
 
-    def step_async(self, actions: np.ndarray) -> None:
-        self._actions = actions
-
-    def step_wait(self):
-        shards = np.split(np.asarray(self._actions), self.n_shards)
+    def step(self, actions: np.ndarray):
+        shards = np.split(np.asarray(actions), self.n_shards)
         for remote, shard_actions in zip(self.remotes, shards):
             remote.send(("step", shard_actions))
         results = [remote.recv() for remote in self.remotes]
@@ -290,10 +262,6 @@ class ShardedNativeBatchedVecEnv(VecEnv):
         infos = [info for infos in info_lists for info in infos]
         self._last_infos = infos
         return obs, rewards, dones, infos
-
-    def step(self, actions: np.ndarray):
-        self.step_async(actions)
-        return self.step_wait()
 
     def close(self) -> None:
         for remote in self.remotes:
@@ -327,10 +295,6 @@ class ShardedNativeBatchedVecEnv(VecEnv):
             return [per_env[i] for i in indices]
         return per_env
 
-    def env_is_wrapped(self, wrapper_class: type, indices=None) -> list[bool]:
-        n = len(indices) if indices is not None else self.num_envs
-        return [False] * n
-
     def get_attr(self, attr_name: str, indices=None) -> list:
         for remote in self.remotes:
             remote.send(("get_attr", attr_name))
@@ -356,11 +320,63 @@ class ShardedNativeBatchedVecEnv(VecEnv):
         for remote in self.remotes:
             remote.recv()
 
-    def get_images(self) -> list:
-        return [None] * self.num_envs
+
+class NativeMonitor:
+    """Tracks per-episode reward/length over a trailing window, replacing
+    SB3's VecMonitor. Transparently forwards everything else to the wrapped
+    vec-env."""
+
+    def __init__(self, venv, window: int = 100):
+        self.venv = venv
+        self.num_envs = venv.num_envs
+        self.single_observation_space = venv.single_observation_space
+        self.single_action_space = venv.single_action_space
+
+        self._ep_rewards = np.zeros(self.num_envs, dtype=np.float64)
+        self._ep_lengths = np.zeros(self.num_envs, dtype=np.int64)
+        self._rew_window: deque = deque(maxlen=window)
+        self._len_window: deque = deque(maxlen=window)
+
+    def reset(self, seed=None, options=None):
+        self._ep_rewards[:] = 0
+        self._ep_lengths[:] = 0
+        return self.venv.reset(seed=seed, options=options)
+
+    def step(self, actions):
+        obs, rewards, dones, infos = self.venv.step(actions)
+        self._ep_rewards += rewards
+        self._ep_lengths += 1
+        for i, done in enumerate(dones):
+            if done:
+                self._rew_window.append(self._ep_rewards[i])
+                self._len_window.append(self._ep_lengths[i])
+                self._ep_rewards[i] = 0
+                self._ep_lengths[i] = 0
+        return obs, rewards, dones, infos
+
+    def action_masks(self):
+        return self.venv.action_masks()
+
+    def env_method(self, *args, **kwargs):
+        return self.venv.env_method(*args, **kwargs)
+
+    def get_attr(self, *args, **kwargs):
+        return self.venv.get_attr(*args, **kwargs)
+
+    def set_attr(self, *args, **kwargs):
+        return self.venv.set_attr(*args, **kwargs)
+
+    def close(self):
+        return self.venv.close()
+
+    def ep_rew_mean(self) -> Optional[float]:
+        return float(np.mean(self._rew_window)) if self._rew_window else None
+
+    def ep_len_mean(self) -> Optional[float]:
+        return float(np.mean(self._len_window)) if self._len_window else None
 
 
-def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
+def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> NativeMonitor:
     if cfg.n_shards > 1:
         vec_env = ShardedNativeBatchedVecEnv(cfg, opponents, log_dir, n_shards=cfg.n_shards)
     else:
@@ -374,27 +390,30 @@ def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
         )
         vec_env = NativeBatchedVecEnv(env)
 
-    return VecMonitor(vec_env, filename=None)
+    return NativeMonitor(vec_env)
 
 
-class OpponentResampleCallback(BaseCallback):
+class OpponentResampleCallback:
     """Resamples opponents every `every_n_timesteps` environment steps."""
 
     def __init__(self, pool: OpponentPool, every_n_timesteps: int, verbose: int = 0):
-        super().__init__(verbose)
         self.pool = pool
         self.every_n_timesteps = max(1, every_n_timesteps)
+        self.verbose = verbose
         self._next_resample_at = 0
 
-    def _on_training_start(self) -> None:
-        self._next_resample_at = self.num_timesteps + self.every_n_timesteps
+    def on_training_start(self, model: MaskableDQN, env) -> None:
+        self._next_resample_at = model.num_timesteps + self.every_n_timesteps
 
-    def _on_step(self) -> bool:
-        if self.num_timesteps < self._next_resample_at:
-            return True
-        self._next_resample_at = self.num_timesteps + self.every_n_timesteps
+    def on_rollout_start(self, model: MaskableDQN, env) -> None:
+        pass
 
-        self.training_env.env_method("set_opponent_resampler", OpponentSampler(self.pool))
+    def on_step(self, model: MaskableDQN, env) -> None:
+        if model.num_timesteps < self._next_resample_at:
+            return
+        self._next_resample_at = model.num_timesteps + self.every_n_timesteps
+
+        env.env_method("set_opponent_resampler", OpponentSampler(self.pool))
 
         if self.verbose:
             arrangement_str = ", ".join(
@@ -403,11 +422,34 @@ class OpponentResampleCallback(BaseCallback):
             scenario_str = ", ".join(
                 f"{scenario} {p:.0%}" for scenario, p in self.pool.scenario_distribution()
             )
-            print(f"[opponents] timesteps={self.num_timesteps}: resynced self-play pool "
+            print(f"[opponents] timesteps={model.num_timesteps}: resynced self-play pool "
                   f"({self.pool.num_checkpoints} checkpoint(s)) to training env "
                   f"-- distribution: {arrangement_str}")
-            print(f"[scenario] timesteps={self.num_timesteps}: distribution: {scenario_str}")
-        return True
+            print(f"[scenario] timesteps={model.num_timesteps}: distribution: {scenario_str}")
+
+
+class ScheduleCallback:
+    """Applies training schedule overrides at the start of each rollout."""
+
+    def __init__(self, cfg: TrainingConfig, ckman: CheckpointManager, schedule: list[dict],
+                 applied_idx: int = -1, verbose: int = 1):
+        self.cfg = cfg
+        self.ckman = ckman
+        self.schedule = schedule
+        self.applied_idx = applied_idx
+        self.verbose = verbose
+
+    def on_training_start(self, model: MaskableDQN, env) -> None:
+        pass
+
+    def on_rollout_start(self, model: MaskableDQN, env) -> None:
+        self.applied_idx = apply_schedule_up_to(
+            self.cfg, self.schedule, model.num_timesteps, self.applied_idx,
+            model=model, env=env, ckman=self.ckman, verbose=bool(self.verbose),
+        )
+
+    def on_step(self, model: MaskableDQN, env) -> None:
+        pass
 
 
 def architecture_info(cfg: TrainingConfig) -> dict:
@@ -420,14 +462,12 @@ def architecture_info(cfg: TrainingConfig) -> dict:
     }
 
 
-def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str, device: str) -> MaskableDQN:
-    policy_kwargs = dict(features_extractor_class=BombermanFeatureExtractor)
+def build_model(env, cfg: TrainingConfig, device: str) -> MaskableDQN:
+    exploration_duration = max(1, int(cfg.dqn.exploration_fraction * cfg.total_timesteps))
     return MaskableDQN(
-        "MultiInputPolicy",
-        env,
-        policy_kwargs=policy_kwargs,
-        tensorboard_log=tensorboard_log,
-        verbose=1,
+        env.single_observation_space,
+        env.single_action_space,
+        n_envs=cfg.n_envs,
         device=device,
         learning_rate=cfg.dqn.learning_rate,
         buffer_size=cfg.dqn.buffer_size,
@@ -442,24 +482,27 @@ def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str, device: 
         exploration_initial_eps=cfg.dqn.exploration_initial_eps,
         exploration_final_eps=cfg.dqn.exploration_final_eps,
         max_grad_norm=cfg.dqn.max_grad_norm,
+        exploration_duration=exploration_duration,
     )
 
 
-def apply_dqn_hyperparams(model: MaskableDQN, dqn_cfg: DQNConfig) -> None:
+def apply_dqn_hyperparams(model: MaskableDQN, dqn_cfg: DQNConfig, total_timesteps: int) -> None:
     """Update a live MaskableDQN model's hyperparameters to match a new DQNConfig."""
     model.learning_rate = dqn_cfg.learning_rate
-    model.lr_schedule = get_schedule_fn(dqn_cfg.learning_rate)
+    for group in model.optimizer.param_groups:
+        group["lr"] = dqn_cfg.learning_rate
     model.tau = dqn_cfg.tau
     model.gamma = dqn_cfg.gamma
-    model.train_freq = TrainFreq(dqn_cfg.train_freq, TrainFrequencyUnit.STEP)
+    model.train_freq = max(1, int(dqn_cfg.train_freq))
     model.gradient_steps = dqn_cfg.gradient_steps
-    model.target_update_interval = dqn_cfg.target_update_interval
+    model.target_update_interval = max(1, int(dqn_cfg.target_update_interval))
     model.max_grad_norm = dqn_cfg.max_grad_norm
     model.exploration_initial_eps = dqn_cfg.exploration_initial_eps
     model.exploration_final_eps = dqn_cfg.exploration_final_eps
     model.exploration_fraction = dqn_cfg.exploration_fraction
+    model.exploration_duration = max(1, int(dqn_cfg.exploration_fraction * total_timesteps))
     model.exploration_schedule = LinearSchedule(
-        dqn_cfg.exploration_initial_eps, dqn_cfg.exploration_final_eps, dqn_cfg.exploration_fraction,
+        dqn_cfg.exploration_initial_eps, dqn_cfg.exploration_final_eps, model.exploration_duration,
     )
 
 
@@ -496,34 +539,13 @@ def apply_schedule_up_to(
 
     if any_applied:
         if model is not None:
-            apply_dqn_hyperparams(model, cfg.dqn)
+            apply_dqn_hyperparams(model, cfg.dqn, cfg.total_timesteps)
         if env is not None:
             env.env_method("set_reward_config", cfg.rewards)
         if ckman is not None:
             ckman.update_manifest_config()
 
     return target_idx
-
-
-class ScheduleCallback(BaseCallback):
-    """Applies training schedule overrides at the start of each rollout."""
-
-    def __init__(self, cfg: TrainingConfig, ckman: CheckpointManager, schedule: list[dict],
-                 applied_idx: int = -1, verbose: int = 1):
-        super().__init__(verbose)
-        self.cfg = cfg
-        self.ckman = ckman
-        self.schedule = schedule
-        self.applied_idx = applied_idx
-
-    def _on_step(self) -> bool:
-        return True
-
-    def _on_rollout_start(self) -> None:
-        self.applied_idx = apply_schedule_up_to(
-            self.cfg, self.schedule, self.model.num_timesteps, self.applied_idx,
-            model=self.model, env=self.training_env, ckman=self.ckman, verbose=bool(self.verbose),
-        )
 
 
 def run(
@@ -578,7 +600,7 @@ def run(
     env = make_train_env(cfg, opponents, str(ckman.logs_dir))
     env.env_method("set_opponent_resampler", OpponentSampler(pool))
 
-    model = build_model(env, cfg, str(ckman.tensorboard_dir), device)
+    model = build_model(env, cfg, device)
 
     timesteps_done = 0
     if resume_from:
@@ -589,7 +611,7 @@ def run(
         if checkpoint_dir is not None:
             model = ckman.load_model(MaskableDQN, checkpoint_dir, env=env, device=device)
             timesteps_done = ckman.resolved_timesteps(checkpoint_dir)
-            apply_dqn_hyperparams(model, cfg.dqn)
+            apply_dqn_hyperparams(model, cfg.dqn, cfg.total_timesteps)
             print(f"Loaded checkpoint {checkpoint_dir.name} ({timesteps_done} timesteps)")
         else:
             print("No checkpoint found in this run yet -- starting from scratch.")
@@ -607,25 +629,23 @@ def run(
     schedule_callback = ScheduleCallback(
         cfg, ckman, schedule or [], applied_idx=schedule_applied_idx, verbose=1,
     )
-    learn_callback = CallbackList([opponent_callback, schedule_callback])
+    learn_callbacks = [opponent_callback, schedule_callback]
 
     while timesteps_done < cfg.total_timesteps:
         chunk = min(cfg.save_every_timesteps, cfg.total_timesteps - timesteps_done)
 
-        model.learn(
-            total_timesteps=chunk,
-            reset_num_timesteps=False,
-            tb_log_name="DQN",
-            callback=learn_callback,
-        )
+        model.learn(env=env, total_timesteps=chunk, callbacks=learn_callbacks)
         timesteps_done = model.num_timesteps
 
-        ep_rew_mean = model.logger.name_to_value.get("rollout/ep_rew_mean")
-        ep_len_mean = model.logger.name_to_value.get("rollout/ep_len_mean")
+        ep_rew_mean = env.ep_rew_mean()
+        ep_len_mean = env.ep_len_mean()
         if ep_rew_mean is not None:
             print(f"  ep_rew_mean: {ep_rew_mean:.4f}")
         if ep_len_mean is not None:
             print(f"  ep_len_mean: {ep_len_mean:.1f}")
+        if model.last_loss_mean is not None:
+            print(f"  loss_mean: {model.last_loss_mean:.5f}")
+        print(f"  exploration_rate: {model.exploration_rate:.4f}")
 
         ckpt_dir = ckman.save_checkpoint(
             model,
