@@ -5,10 +5,11 @@ import time
 from typing import Optional
 
 from environment import WorldArgs
-from agent_code.ppo_agent.gym_environment import ACTION_INDICES, BombermanGymEnv
-from agent_code.dqn_agent.checkpoint_manager import CheckpointManager
-from agent_code.dqn_agent.config import DEFAULT_CONFIG
-from agent_code.dqn_agent.model import MaskableDQN
+
+from .checkpoint_manager import CheckpointManager
+from .config import DEFAULT_CONFIG
+from .gym_environment import ACTION_INDICES, BombermanGymEnv
+from .model import MaskableDQN
 
 RUN: str = "run_20260901-120000"
 CHECKPOINT: Optional[str] = None
@@ -76,10 +77,7 @@ def _get_dummy_env(run_dir: pathlib.Path) -> BombermanGymEnv:
 
 
 def setup(self):
-    """
-    Called once at the start of a match.
-    Loads the trained MaskableDQN checkpoint and prepares a BombermanGymEnv for observation conversion.
-    """
+    """Load the trained MaskableDQN checkpoint and prepare a BombermanGymEnv for observation conversion."""
     _RUN_DIR = _resolve_run_dir()
 
     self._dqn_model = _load_model(_RUN_DIR, CHECKPOINT)
@@ -87,10 +85,7 @@ def setup(self):
 
 
 def act(self, game_state: dict) -> str:
-    """
-    Called on every game step.
-    Converts the game_state to an observation, applies action masks, and uses the trained MaskableDQN model to predict the next action.
-    """
+    """Convert game_state to an observation, apply action masks, and predict the next action."""
     time_start = time.time()
 
     obs_env = self._dqn_obs_env

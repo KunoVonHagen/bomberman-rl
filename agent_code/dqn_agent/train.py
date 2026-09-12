@@ -2,26 +2,411 @@ from __future__ import annotations
 
 import argparse
 import copy
+import multiprocessing as mp
+import pathlib
 from multiprocessing import freeze_support
 from typing import Optional
 
+import numpy as np
+import torch
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.utils import get_schedule_fn, LinearSchedule
 from stable_baselines3.common.type_aliases import TrainFreq, TrainFrequencyUnit
-from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.vec_env import VecEnv, VecMonitor
 
-from agent_code.ppo_agent.train import (
-    resolve_device,
-    make_train_env,
-    OpponentResampleCallback,
-)
-from agent_code.ppo_agent.config import load_overrides_file
-from agent_code.ppo_agent.training_schedule import DEFAULT_SCHEDULE, load_schedule
+from environment import WorldArgs
 
-from .config import DEFAULT_CONFIG, TrainingConfig, DQNConfig
+from .config import DEFAULT_CONFIG, TrainingConfig, DQNConfig, RewardConfig, load_overrides_file
 from .checkpoint_manager import CheckpointManager
-from .opponent_pool import OpponentPool, OpponentSampler
+from .gym_environment import BombermanGymEnv
 from .model import BombermanFeatureExtractor, MaskableDQN
+from .opponent_pool import OpponentPool, OpponentSampler
+from .training_schedule import DEFAULT_SCHEDULE, load_schedule
+
+
+def resolve_device(requested: str = "auto") -> str:
+    """Resolve the device string to use for PyTorch (and SB3) training."""
+    if requested != "auto":
+        device = requested
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print("=" * 60)
+    print(f"[device] requested={requested!r} -> resolved={device!r}")
+    print(f"[device] torch.cuda.is_available() = {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        idx = torch.cuda.current_device()
+        print(f"[device] GPU: {torch.cuda.get_device_name(idx)}")
+        props = torch.cuda.get_device_properties(idx)
+        print(f"[device] Total VRAM: {props.total_memory / 1024**3:.1f} GB")
+    elif device == "cuda":
+        raise RuntimeError(
+            "device='cuda' was requested/forced but torch.cuda.is_available() "
+            "is False. Check CUDA module / driver / torch build on this node."
+        )
+    else:
+        print("[device] Running on CPU. This will be slow for the CNN "
+              "feature extractor -- check that a GPU partition/module was "
+              "requested if that wasn't intentional.")
+    print("=" * 60)
+    return device
+
+
+def build_world_args(
+    cfg: TrainingConfig,
+    log_dir: str,
+    save_replay: bool,
+    replay_path: str | None = None,
+) -> WorldArgs:
+    e = cfg.env
+    return WorldArgs(
+        scenario=e.scenario,
+        seed=e.seed,
+        silence_errors=e.silence_errors,
+        no_gui=e.no_gui,
+        make_video=e.make_video,
+        save_replay=save_replay,
+        save_stats=e.save_stats,
+        turn_based=e.turn_based,
+        update_interval=e.update_interval,
+        log_dir=log_dir,
+        match_name=e.match_name,
+        fps=e.fps,
+        replay=replay_path or e.replay,
+        continue_without_training=e.continue_without_training,
+    )
+
+
+class NativeBatchedVecEnv(VecEnv):
+    """Wraps a BombermanGymEnv that natively batches N envs in-process as an SB3 VecEnv."""
+
+    def __init__(self, batched_env):
+        self.env = batched_env
+        super().__init__(
+            num_envs=self.env.n_envs,
+            observation_space=self.env.single_observation_space,
+            action_space=self.env.single_action_space
+        )
+        self._actions = None
+        self._last_infos: list[dict] = []
+
+    def reset(self, seed=None, options=None):
+        obs, infos = self.env.reset(seed=seed, options=options)
+        self._last_infos = infos
+        return obs
+
+    def step_async(self, actions: np.ndarray) -> None:
+        self._actions = actions
+
+    def step_wait(self):
+        obs, rewards, terminated, truncated, infos = self.env.step(self._actions)
+        dones = terminated | truncated
+        self._last_infos = infos
+        return obs, rewards, dones, infos
+
+    def step(self, actions: np.ndarray):
+        self.step_async(actions)
+        return self.step_wait()
+
+    def close(self) -> None:
+        return self.env.close()
+
+    def env_method(self, method_name: str, *args, **kwargs) -> list:
+        indices = kwargs.pop('indices', None)
+
+        result = getattr(self.env, method_name)(*args, **kwargs)
+
+        if isinstance(result, np.ndarray) and result.ndim > 0 and result.shape[0] == self.num_envs:
+            per_env = [result[i] for i in range(self.num_envs)]
+            if indices is not None:
+                return [per_env[i] for i in indices]
+            return per_env
+        elif isinstance(result, list) and len(result) == self.num_envs:
+            if indices is not None:
+                return [result[i] for i in indices]
+            return list(result)
+        else:
+            n = len(indices) if indices is not None else self.num_envs
+            return [result] * n
+
+    def action_masks(self) -> np.ndarray:
+        return self.env.action_masks()
+
+    def env_is_wrapped(self, wrapper_class: type, indices: list[int] | None = None) -> list[bool]:
+        if indices is None:
+            return [False] * self.num_envs
+        return [False] * len(indices)
+
+    def get_attr(self, attr_name: str, indices: list[int] | None = None) -> list:
+        attr = getattr(self.env, attr_name)
+        if indices is None:
+            if isinstance(attr, (list, np.ndarray)) and len(attr) == self.num_envs:
+                return list(attr)
+            return [attr] * self.num_envs
+        if isinstance(attr, (list, np.ndarray)) and len(attr) == self.num_envs:
+            return [attr[i] for i in indices]
+        return [attr] * len(indices)
+
+    def set_attr(self, attr_name: str, values, indices: list[int] | None = None) -> None:
+        if indices is None:
+            setattr(self.env, attr_name, values)
+        else:
+            current = getattr(self.env, attr_name)
+            if isinstance(current, (list, np.ndarray)) and len(current) == self.num_envs:
+                if isinstance(current, np.ndarray):
+                    current[indices] = values
+                else:
+                    for idx, val in zip(indices, values):
+                        current[idx] = val
+                setattr(self.env, attr_name, current)
+            else:
+                setattr(self.env, attr_name, values[0] if isinstance(values, (list, np.ndarray)) else values)
+
+    def get_images(self) -> list[np.ndarray]:
+        return [None] * self.num_envs
+
+
+def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, layer_config,
+                   shard_n_envs: int, reward_config: Optional[RewardConfig] = None):
+    """Run a single shard's BombermanGymEnv, serving commands from the parent process."""
+    parent_remote.close()
+
+    world_args = WorldArgs(**world_args_kwargs)
+    env = BombermanGymEnv(
+        world_args, opponents=opponents, layer_config=layer_config,
+        n_envs=shard_n_envs, reward_config=reward_config,
+    )
+
+    while True:
+        try:
+            cmd, data = remote.recv()
+        except EOFError:
+            break
+
+        if cmd == "step":
+            obs, rewards, terminated, truncated, infos = env.step(data)
+            remote.send((obs, rewards, terminated, truncated, infos))
+        elif cmd == "reset":
+            seed, options = data
+            obs, infos = env.reset(seed=seed, options=options)
+            remote.send((obs, infos))
+        elif cmd == "action_masks":
+            remote.send(env.action_masks())
+        elif cmd == "env_method":
+            method_name, args, kwargs = data
+            remote.send(getattr(env, method_name)(*args, **kwargs))
+        elif cmd == "get_spaces":
+            remote.send((env.single_observation_space, env.single_action_space))
+        elif cmd == "get_attr":
+            remote.send(getattr(env, data))
+        elif cmd == "set_attr":
+            attr_name, value = data
+            setattr(env, attr_name, value)
+            remote.send(None)
+        elif cmd == "close":
+            env.close()
+            remote.close()
+            break
+        else:
+            raise NotImplementedError(f"Unknown shard command: {cmd!r}")
+
+
+def _concat_obs(obs_list: list) -> dict:
+    """Dict obs -> concatenate each key across shards along the batch axis."""
+    keys = obs_list[0].keys()
+    return {k: np.concatenate([o[k] for o in obs_list], axis=0) for k in keys}
+
+
+class ShardedNativeBatchedVecEnv(VecEnv):
+    """Wraps N BombermanGymEnv shards, each natively batching M envs, as an SB3 VecEnv."""
+
+    def __init__(self, cfg: TrainingConfig, opponents, log_dir: str, n_shards: int):
+        if cfg.n_envs % n_shards != 0:
+            raise ValueError(f"cfg.n_envs ({cfg.n_envs}) must be divisible by n_shards ({n_shards})")
+        self.n_shards = n_shards
+        self.shard_size = cfg.n_envs // n_shards
+        self._cfg = cfg
+
+        ctx = mp.get_context("spawn")
+        self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(n_shards)])
+        self.processes = []
+        for i, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
+            e = cfg.env
+            world_args_kwargs = dict(
+                scenario=e.scenario,
+                seed=e.seed,
+                silence_errors=e.silence_errors,
+                no_gui=e.no_gui,
+                make_video=e.make_video,
+                save_replay=False,
+                save_stats=e.save_stats,
+                turn_based=e.turn_based,
+                update_interval=e.update_interval,
+                log_dir=str(pathlib.Path(log_dir) / f"shard_{i}"),
+                match_name=e.match_name,
+                fps=e.fps,
+                replay=e.replay,
+                continue_without_training=e.continue_without_training,
+            )
+            p = ctx.Process(
+                target=_shard_worker,
+                args=(work_remote, remote, world_args_kwargs, opponents, e.layer_config,
+                      self.shard_size, cfg.rewards),
+                daemon=True,
+            )
+            p.start()
+            self.processes.append(p)
+            work_remote.close()
+
+        self.remotes[0].send(("get_spaces", None))
+        obs_space, act_space = self.remotes[0].recv()
+
+        super().__init__(num_envs=cfg.n_envs, observation_space=obs_space, action_space=act_space)
+        self._actions = None
+
+    def reset(self, seed=None, options=None):
+        for remote in self.remotes:
+            remote.send(("reset", (seed, options)))
+        results = [remote.recv() for remote in self.remotes]
+        obs_list, info_lists = zip(*results)
+        self._last_infos = [info for infos in info_lists for info in infos]
+        return _concat_obs(list(obs_list))
+
+    def step_async(self, actions: np.ndarray) -> None:
+        self._actions = actions
+
+    def step_wait(self):
+        shards = np.split(np.asarray(self._actions), self.n_shards)
+        for remote, shard_actions in zip(self.remotes, shards):
+            remote.send(("step", shard_actions))
+        results = [remote.recv() for remote in self.remotes]
+        obs_list, rew_list, term_list, trunc_list, info_lists = zip(*results)
+
+        obs = _concat_obs(list(obs_list))
+        rewards = np.concatenate(rew_list, axis=0)
+        terminated = np.concatenate(term_list, axis=0)
+        truncated = np.concatenate(trunc_list, axis=0)
+        dones = terminated | truncated
+        infos = [info for infos in info_lists for info in infos]
+        self._last_infos = infos
+        return obs, rewards, dones, infos
+
+    def step(self, actions: np.ndarray):
+        self.step_async(actions)
+        return self.step_wait()
+
+    def close(self) -> None:
+        for remote in self.remotes:
+            try:
+                remote.send(("close", None))
+            except (BrokenPipeError, OSError):
+                pass
+        for p in self.processes:
+            p.join(timeout=5)
+
+    def action_masks(self) -> np.ndarray:
+        for remote in self.remotes:
+            remote.send(("action_masks", None))
+        return np.concatenate([remote.recv() for remote in self.remotes], axis=0)
+
+    def env_method(self, method_name: str, *args, indices=None, **kwargs) -> list:
+        for remote in self.remotes:
+            remote.send(("env_method", (method_name, args, kwargs)))
+        results = [remote.recv() for remote in self.remotes]
+
+        per_env = []
+        for result in results:
+            if isinstance(result, np.ndarray) and result.ndim > 0 and result.shape[0] == self.shard_size:
+                per_env.extend(result[i] for i in range(self.shard_size))
+            elif isinstance(result, list) and len(result) == self.shard_size:
+                per_env.extend(result)
+            else:
+                per_env.extend([result] * self.shard_size)
+
+        if indices is not None:
+            return [per_env[i] for i in indices]
+        return per_env
+
+    def env_is_wrapped(self, wrapper_class: type, indices=None) -> list[bool]:
+        n = len(indices) if indices is not None else self.num_envs
+        return [False] * n
+
+    def get_attr(self, attr_name: str, indices=None) -> list:
+        for remote in self.remotes:
+            remote.send(("get_attr", attr_name))
+
+        per_env = []
+        for remote in self.remotes:
+            value = remote.recv()
+            per_env.extend([value] * self.shard_size)
+        if indices is not None:
+            return [per_env[i] for i in indices]
+        return per_env
+
+    def set_attr(self, attr_name: str, values, indices=None) -> None:
+        if indices is not None:
+            raise NotImplementedError(
+                "set_attr with per-index targeting isn't supported by "
+                "ShardedNativeBatchedVecEnv -- shard boundaries don't map "
+                "cleanly onto arbitrary env indices."
+            )
+        value = values[0] if isinstance(values, (list, np.ndarray)) else values
+        for remote in self.remotes:
+            remote.send(("set_attr", (attr_name, value)))
+        for remote in self.remotes:
+            remote.recv()
+
+    def get_images(self) -> list:
+        return [None] * self.num_envs
+
+
+def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
+    if cfg.n_shards > 1:
+        vec_env = ShardedNativeBatchedVecEnv(cfg, opponents, log_dir, n_shards=cfg.n_shards)
+    else:
+        world_args = build_world_args(cfg, log_dir, save_replay=False)
+        env = BombermanGymEnv(
+            world_args,
+            opponents=opponents,
+            layer_config=cfg.env.layer_config,
+            n_envs=cfg.n_envs,
+            reward_config=cfg.rewards,
+        )
+        vec_env = NativeBatchedVecEnv(env)
+
+    return VecMonitor(vec_env, filename=None)
+
+
+class OpponentResampleCallback(BaseCallback):
+    """Resamples opponents at the end of each training rollout."""
+
+    def __init__(self, pool: OpponentPool, every_n_rollouts: int = 1, verbose: int = 0):
+        super().__init__(verbose)
+        self.pool = pool
+        self.every_n_rollouts = max(1, every_n_rollouts)
+        self._rollout_count = 0
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_start(self) -> None:
+        self._rollout_count += 1
+        if (self._rollout_count - 1) % self.every_n_rollouts != 0:
+            return
+
+        self.training_env.env_method("set_opponent_resampler", OpponentSampler(self.pool))
+
+        if self.verbose:
+            arrangement_str = ", ".join(
+                f"{label} {p:.0%}" for label, p in self.pool.arrangement_distribution()
+            )
+            scenario_str = ", ".join(
+                f"{scenario} {p:.0%}" for scenario, p in self.pool.scenario_distribution()
+            )
+            print(f"[opponents] rollout {self._rollout_count}: resynced self-play pool "
+                  f"({self.pool.num_checkpoints} checkpoint(s)) to training env "
+                  f"-- distribution: {arrangement_str}")
+            print(f"[scenario] rollout {self._rollout_count}: distribution: {scenario_str}")
 
 
 def architecture_info(cfg: TrainingConfig) -> dict:

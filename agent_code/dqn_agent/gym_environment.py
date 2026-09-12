@@ -10,7 +10,7 @@ from numba import njit
 
 import settings as s
 import events as e
-from agent_code.ppo_agent.rewards import (
+from .rewards import (
     EVENT_REWARDS,
     CRATE_SHAPING_COEF,
     COIN_SHAPING_COEF,
@@ -19,7 +19,7 @@ from agent_code.ppo_agent.rewards import (
     TRAP_SHAPING_COEF,
     build_event_rewards,
 )
-from agent_code.ppo_agent.config import RewardConfig
+from .config import RewardConfig
 
 WorldArgs = namedtuple(
     "WorldArgs",
@@ -107,7 +107,8 @@ _EXPLOSION_STAGE1_TICKS = 2
 
 MAX_OPPONENTS = 3
 
-WALL_LAYER, CRATE_LAYER, COIN_LAYER, SELF_LAYER, SELF_BLAST_LAYER, OPPONENT_LAYER, OPPONENT_DANGER_LAYER, BOMBS_LEFT_LAYER = range(8)
+WALL_LAYER, CRATE_LAYER, COIN_LAYER, SELF_LAYER, SELF_BLAST_LAYER, OPPONENT_LAYER, OPPONENT_DANGER_LAYER, BOMBS_LEFT_LAYER = range(
+    8)
 _BASE_LAYERS = 8 + 2 * s.BOMB_TIMER + s.EXPLOSION_TIMER
 
 DANGER_MAP_LAYERS = [_BASE_LAYERS + t for t in range(s.BOMB_TIMER + s.EXPLOSION_TIMER)]
@@ -128,7 +129,7 @@ _OCC_SLICE = slice(OCCUPIED_MAP_LAYERS[0], OCCUPIED_MAP_LAYERS[-1] + 1)
 
 LAYER_GROUPS: Dict[str, List[int]] = {
     "base": [WALL_LAYER, CRATE_LAYER, COIN_LAYER, SELF_LAYER, SELF_BLAST_LAYER,
-              OPPONENT_LAYER, OPPONENT_DANGER_LAYER, BOMBS_LEFT_LAYER],
+             OPPONENT_LAYER, OPPONENT_DANGER_LAYER, BOMBS_LEFT_LAYER],
     "timer_channels": list(range(8, _BASE_LAYERS)),
     "forecast": list(DANGER_MAP_LAYERS) + list(OCCUPIED_MAP_LAYERS),
     "self_distance": [SELF_DISTANCE_LAYER],
@@ -391,6 +392,7 @@ def _forecast_kernel(bomb_x, bomb_y, bomb_timer, bomb_counts, blast_tensor,
             for yy in range(height):
                 of[xx, yy] = wall[xx, yy] or remaining_crates[xx, yy]
 
+
 class BombermanGymEnv(gym.Env):
     """
     A Gymnasium environment for the Bomberman game, supporting multiple parallel games and various observation layers.
@@ -399,15 +401,15 @@ class BombermanGymEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
 
     def __init__(
-        self,
-        args,
-        opponents: List[Tuple[Callable[["AgentHandle"], None], Callable[["AgentHandle", dict], "Optional[str]"]]],
-        reward_fn=None,
-        reward_config: Optional[RewardConfig] = None,
-        render_mode=None,
-        layer_config: Optional[Iterable[str]] = None,
-        n_envs: int = 1,
-        auto_reset: bool = True,
+            self,
+            args,
+            opponents: List[Tuple[Callable[["AgentHandle"], None], Callable[["AgentHandle", dict], "Optional[str]"]]],
+            reward_fn=None,
+            reward_config: Optional[RewardConfig] = None,
+            render_mode=None,
+            layer_config: Optional[Iterable[str]] = None,
+            n_envs: int = 1,
+            auto_reset: bool = True,
     ):
         super().__init__()
         self.args = args
@@ -566,7 +568,6 @@ class BombermanGymEnv(gym.Env):
             self.PRECOMPUTED_BLAST_COORDS[(x, y)] = coords
             xs_, ys_ = zip(*coords)
             self._blast_tensor[x, y, list(xs_), list(ys_)] = 1.0
-
 
     @staticmethod
     def available_layer_groups() -> Dict[str, List[int]]:
@@ -738,7 +739,6 @@ class BombermanGymEnv(gym.Env):
             self._prev_crate_dist[env] = np.nan if kd is None else kd
             self._prev_bomb_danger[env] = self._bomb_danger_now(env)
             self._prev_trap_dist[env] = self._trapped_opponent_distance_now(env)
-
 
     def _refresh_dynamic_layers(self):
         gt = self.grid_tensor
@@ -913,7 +913,6 @@ class BombermanGymEnv(gym.Env):
         if self._enable_mobility:
             self._compute_mobility()
         self._compute_distance_fields()
-
 
     def _get_centered_tensor(self) -> np.ndarray:
         """Batched centering: (n_envs, L, W, H) with each env centered on its agent."""
@@ -1619,7 +1618,7 @@ class BombermanGymEnv(gym.Env):
     def action_masks(self) -> np.ndarray:
         """
         Returns a boolean array of shape (n_envs, 6) indicating which actions
-        are valid. MaskablePPO will use this to prevent illegal moves.
+        are valid. the policy will use this to prevent illegal moves.
         """
         E = self.n_envs
         W, H = self.width, self.height
