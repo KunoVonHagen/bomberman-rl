@@ -1,17 +1,84 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict, ClassVar
-from typing import Optional
+from dataclasses import dataclass, field, asdict, is_dataclass, fields as dataclass_fields
+from typing import Optional, List, Literal, ClassVar
 import json
 
-from agent_code.ppo_agent.config import (
-    EnvConfig,
-    RewardConfig,
-    SelfPlayConfig,
-    OpponentArrangement,
-    TrainingConfig as _PPOTrainingConfig,
-    _coerce_value,
-)
+
+def _coerce_dataclass_list(cls, raw: str) -> list:
+    """Coerce a raw string into a list of dataclass instances of type `cls`.
+
+    The raw string can be a JSON array of objects, or a semicolon-separated
+    list of comma-separated values corresponding to the dataclass fields.
+    """
+    trimmed = raw.strip()
+    if trimmed.startswith("[") or trimmed.startswith("{"):
+        parsed = json.loads(trimmed)
+        return [cls(**item) if isinstance(item, dict) else item for item in parsed]
+
+    field_specs = dataclass_fields(cls)
+    items = []
+    for chunk in trimmed.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [p.strip() for p in chunk.split(",")]
+        if len(parts) > len(field_specs):
+            raise ValueError(
+                f"Too many values in '{chunk}' for {cls.__name__} "
+                f"(expected at most {len(field_specs)}: "
+                f"{', '.join(f.name for f in field_specs)})"
+            )
+        kwargs = {}
+        for f, val in zip(field_specs, parts):
+            kwargs[f.name] = _coerce_value(f.default, val)
+        items.append(cls(**kwargs))
+    return items
+
+
+def _coerce_value(current, raw):
+    """Coerce a raw string value into the type of `current`."""
+    if not isinstance(raw, str):
+        return raw
+    if isinstance(current, bool):
+        return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+    if isinstance(current, int) and not isinstance(current, bool):
+        return int(float(raw))
+    if isinstance(current, float):
+        return float(raw)
+    if isinstance(current, list):
+        if current and is_dataclass(current[0]):
+            return _coerce_dataclass_list(type(current[0]), raw)
+        return [x for x in raw.split(",") if x]
+    if current is None:
+        if raw.strip().lower() in ("none", "null", ""):
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return raw
+    return raw
+
+
+def load_overrides_file(path) -> dict:
+    """Load a dict of dotted-key overrides from a JSON file.
+
+    This is the file-based counterpart to `--set path.to.field=value` on the
+    CLI: point --overrides-file at one of these, or drop a file named
+    'config_overrides.json' in a run's directory to have it picked up
+    automatically on --resume (see train.py:run()).
+    """
+    import pathlib as _pathlib
+    path = _pathlib.Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"overrides file not found: {path}")
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"overrides file {path} must contain a JSON object of "
+            f"'dotted.key': value pairs, got {type(data).__name__}"
+        )
+    return data
 
 
 @dataclass
@@ -30,6 +97,113 @@ class DQNConfig:
     exploration_initial_eps: float = 1.0
     exploration_final_eps: float = 0.05
     max_grad_norm: float = 10.0
+
+
+@dataclass(frozen=True)
+class ScenarioArrangement:
+    """One entry in a training-scenario mix.
+
+    Play `scenario` for the next batch of rounds with probability
+    proportional to `weight` (see EnvConfig.scenario_mix). Parsed the same
+    way as OpponentArrangement -- "classic,0.85;coin-heaven,0.15" or JSON.
+    """
+    scenario: str = "classic"
+    weight: float = 1.0
+
+
+@dataclass
+class EnvConfig:
+    """Configuration for the Bomberman environment.
+
+    Passed to the BombermanGymEnv constructor.
+    """
+    scenario: str = "classic"
+    seed: Optional[int] = None
+    silence_errors: bool = True
+    no_gui: bool = True
+    make_video: bool = False
+    save_replay: bool = False
+    save_stats: bool = True
+    turn_based: bool = False
+    update_interval: float = 0.1
+    match_name: Optional[str] = None
+    fps: int = 60
+    replay: Optional[str] = None
+    continue_without_training: bool = False
+    scenario_mix: List[ScenarioArrangement] = field(
+        default_factory=lambda: [ScenarioArrangement(scenario="classic", weight=1.0)]
+    )
+
+    layer_config: List[str] = field(default_factory=lambda: [
+        "base",
+        "timer_channels",
+        "forecast",
+        "self_distance",
+        "opponent_distance",
+        "crate_potential",
+        "danger_summary",
+        "mobility",
+        "crate_distance",
+        "coin_distance",
+    ])
+
+
+@dataclass
+class RewardConfig:
+    """Configuration for reward shaping in the Bomberman environment.
+
+    Passed to the BombermanGymEnv constructor.
+    """
+    waited: float = -0.01
+    invalid_action: float = -0.2
+    bomb_dropped: float = 0.0
+    bomb_exploded: float = 0.0
+    crate_destroyed: float = 0.3
+    coin_found: float = 0.0
+    coin_collected: float = 1.0
+    killed_opponent: float = 5.0
+    killed_self: float = -1.0
+    got_killed: float = -5.0
+    opponent_eliminated: float = 0.0
+    survived_round: float = 0.0
+
+    coin_shaping_coef: float = 0.05
+    crate_shaping_coef: float = 0.02
+    danger_penalty_coef: float = 0.05
+    escape_bonus_coef: float = 0.05
+    trap_shaping_coef: float = 0.1
+
+
+@dataclass(frozen=True)
+class OpponentArrangement:
+    """A single opponent lineup configuration for self-play.
+
+    The agent faces `n_static` static opponents and `n_self_play` self-play
+    opponents per game. `weight` sets how often this arrangement is sampled
+    relative to others.
+    """
+    n_static: int = 1
+    n_self_play: int = 2
+    weight: float = 1.0
+
+
+@dataclass
+class SelfPlayConfig:
+    """Configuration for self-play training against static and checkpoint opponents."""
+    enabled: bool = False
+    static_opponents: List[str] = field(default_factory=list)
+
+    arrangements: List[OpponentArrangement] = field(
+        default_factory=lambda: [OpponentArrangement(n_static=1, n_self_play=2, weight=1.0)]
+    )
+    allow_repeat_static_opponents: bool = True
+    shuffle_opponent_order: bool = True
+    resample_every_n_rollouts: int = 1
+
+    pool_size: int = 8
+    add_checkpoint_every_epochs: int = 1
+    sample_strategy: Literal["uniform", "latest_biased"] = "latest_biased"
+    latest_bias: float = 0.5
 
 
 @dataclass
@@ -130,10 +304,40 @@ class TrainingConfig:
     def from_dict(cls, d: dict) -> "TrainingConfig":
         d = dict(d)
         d["dqn"] = DQNConfig(**d.get("dqn", {}))
-        d["env"] = EnvConfig(**_PPOTrainingConfig._migrate_env_dict(d.get("env", {})))
-        d["self_play"] = SelfPlayConfig(**_PPOTrainingConfig._migrate_self_play_dict(d.get("self_play", {})))
+        d["env"] = EnvConfig(**cls._migrate_env_dict(d.get("env", {})))
+        d["self_play"] = SelfPlayConfig(**cls._migrate_self_play_dict(d.get("self_play", {})))
         d["rewards"] = RewardConfig(**d.get("rewards", {}))
         return cls(**d)
+
+    @staticmethod
+    def _migrate_env_dict(env: dict) -> dict:
+        """Migrate an env config dict from older versions to the current format."""
+        env = dict(env)
+        if "scenario_mix" in env:
+            env["scenario_mix"] = [
+                a if isinstance(a, ScenarioArrangement) else ScenarioArrangement(**a)
+                for a in env["scenario_mix"]
+            ]
+        return env
+
+    @staticmethod
+    def _migrate_self_play_dict(sp: dict) -> dict:
+        """Migrate old self_play dicts using n_static/n_self_play_opponents to the arrangements format."""
+        sp = dict(sp)
+        n_static = sp.pop("n_static_opponents", None)
+        n_self_play = sp.pop("n_self_play_opponents", None)
+        if "arrangements" not in sp and (n_static is not None or n_self_play is not None):
+            sp["arrangements"] = [{
+                "n_static": n_static if n_static is not None else 1,
+                "n_self_play": n_self_play if n_self_play is not None else 2,
+                "weight": 1.0,
+            }]
+        if "arrangements" in sp:
+            sp["arrangements"] = [
+                a if isinstance(a, OpponentArrangement) else OpponentArrangement(**a)
+                for a in sp["arrangements"]
+            ]
+        return sp
 
     def save(self, path: str) -> None:
         with open(path, "w") as f:
