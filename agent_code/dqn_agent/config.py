@@ -5,12 +5,8 @@ from typing import Optional, List, Literal, ClassVar
 import json
 
 
-def _coerce_dataclass_list(cls, raw: str) -> list:
-    """Coerce a raw string into a list of dataclass instances of type `cls`.
-
-    The raw string can be a JSON array of objects, or a semicolon-separated
-    list of comma-separated values corresponding to the dataclass fields.
-    """
+def coerce_dataclass_list(cls, raw: str) -> list:
+    """Convert raw config text into dataclass instances."""
     trimmed = raw.strip()
     if trimmed.startswith("[") or trimmed.startswith("{"):
         parsed = json.loads(trimmed)
@@ -30,14 +26,14 @@ def _coerce_dataclass_list(cls, raw: str) -> list:
                 f"{', '.join(f.name for f in field_specs)})"
             )
         kwargs = {}
-        for f, val in zip(field_specs, parts):
-            kwargs[f.name] = _coerce_value(f.default, val)
+        for field_spec, val in zip(field_specs, parts):
+            kwargs[field_spec.name] = coerce_value(field_spec.default, val)
         items.append(cls(**kwargs))
     return items
 
 
-def _coerce_value(current, raw):
-    """Coerce a raw string value into the type of `current`."""
+def coerce_value(current, raw):
+    """Coerce a raw CLI value to the target type."""
     if not isinstance(raw, str):
         return raw
     if isinstance(current, bool):
@@ -48,7 +44,7 @@ def _coerce_value(current, raw):
         return float(raw)
     if isinstance(current, list):
         if current and is_dataclass(current[0]):
-            return _coerce_dataclass_list(type(current[0]), raw)
+            return coerce_dataclass_list(type(current[0]), raw)
         return [x for x in raw.split(",") if x]
     if current is None:
         if raw.strip().lower() in ("none", "null", ""):
@@ -61,13 +57,7 @@ def _coerce_value(current, raw):
 
 
 def load_overrides_file(path) -> dict:
-    """Load a dict of dotted-key overrides from a JSON file.
-
-    This is the file-based counterpart to `--set path.to.field=value` on the
-    CLI: point --overrides-file at one of these, or drop a file named
-    'config_overrides.json' in a run's directory to have it picked up
-    automatically on --resume (see train.py:run()).
-    """
+    """Load dotted-key overrides from a JSON file."""
     import pathlib as _pathlib
     path = _pathlib.Path(path)
     if not path.exists():
@@ -83,7 +73,7 @@ def load_overrides_file(path) -> dict:
 
 @dataclass
 class DQNConfig:
-    """Hyperparameters passed directly to stable_baselines3.DQN."""
+    """Hyperparameters passed directly to the DQN learner."""
     learning_rate: float = 1e-4
     buffer_size: int = 500_000
     learning_starts: int = 50_000
@@ -101,22 +91,14 @@ class DQNConfig:
 
 @dataclass(frozen=True)
 class ScenarioArrangement:
-    """One entry in a training-scenario mix.
-
-    Play `scenario` for the next batch of rounds with probability
-    proportional to `weight` (see EnvConfig.scenario_mix). Parsed the same
-    way as OpponentArrangement -- "classic,0.85;coin-heaven,0.15" or JSON.
-    """
+    """One entry in a training scenario mix."""
     scenario: str = "classic"
     weight: float = 1.0
 
 
 @dataclass
 class EnvConfig:
-    """Configuration for the Bomberman environment.
-
-    Passed to the BombermanGymEnv constructor.
-    """
+    """Configuration for the Bomberman environment."""
     scenario: str = "classic"
     seed: Optional[int] = None
     silence_errors: bool = True
@@ -150,10 +132,7 @@ class EnvConfig:
 
 @dataclass
 class RewardConfig:
-    """Configuration for reward shaping in the Bomberman environment.
-
-    Passed to the BombermanGymEnv constructor.
-    """
+    """Configuration for reward shaping in the Bomberman environment."""
     waited: float = -0.01
     invalid_action: float = -0.2
     bomb_dropped: float = 0.0
@@ -176,12 +155,7 @@ class RewardConfig:
 
 @dataclass(frozen=True)
 class OpponentArrangement:
-    """A single opponent lineup configuration for self-play.
-
-    The agent faces `n_static` static opponents and `n_self_play` self-play
-    opponents per game. `weight` sets how often this arrangement is sampled
-    relative to others.
-    """
+    """A single self-play arrangement."""
     n_static: int = 1
     n_self_play: int = 2
     weight: float = 1.0
@@ -208,6 +182,7 @@ class SelfPlayConfig:
 
 @dataclass
 class TrainingConfig:
+    """Top-level training configuration for a DQN run."""
     run_name: Optional[str] = None
     runs_dir: str = "runs"
     n_envs: int = 32
@@ -272,7 +247,7 @@ class TrainingConfig:
     }
 
     def apply_overrides(self, overrides: dict, *, restrict_to: set | None = None) -> list:
-        """Apply a dict of dotted-key overrides, returning (key, old, new) triples."""
+        """Apply dotted-key overrides and return the changed values."""
         applied = []
         for dotted_key, raw_value in overrides.items():
             if restrict_to is not None and dotted_key not in restrict_to:
@@ -290,7 +265,7 @@ class TrainingConfig:
             if not hasattr(obj, leaf):
                 raise ValueError(f"Unknown config path '{dotted_key}'")
             current = getattr(obj, leaf)
-            new_value = _coerce_value(current, raw_value)
+            new_value = coerce_value(current, raw_value)
             setattr(obj, leaf, new_value)
             applied.append((dotted_key, current, new_value))
         return applied
@@ -309,7 +284,7 @@ class TrainingConfig:
 
     @staticmethod
     def _migrate_env_dict(env: dict) -> dict:
-        """Migrate an env config dict from older versions to the current format."""
+        """Normalize legacy env config fields."""
         env = dict(env)
         if "scenario_mix" in env:
             env["scenario_mix"] = [
@@ -320,7 +295,7 @@ class TrainingConfig:
 
     @staticmethod
     def _migrate_self_play_dict(sp: dict) -> dict:
-        """Migrate old self_play dicts using n_static/n_self_play_opponents to the arrangements format."""
+        """Normalize legacy self-play config fields."""
         sp = dict(sp)
         n_static = sp.pop("n_static_opponents", None)
         n_self_play = sp.pop("n_self_play_opponents", None)

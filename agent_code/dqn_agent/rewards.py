@@ -32,7 +32,7 @@ EVENT_REWARDS = {
     e.INVALID_ACTION: -0.2,
 
     e.BOMB_DROPPED: 0,
-    e.BOMB_EXPLODED: 0.,
+    e.BOMB_EXPLODED: 0.0,
 
     e.CRATE_DESTROYED: 0.3,
     e.COIN_FOUND: 0,
@@ -54,9 +54,7 @@ TRAP_SHAPING_COEF = 0.1
 
 
 def build_event_rewards(cfg) -> dict:
-    """
-    Build a dictionary of event rewards based on the provided configuration.
-    """
+    """Build event rewards from the active config."""
     return {
         e.MOVED_LEFT: 0,
         e.MOVED_RIGHT: 0,

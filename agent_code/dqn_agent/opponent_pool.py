@@ -17,11 +17,7 @@ OpponentPair = Tuple[Callable, Callable]
 
 
 class _CheckpointOpponent:
-    """Wraps a MaskableDQN checkpoint as an opponent for the BombermanGymEnv.
-
-    Lazily loads the model and environment on first use, and caches them for
-    subsequent calls.
-    """
+    """Wrap a checkpointed DQN model as an in-game opponent."""
 
     def __init__(self, model_path: str, env_cfg: EnvConfig):
         self.model_path = model_path
@@ -41,6 +37,7 @@ class _CheckpointOpponent:
         self.__dict__.update(state)
 
     def _ensure_ready(self):
+        """Load the model and observation environment lazily."""
         if self._model is None:
             self._model = MaskableDQN.load(self.model_path, device="cpu")
 
@@ -70,10 +67,12 @@ class _CheckpointOpponent:
             self._action_names = {v: k for k, v in ACTION_INDICES.items() if k is not None}
 
     def setup(self, agent):
+        """Prepare the opponent environment before the match starts."""
         self._ensure_ready()
         self._obs_env.reset()
 
     def act(self, agent, game_state):
+        """Pick the next action for the checkpointed model."""
         self._ensure_ready()
         obs_env = self._obs_env
         obs = obs_env.observation_from_game_state(game_state)
@@ -91,6 +90,8 @@ def _make_checkpoint_opponent(model_path: str, env_cfg: EnvConfig) -> OpponentPa
 
 
 class OpponentPool:
+    """Manage static and checkpoint-based opponents for self-play."""
+
     def __init__(self, ckman: CheckpointManager, cfg: SelfPlayConfig):
         self.ckman = ckman
         self.cfg = cfg
@@ -104,11 +105,11 @@ class OpponentPool:
 
     @property
     def num_checkpoints(self) -> int:
-        """Number of self-play checkpoints currently in this pool's window."""
+        """Return the number of active checkpoint opponents."""
         return len(self._checkpoints)
 
     def maybe_add_checkpoint(self, checkpoint_dir: Optional[pathlib.Path], _timesteps: int) -> None:
-        """Add a saved checkpoint to the self-play pool if the epoch cadence allows it."""
+        """Add a checkpoint to the pool when the cadence allows it."""
         if not self.cfg.enabled or checkpoint_dir is None:
             return
 
@@ -119,6 +120,7 @@ class OpponentPool:
             self._checkpoints = self._checkpoints[-self.cfg.pool_size:]
 
     def _sample_checkpoint(self) -> Optional[pathlib.Path]:
+        """Sample one checkpoint from the active pool."""
         if not self._checkpoints:
             return None
         if self.cfg.sample_strategy == "latest_biased" and random.random() < self.cfg.latest_bias:
@@ -126,6 +128,7 @@ class OpponentPool:
         return random.choice(self._checkpoints)
 
     def _checkpoint_opponent(self, checkpoint_dir: pathlib.Path) -> OpponentPair:
+        """Return a cached checkpointed opponent."""
         key = str(checkpoint_dir.resolve())
         if key not in self._opponent_cache:
             model_path = str((checkpoint_dir / "model.zip").resolve())
@@ -134,11 +137,12 @@ class OpponentPool:
 
     @staticmethod
     def _resolve_static(module_path: str) -> OpponentPair:
+        """Import a static agent module and expose its entry points."""
         module = importlib.import_module(module_path)
         return (module.setup, module.act)
 
     def _choose_arrangement(self) -> OpponentArrangement:
-        """Randomly choose a configured opponent arrangement, weighted by `weight`."""
+        """Randomly choose a configured opponent arrangement by weight."""
         arrangements = self.cfg.arrangements
         if len(arrangements) == 1:
             return arrangements[0]
@@ -148,7 +152,7 @@ class OpponentPool:
         return random.choices(arrangements, weights=weights, k=1)[0]
 
     def _choose_scenario_arrangement(self) -> ScenarioArrangement:
-        """Randomly choose one entry from env_cfg.scenario_mix, weighted by `weight`."""
+        """Randomly choose a scenario mix entry by weight."""
         mix = self.env_cfg.scenario_mix
         if len(mix) == 1:
             return mix[0]
@@ -158,13 +162,14 @@ class OpponentPool:
         return random.choices(mix, weights=weights, k=1)[0]
 
     def current_scenario(self) -> str:
-        """Draw one scenario from env_cfg.scenario_mix, falling back to env_cfg.scenario."""
+        """Draw one scenario from the configured scenario mix."""
         mix = self.env_cfg.scenario_mix
         if not mix:
             return self.env_cfg.scenario
         return self._choose_scenario_arrangement().scenario
 
     def _sample_static_opponents(self, k: int) -> List[str]:
+        """Sample static opponent module paths."""
         if k <= 0:
             return []
         pool = self.cfg.static_opponents
@@ -180,7 +185,7 @@ class OpponentPool:
         return random.sample(pool, k=k)
 
     def current_opponents(self) -> List[OpponentPair]:
-        """Return (setup, act) callables for the opponents to use in the next match."""
+        """Return the opponent callables for the next round."""
         arrangement = self._choose_arrangement()
         total_needed = arrangement.n_static + arrangement.n_self_play
 
@@ -190,11 +195,11 @@ class OpponentPool:
         n_self_play_requested = arrangement.n_self_play if self.cfg.enabled else 0
         self_play_filled = 0
         for _ in range(n_self_play_requested):
-            ckpt = self._sample_checkpoint()
-            if ckpt is None:
+            checkpoint = self._sample_checkpoint()
+            if checkpoint is None:
                 break
-            opponents.append(self._checkpoint_opponent(ckpt))
-            descriptions.append(f"checkpoint:{ckpt.parent.parent.name}/{ckpt.name}")
+            opponents.append(self._checkpoint_opponent(checkpoint))
+            descriptions.append(f"checkpoint:{checkpoint.parent.parent.name}/{checkpoint.name}")
             self_play_filled += 1
 
         n_static_needed = total_needed - self_play_filled
@@ -213,11 +218,12 @@ class OpponentPool:
         return opponents
 
     def last_opponent_descriptions(self) -> List[str]:
-        """Human-readable descriptions of the opponents used in the last current_opponents() call."""
+        """Return the last chosen opponent descriptions."""
         return list(self._last_descriptions)
 
     @staticmethod
     def _normalized_weights(weights: List[float]) -> List[float]:
+        """Normalize weights while handling negatives and zero totals."""
         clamped = [max(0.0, w) for w in weights]
         total = sum(clamped)
         if total <= 0:
@@ -226,7 +232,7 @@ class OpponentPool:
         return [w / total for w in clamped]
 
     def arrangement_distribution(self) -> List[Tuple[str, float]]:
-        """Probability of each configured opponent arrangement being drawn."""
+        """Return the current arrangement sampling weights."""
         arrangements = self.cfg.arrangements
         probs = self._normalized_weights([a.weight for a in arrangements])
         return [
@@ -235,7 +241,7 @@ class OpponentPool:
         ]
 
     def scenario_distribution(self) -> List[Tuple[str, float]]:
-        """Probability of each configured scenario being drawn."""
+        """Return the current scenario sampling weights."""
         mix = self.env_cfg.scenario_mix
         if not mix:
             return [(self.env_cfg.scenario, 1.0)]
@@ -244,14 +250,15 @@ class OpponentPool:
 
 
 class OpponentSampler:
-    """A callable that samples opponents and a scenario for a single game."""
+    """Sample a full opponent set and scenario for one match."""
 
     def __init__(self, pool: "OpponentPool"):
         self.pool = pool
 
     def sample_one(self) -> Tuple[List[OpponentPair], str, List[str]]:
-        """Draw one game's worth of opponents + scenario from the wrapped pool."""
+        """Sample one match configuration from the pool."""
         opponents = self.pool.current_opponents()
         descriptions = self.pool.last_opponent_descriptions()
         scenario = self.pool.current_scenario()
         return opponents, scenario, descriptions
+

@@ -19,7 +19,7 @@ _ACTION_NAMES = {v: k for k, v in ACTION_INDICES.items() if k is not None}
 
 
 def _resolve_run_dir() -> pathlib.Path:
-    """Resolve RUN (a run name or a path to a run directory) to a run dir."""
+    """Resolve the configured run name or path to a directory."""
     run_dir = pathlib.Path(RUN)
     if not run_dir.exists():
         run_dir = pathlib.Path(DEFAULT_CONFIG.runs_dir) / RUN
@@ -32,7 +32,7 @@ def _resolve_run_dir() -> pathlib.Path:
 
 
 def _load_model(run_dir: pathlib.Path, checkpoint: Optional[str] = None) -> MaskableDQN:
-    """Load a MaskableDQN model from a run directory and optional checkpoint name."""
+    """Load a DQN model from a checkpoint."""
     manager = CheckpointManager.resume(str(run_dir))
     if checkpoint is None:
         checkpoint_path = manager.latest_checkpoint()
@@ -47,7 +47,7 @@ def _load_model(run_dir: pathlib.Path, checkpoint: Optional[str] = None) -> Mask
 
 
 def _get_dummy_env(run_dir: pathlib.Path) -> BombermanGymEnv:
-    """Get a dummy BombermanGymEnv for the given run directory."""
+    """Create a minimal environment for observation conversion."""
     manager = CheckpointManager.resume(run_dir)
     env_cfg = manager.config.env
 
@@ -77,15 +77,15 @@ def _get_dummy_env(run_dir: pathlib.Path) -> BombermanGymEnv:
 
 
 def setup(self):
-    """Load the trained MaskableDQN checkpoint and prepare a BombermanGymEnv for observation conversion."""
-    _RUN_DIR = _resolve_run_dir()
+    """Load the trained model and prepare the observation environment."""
+    run_dir = _resolve_run_dir()
 
-    self._dqn_model = _load_model(_RUN_DIR, CHECKPOINT)
-    self._dqn_obs_env = _get_dummy_env(_RUN_DIR)
+    self._dqn_model = _load_model(run_dir, CHECKPOINT)
+    self._dqn_obs_env = _get_dummy_env(run_dir)
 
 
 def act(self, game_state: dict) -> str:
-    """Convert game_state to an observation, apply action masks, and predict the next action."""
+    """Convert the game state into a masked action prediction."""
     time_start = time.time()
 
     obs_env = self._dqn_obs_env

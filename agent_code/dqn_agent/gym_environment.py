@@ -30,10 +30,7 @@ WorldArgs = namedtuple(
 
 
 class _NullLogger:
-    """
-    A logger that does nothing. Used as a default logger for AgentHandle instances
-    when no logger is provided. This prevents the need for null checks before logging.
-    """
+    """A no-op logger used by agents that don't need logging."""
     __slots__ = ()
 
     def info(self, *args, **kwargs):
@@ -50,9 +47,7 @@ _NULL_LOGGER = _NullLogger()
 
 
 class AgentHandle:
-    """
-    Represents an agent in the Bomberman environment, tracking its state, score, and events.
-    """
+    """Tracks one agent's gameplay state and basic bookkeeping."""
 
     __slots__ = ("name", "train", "logger", "x", "y", "score", "total_score",
                  "bombs_left", "dead", "events", "__dict__")
@@ -201,9 +196,7 @@ NUM_FEATURES = len(FEATURE_NAMES)
 
 
 def resolve_layer_groups(requested: Optional[Iterable[str]]) -> Set[str]:
-    """
-    Resolves a set of requested layer groups, including their dependencies.
-    """
+    """Resolve requested layer groups and their dependencies."""
     if requested is None:
         return set(LAYER_GROUPS.keys())
 
@@ -225,16 +218,14 @@ def resolve_layer_groups(requested: Optional[Iterable[str]]) -> Set[str]:
         for dep in LAYER_GROUP_DEPENDENCIES.get(group, ()):
             _add(dep)
 
-    for g in requested:
-        _add(g)
+    for group in requested:
+        _add(group)
     return resolved
 
 
 @njit(cache=True)
 def _time_aware_bfs_kernel(starts, start_counts, occ, W, H, T, dist, visited, qx, qy, qt):
-    """
-    Batched time-aware BFS. starts/occ/dist/visited: (n_envs, W, H, T+1).
-    """
+    """Batched time-aware BFS for reachability and danger propagation."""
     n_envs = starts.shape[0]
     for env in range(n_envs):
         d = dist[env]
@@ -298,9 +289,7 @@ def _time_aware_bfs_kernel(starts, start_counts, occ, W, H, T, dist, visited, qx
 
 @njit(cache=True)
 def _multi_source_bfs_kernel(targets, occ, W, H, dist, qx, qy):
-    """
-    Batched multi-source BFS. targets/occ/dist: (n_envs, W, H).
-    """
+    """Batched multi-source BFS for reachability."""
     n_envs = targets.shape[0]
     for env in range(n_envs):
         d = dist[env]
@@ -347,9 +336,7 @@ def _multi_source_bfs_kernel(targets, occ, W, H, dist, qx, qy):
 def _forecast_kernel(bomb_x, bomb_y, bomb_timer, bomb_counts, blast_tensor,
                      exp_x, exp_y, exp_timer, exp_counts,
                      wall, crate, T, ET, danger_out, occ_out):
-    """
-    Batched forecast of danger and occupied maps. All inputs/outputs are (n_envs, ...) arrays.
-    """
+    """Batched forecast of danger and occupied maps. All inputs/outputs are (n_envs, ...) arrays."""
     n_envs = bomb_counts.shape[0]
     width, height = wall.shape
 
@@ -1180,7 +1167,7 @@ class BombermanGymEnv(gym.Env):
 
         order = self.rng.permutation(len(self.active_agents[env]))
         for i in order:
-            a = self.active_agents[env][i]
+            a = self.active_agents[env][int(i)]
             act = actions.get(a, "WAIT")
             self._perform_agent_action(env, a, act)
 
