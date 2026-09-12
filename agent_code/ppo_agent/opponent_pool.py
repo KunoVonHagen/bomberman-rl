@@ -100,6 +100,11 @@ class OpponentPool:
         if cfg.enabled:
             self._checkpoints = list(ckman.list_checkpoints())[-cfg.pool_size:]
 
+    @property
+    def num_checkpoints(self) -> int:
+        """Number of self-play checkpoints currently in this pool's window."""
+        return len(self._checkpoints)
+
     def maybe_add_checkpoint(self, checkpoint_dir: Optional[pathlib.Path], _timesteps: int) -> None:
         """Call this after every saved checkpoint; it decides whether to add
         it to the self-play pool based on `add_checkpoint_every_epochs`."""
@@ -159,9 +164,13 @@ class OpponentPool:
 
     def current_scenario(self) -> str:
         """
-        Return the scenario to use for the next batch of rounds, drawn from
-        env_cfg.scenario_mix (e.g. to mix "coin-heaven" into training for
-        generalization). Falls back to env_cfg.scenario if no mix is set.
+        Draw one scenario from env_cfg.scenario_mix (e.g. to mix
+        "coin-heaven" into training for generalization). Falls back to
+        env_cfg.scenario if no mix is set.
+
+        Called once per individual game via OpponentSampler.sample_one() (see
+        below) rather than once per PPO rollout, so the scenario mix is
+        rerolled every game instead of persisting across a whole rollout.
         """
         mix = self.env_cfg.scenario_mix
         if not mix:
@@ -187,6 +196,10 @@ class OpponentPool:
         """
         Return a list of (setup, act) callables for the opponents to use in the next match.
         The list is shuffled if `shuffle_opponent_order` is True.
+
+        Called once per individual game via OpponentSampler.sample_one() (see
+        below) rather than once per PPO rollout, so the opponent lineup is
+        rerolled every game instead of persisting across a whole rollout.
         """
         arrangement = self._choose_arrangement()
         total_needed = arrangement.n_static + arrangement.n_self_play
@@ -224,3 +237,51 @@ class OpponentPool:
         Return a list of human-readable descriptions of the opponents used in the last call to `current_opponents()`.
         """
         return list(self._last_descriptions)
+
+    @staticmethod
+    def _normalized_weights(weights: List[float]) -> List[float]:
+        clamped = [max(0.0, w) for w in weights]
+        total = sum(clamped)
+        if total <= 0:
+            clamped = [1.0] * len(weights)
+            total = float(len(weights))
+        return [w / total for w in clamped]
+
+    def arrangement_distribution(self) -> List[Tuple[str, float]]:
+        """
+        The probability of each configured opponent arrangement being drawn,
+        matching _choose_arrangement's weighting exactly.
+        """
+        arrangements = self.cfg.arrangements
+        probs = self._normalized_weights([a.weight for a in arrangements])
+        return [
+            (f"(static:{a.n_static},self_play:{a.n_self_play})", p)
+            for a, p in zip(arrangements, probs)
+        ]
+
+    def scenario_distribution(self) -> List[Tuple[str, float]]:
+        """
+        The probability of each configured scenario being drawn, matching
+        _choose_scenario_arrangement's weighting exactly.
+        """
+        mix = self.env_cfg.scenario_mix
+        if not mix:
+            return [(self.env_cfg.scenario, 1.0)]
+        probs = self._normalized_weights([a.weight for a in mix])
+        return [(a.scenario, p) for a, p in zip(mix, probs)]
+
+
+class OpponentSampler:
+    """
+    A callable that samples opponents and scenarios for a single game.
+    """
+
+    def __init__(self, pool: "OpponentPool"):
+        self.pool = pool
+
+    def sample_one(self) -> Tuple[List[OpponentPair], str, List[str]]:
+        """Draw one game's worth of opponents + scenario from the wrapped pool."""
+        opponents = self.pool.current_opponents()
+        descriptions = self.pool.last_opponent_descriptions()
+        scenario = self.pool.current_scenario()
+        return opponents, scenario, descriptions

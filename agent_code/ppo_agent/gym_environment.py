@@ -430,9 +430,12 @@ class BombermanGymEnv(gym.Env):
             [AgentHandle(f"OpponentAgent{i}") for i in range(MAX_OPPONENTS)]
             for _ in range(self.n_envs)
         ]
-        self.opponent_act_fns: List[Callable] = [act_fn for (_setup_fn, act_fn) in opponents]
-        self.n_real_opponents = len(opponents)
-        self.n_agents = 1 + self.n_real_opponents
+        self.opponent_act_fns: List[List[Callable]] = [
+            [act_fn for (_setup_fn, act_fn) in opponents] for _ in range(self.n_envs)
+        ]
+        self.n_real_opponents: List[int] = [len(opponents) for _ in range(self.n_envs)]
+        self.env_scenarios: List[str] = [args.scenario for _ in range(self.n_envs)]
+        self._opponent_resampler = None
 
         for handles in self.opponent_handles:
             for handle, (setup_fn, _act_fn) in zip(handles, opponents):
@@ -606,11 +609,11 @@ class BombermanGymEnv(gym.Env):
             coords.append((x, y - i))
         return coords
 
-    def _generate_round_layout(self):
+    def _generate_round_layout(self, env: int):
         WALL, FREE, CRATE = -1, 0, 1
         arena = self._build_wall_mask().copy()
 
-        scenario_info = s.SCENARIOS[self.args.scenario]
+        scenario_info = s.SCENARIOS[self.env_scenarios[env]]
         crate_mask = self.rng.random((s.COLS, s.ROWS)) < scenario_info["CRATE_DENSITY"]
         arena[(arena != WALL) & crate_mask] = CRATE
 
@@ -628,19 +631,43 @@ class BombermanGymEnv(gym.Env):
         coins_xy = [(int(x), int(y)) for x, y in coin_positions]
         coins_collectable = [arena[x, y] == FREE for (x, y) in coins_xy]
 
+        n_agents = 1 + self.n_real_opponents[env]
         perm = self.rng.permutation(len(start_positions))
-        positions = [start_positions[i] for i in perm[:self.n_agents]]
+        positions = [start_positions[i] for i in perm[:n_agents]]
 
         return arena, coins_xy, coins_collectable, positions
 
+    def _reroll_opponents_and_scenario(self, env: int) -> None:
+        """
+        Rerolls the opponents and scenario for a given environment.
+        """
+        resampler = self._opponent_resampler
+        if resampler is None:
+            return
+
+        opponents, scenario, _descriptions = resampler.sample_one()
+        if scenario not in s.SCENARIOS:
+            raise ValueError(
+                f"Opponent resampler produced unknown scenario {scenario!r}. "
+                f"Available: {sorted(s.SCENARIOS)}"
+            )
+
+        self.env_scenarios[env] = scenario
+        self.n_real_opponents[env] = len(opponents)
+        self.opponent_act_fns[env] = [act_fn for (_setup_fn, act_fn) in opponents]
+        for handle, (setup_fn, _act_fn) in zip(self.opponent_handles[env], opponents):
+            setup_fn(handle)
+
     def _new_round(self, env: int):
         """Reset one env's game state (per-env, cheap; heavy layers are refreshed batched)."""
+        self._reroll_opponents_and_scenario(env)
+
         self.rounds[env] += 1
         self.step_counts[env] = 0
         self.bombs[env] = []
         self.explosions[env] = []
 
-        arena, coins_xy, coins_collectable, positions = self._generate_round_layout()
+        arena, coins_xy, coins_collectable, positions = self._generate_round_layout(env)
         self.arena[env] = arena
 
         n = len(coins_xy)
@@ -654,7 +681,8 @@ class BombermanGymEnv(gym.Env):
         self._initial_crate_count[env] = int(np.sum(arena == 1))
         self._initial_coin_count[env] = int(sum(coins_collectable)) if n else 0
 
-        real_agents = [self.agents[env]] + self.opponent_handles[env][: self.n_real_opponents]
+        n_real_opponents = self.n_real_opponents[env]
+        real_agents = [self.agents[env]] + self.opponent_handles[env][:n_real_opponents]
         for handle, (x, y) in zip(real_agents, positions):
             handle.x, handle.y = int(x), int(y)
             handle.dead = False
@@ -662,7 +690,7 @@ class BombermanGymEnv(gym.Env):
             handle.bombs_left = True
             handle.events = []
 
-        for handle in self.opponent_handles[env][self.n_real_opponents:]:
+        for handle in self.opponent_handles[env][n_real_opponents:]:
             handle.dead = True
 
         self.active_agents[env] = list(real_agents)
@@ -1014,9 +1042,7 @@ class BombermanGymEnv(gym.Env):
 
     def set_scenario(self, scenario: str) -> None:
         """
-        Set the scenario for the environment. This method allows you to change the scenario
-        of the environment after it has been initialized. The scenario determines the layout
-        of the arena, including the placement of walls, crates, and coins.
+        Set the scenario for the environment. This will reset the environment and apply the new scenario.
         """
         if scenario not in s.SCENARIOS:
             raise ValueError(
@@ -1026,15 +1052,11 @@ class BombermanGymEnv(gym.Env):
             self.args = self.args._replace(scenario=scenario)
         except AttributeError:
             self.args.scenario = scenario
+        self.env_scenarios = [scenario for _ in range(self.n_envs)]
 
     def set_reward_config(self, reward_config: Optional[RewardConfig]) -> None:
         """
-        (Re)build the event-reward table and shaping coefficients this env's
-        shaped_reward() uses. Safe to call at any time, including mid-run
-        via VecEnv.env_method("set_reward_config", cfg.rewards) -- e.g. to
-        anneal shaping coefficients towards zero later in training without
-        restarting the process. Passing None resets to the static defaults
-        in rewards.py.
+        Set the reward configuration for the environment. This will reset the environment and apply the new reward configuration.
         """
         if reward_config is None:
             self._event_rewards = EVENT_REWARDS
@@ -1052,16 +1074,26 @@ class BombermanGymEnv(gym.Env):
             self._trap_shaping_coef = reward_config.trap_shaping_coef
 
     def set_opponents(self, opponents):
+        """
+        Set the opponents for the environment. This will reset the environment and apply the new opponents.
+        """
         if len(opponents) > MAX_OPPONENTS:
             raise ValueError(
                 f"got {len(opponents)} opponents, but this environment only "
                 f"supports up to MAX_OPPONENTS={MAX_OPPONENTS}"
             )
-        self.opponent_act_fns = [act_fn for (_setup_fn, act_fn) in opponents]
-        self.n_real_opponents = len(opponents)
+        act_fns = [act_fn for (_setup_fn, act_fn) in opponents]
+        self.opponent_act_fns = [list(act_fns) for _ in range(self.n_envs)]
+        self.n_real_opponents = [len(opponents) for _ in range(self.n_envs)]
         for handles in self.opponent_handles:
             for handle, (setup_fn, _act_fn) in zip(handles, opponents):
                 setup_fn(handle)
+
+    def set_opponent_resampler(self, resampler) -> None:
+        """
+        Set the opponent resampler for the environment. This will reset the environment and apply the new opponent resampler.
+        """
+        self._opponent_resampler = resampler
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -1135,7 +1167,7 @@ class BombermanGymEnv(gym.Env):
 
         shared = self._build_shared_state(env)
         actions = {}
-        for handle, act_fn in zip(self.opponent_handles[env], self.opponent_act_fns):
+        for handle, act_fn in zip(self.opponent_handles[env], self.opponent_act_fns[env]):
             handle.reset_game_events()
             if handle.dead:
                 continue
