@@ -29,4 +29,4 @@ else
     TRAIN_ARGS=(--set "run_name=$RUN_NAME")
 fi
 
-srun python -m agent_code.ppo_agent.train "${TRAIN_ARGS[@]}" --device cuda
+srun python3 -m agent_code.ppo_agent.train "${TRAIN_ARGS[@]}" --device cuda
