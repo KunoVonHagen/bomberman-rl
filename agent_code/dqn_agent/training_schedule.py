@@ -103,7 +103,6 @@ DEFAULT_SCHEDULE = [
         "overrides": {
             "self_play.arrangements": "0,0,0.3;0,1,0.5;0,2,0.7;3,0,1.0",
             "env.scenario_mix": "classic,0.95;coin-heaven,0.05",
-            "total_timesteps": 150_000_000,
         },
     },
 ]

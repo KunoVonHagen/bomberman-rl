@@ -9,6 +9,8 @@
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ha300@uni-heidelberg.de
 
+export PYTHONUNBUFFERED=1
+
 source /cluster/projects/dwiest/envs/bomberman/bin/activate
 
 cd /cluster/projects/dwiest/bomberman-rl
