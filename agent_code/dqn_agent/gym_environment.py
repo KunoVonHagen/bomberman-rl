@@ -10,7 +10,7 @@ from numba import njit
 
 import settings as s
 import events as e
-from .rewards import (
+from agent_code.dqn_agent.rewards import (
     EVENT_REWARDS,
     CRATE_SHAPING_COEF,
     COIN_SHAPING_COEF,
@@ -19,7 +19,7 @@ from .rewards import (
     TRAP_SHAPING_COEF,
     build_event_rewards,
 )
-from .config import RewardConfig
+from agent_code.dqn_agent.config import RewardConfig
 
 WorldArgs = namedtuple(
     "WorldArgs",
