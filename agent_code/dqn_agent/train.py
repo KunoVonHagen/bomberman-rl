@@ -378,21 +378,21 @@ def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
 
 
 class OpponentResampleCallback(BaseCallback):
-    """Resamples opponents at the end of each training rollout."""
+    """Resamples opponents every `every_n_timesteps` environment steps."""
 
-    def __init__(self, pool: OpponentPool, every_n_rollouts: int = 1, verbose: int = 0):
+    def __init__(self, pool: OpponentPool, every_n_timesteps: int, verbose: int = 0):
         super().__init__(verbose)
         self.pool = pool
-        self.every_n_rollouts = max(1, every_n_rollouts)
-        self._rollout_count = 0
+        self.every_n_timesteps = max(1, every_n_timesteps)
+        self._next_resample_at = 0
+
+    def _on_training_start(self) -> None:
+        self._next_resample_at = self.num_timesteps + self.every_n_timesteps
 
     def _on_step(self) -> bool:
-        return True
-
-    def _on_rollout_start(self) -> None:
-        self._rollout_count += 1
-        if (self._rollout_count - 1) % self.every_n_rollouts != 0:
-            return
+        if self.num_timesteps < self._next_resample_at:
+            return True
+        self._next_resample_at = self.num_timesteps + self.every_n_timesteps
 
         self.training_env.env_method("set_opponent_resampler", OpponentSampler(self.pool))
 
@@ -403,10 +403,11 @@ class OpponentResampleCallback(BaseCallback):
             scenario_str = ", ".join(
                 f"{scenario} {p:.0%}" for scenario, p in self.pool.scenario_distribution()
             )
-            print(f"[opponents] rollout {self._rollout_count}: resynced self-play pool "
+            print(f"[opponents] timesteps={self.num_timesteps}: resynced self-play pool "
                   f"({self.pool.num_checkpoints} checkpoint(s)) to training env "
                   f"-- distribution: {arrangement_str}")
-            print(f"[scenario] rollout {self._rollout_count}: distribution: {scenario_str}")
+            print(f"[scenario] timesteps={self.num_timesteps}: distribution: {scenario_str}")
+        return True
 
 
 def architecture_info(cfg: TrainingConfig) -> dict:
@@ -601,7 +602,7 @@ def run(
         )
 
     opponent_callback = OpponentResampleCallback(
-        pool, every_n_rollouts=cfg.self_play.resample_every_n_rollouts, verbose=1,
+        pool, every_n_timesteps=cfg.self_play.resample_every_n_timesteps, verbose=1,
     )
     schedule_callback = ScheduleCallback(
         cfg, ckman, schedule or [], applied_idx=schedule_applied_idx, verbose=1,

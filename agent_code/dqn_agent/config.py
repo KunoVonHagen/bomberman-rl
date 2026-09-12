@@ -198,7 +198,7 @@ class SelfPlayConfig:
     )
     allow_repeat_static_opponents: bool = True
     shuffle_opponent_order: bool = True
-    resample_every_n_rollouts: int = 1
+    resample_every_n_timesteps: int = 50_000
 
     pool_size: int = 8
     add_checkpoint_every_epochs: int = 1
@@ -216,7 +216,6 @@ class TrainingConfig:
 
     device: str = "auto"
     save_every_timesteps: int = 1_048_576
-    eval_every_save: bool = True
 
     resume_from: Optional[str] = None
     resume_checkpoint: Optional[str] = None
@@ -229,7 +228,6 @@ class TrainingConfig:
     RESUMABLE_FIELDS: ClassVar[set] = {
         "total_timesteps",
         "save_every_timesteps",
-        "eval_every_save",
         "device",
         "n_envs",
         "n_shards",
@@ -249,7 +247,7 @@ class TrainingConfig:
         "self_play.arrangements",
         "self_play.allow_repeat_static_opponents",
         "self_play.shuffle_opponent_order",
-        "self_play.resample_every_n_rollouts",
+        "self_play.resample_every_n_timesteps",
         "self_play.pool_size",
         "self_play.add_checkpoint_every_epochs",
         "self_play.sample_strategy",
@@ -351,20 +349,20 @@ class TrainingConfig:
 
 DEFAULT_CONFIG = TrainingConfig(
     run_name=None,
-    n_envs=256,
-    n_shards=32,
+    n_envs=16,
+    n_shards=4,
     total_timesteps=1_000_000_000_000,
-    save_every_timesteps=256 * 1024 * 4,
+    save_every_timesteps=1_048_576,
     dqn=DQNConfig(
         learning_rate=1e-4,
-        buffer_size=1_000_000,
-        learning_starts=100_000,
-        batch_size=512,
+        buffer_size=500_000,
+        learning_starts=50_000,
+        batch_size=256,
         tau=1.0,
         gamma=0.99,
         train_freq=4,
-        gradient_steps=1,
-        target_update_interval=20_000,
+        gradient_steps=-1,
+        target_update_interval=10_000,
         exploration_fraction=0.4,
         exploration_initial_eps=1.0,
         exploration_final_eps=0.05,
@@ -384,7 +382,7 @@ DEFAULT_CONFIG = TrainingConfig(
         ],
         allow_repeat_static_opponents=True,
         shuffle_opponent_order=True,
-        resample_every_n_rollouts=1,
+        resample_every_n_timesteps=50_000,
         pool_size=16,
         add_checkpoint_every_epochs=1,
         sample_strategy="latest_biased",
