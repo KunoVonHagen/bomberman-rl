@@ -28,7 +28,7 @@ from agent_code.ppo_agent.config import (
     load_overrides_file,
 )
 from agent_code.ppo_agent.checkpoint_manager import CheckpointManager
-from agent_code.ppo_agent.opponent_pool import OpponentPool
+from agent_code.ppo_agent.opponent_pool import OpponentPool, OpponentSampler
 from agent_code.ppo_agent.training_schedule import DEFAULT_SCHEDULE, load_schedule
 
 
@@ -452,10 +452,13 @@ def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str, device: 
 
 
 def _resize_rollout_buffer(model: MaskablePPO, new_n_steps: int) -> None:
-    old_n_steps = model.n_steps
-    buffer_cls = type(model.rollout_buffer)
-    model.n_steps = new_n_steps
-    model.rollout_buffer = buffer_cls(
+    """
+    Resize the rollout buffer of a MaskablePPO model to accommodate a new number of steps.
+    """
+    old_size = model.rollout_buffer.buffer_size
+    buffer = model.rollout_buffer
+    buffer_cls = type(buffer)
+    new_buffer = buffer_cls(
         new_n_steps,
         model.observation_space,
         model.action_space,
@@ -464,7 +467,8 @@ def _resize_rollout_buffer(model: MaskablePPO, new_n_steps: int) -> None:
         gae_lambda=model.gae_lambda,
         n_envs=model.n_envs,
     )
-    print(f"  ppo.n_steps changed ({old_n_steps} -> {new_n_steps}): rebuilt rollout buffer")
+    buffer.__dict__.update(new_buffer.__dict__)
+    print(f"  rollout buffer resized ({old_size} -> {new_n_steps} steps)")
 
 
 def apply_ppo_hyperparams(
@@ -499,7 +503,7 @@ def apply_ppo_hyperparams(
 
 class OpponentResampleCallback(BaseCallback):
     """
-    A callback that resamples opponents at the end of each training episode.
+    A callback that resamples opponents at the end of each training rollout.
     """
 
     def __init__(self, pool: OpponentPool, every_n_rollouts: int = 1, verbose: int = 0):
@@ -515,13 +519,20 @@ class OpponentResampleCallback(BaseCallback):
         self._rollout_count += 1
         if (self._rollout_count - 1) % self.every_n_rollouts != 0:
             return
-        opponents = self.pool.current_opponents()
-        self.training_env.env_method("set_opponents", opponents)
-        scenario = self.pool.current_scenario()
-        self.training_env.env_method("set_scenario", scenario)
+
+        self.training_env.env_method("set_opponent_resampler", OpponentSampler(self.pool))
+
         if self.verbose:
-            print(f"[opponents] rollout {self._rollout_count}: {self.pool.last_opponent_descriptions()}")
-            print(f"[scenario] rollout {self._rollout_count}: {scenario}")
+            arrangement_str = ", ".join(
+                f"{label} {p:.0%}" for label, p in self.pool.arrangement_distribution()
+            )
+            scenario_str = ", ".join(
+                f"{scenario} {p:.0%}" for scenario, p in self.pool.scenario_distribution()
+            )
+            print(f"[opponents] rollout {self._rollout_count}: resynced self-play pool "
+                  f"({self.pool.num_checkpoints} checkpoint(s)) to training env "
+                  f"-- distribution: {arrangement_str}")
+            print(f"[scenario] rollout {self._rollout_count}: distribution: {scenario_str}")
 
 
 def apply_schedule_up_to(
@@ -594,11 +605,11 @@ class ScheduleCallback(BaseCallback):
         return True
 
     def _on_rollout_start(self) -> None:
-        pending = getattr(self.model, "_pending_n_steps", None)
-        if pending is not None:
-            if pending != self.model.n_steps:
-                _resize_rollout_buffer(self.model, pending)
-            self.model._pending_n_steps = None
+        resize_to = getattr(self.model, "_pending_buffer_resize", None)
+        if resize_to is not None:
+            if resize_to != self.model.rollout_buffer.buffer_size:
+                _resize_rollout_buffer(self.model, resize_to)
+            self.model._pending_buffer_resize = None
 
         self.applied_idx = apply_schedule_up_to(
             self.cfg,
@@ -610,6 +621,14 @@ class ScheduleCallback(BaseCallback):
             ckman=self.ckman,
             verbose=bool(self.verbose),
         )
+
+    def _on_rollout_end(self) -> None:
+        pending = getattr(self.model, "_pending_n_steps", None)
+        if pending is not None:
+            if pending != self.model.n_steps:
+                self.model.n_steps = pending
+                self.model._pending_buffer_resize = pending
+            self.model._pending_n_steps = None
 
 
 class MaxRolloutsCallback(BaseCallback):
@@ -776,6 +795,7 @@ def run(
             cfg = copy.deepcopy(cfg)
             cfg.apply_overrides(merged)
         ckman = CheckpointManager.new(cfg, architecture_info(cfg))
+        cfg = ckman.config
         print(f"Starting new run '{cfg.run_name}' in {ckman.run_dir}")
         print(
             f"Tip: drop a 'config_overrides.json' into {ckman.run_dir} and it will be "
@@ -788,6 +808,8 @@ def run(
     opponents = pool.current_opponents()
 
     env = make_train_env(cfg, opponents, str(ckman.logs_dir))
+    env.env_method("set_opponent_resampler", OpponentSampler(pool))
+
     model = build_model(env, cfg, str(ckman.tensorboard_dir), device)
 
     opponent_callback = OpponentResampleCallback(
