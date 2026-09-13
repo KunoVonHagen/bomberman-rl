@@ -87,16 +87,19 @@ class NativeBatchedVecEnv:
         self.single_observation_space = self.env.single_observation_space
         self.single_action_space = self.env.single_action_space
         self._last_infos: list[dict] = []
+        self._last_action_masks: Optional[np.ndarray] = None
 
     def reset(self, seed=None, options=None):
-        obs, infos = self.env.reset(seed=seed, options=options)
+        obs, infos, masks = self.env.reset(seed=seed, options=options)
         self._last_infos = infos
+        self._last_action_masks = masks
         return obs
 
     def step(self, actions: np.ndarray):
-        obs, rewards, terminated, truncated, infos = self.env.step(actions)
+        obs, rewards, terminated, truncated, infos, masks = self.env.step(actions)
         dones = terminated | truncated
         self._last_infos = infos
+        self._last_action_masks = masks
         return obs, rewards, dones, infos
 
     def close(self) -> None:
@@ -115,7 +118,7 @@ class NativeBatchedVecEnv:
         return [result] * n
 
     def action_masks(self) -> np.ndarray:
-        return self.env.action_masks()
+        return self._last_action_masks
 
     def get_attr(self, attr_name: str, indices: list[int] | None = None) -> list:
         attr = getattr(self.env, attr_name)
@@ -167,12 +170,12 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
             break
 
         if cmd == "step":
-            obs, rewards, terminated, truncated, infos = env.step(data)
-            remote.send((obs, rewards, terminated, truncated, infos))
+            obs, rewards, terminated, truncated, infos, masks = env.step(data)
+            remote.send((obs, rewards, terminated, truncated, infos, masks))
         elif cmd == "reset":
             seed, options = data
-            obs, infos = env.reset(seed=seed, options=options)
-            remote.send((obs, infos))
+            obs, infos, masks = env.reset(seed=seed, options=options)
+            remote.send((obs, infos, masks))
         elif cmd == "action_masks":
             remote.send(env.action_masks())
         elif cmd == "env_method":
@@ -240,13 +243,15 @@ class ShardedNativeBatchedVecEnv:
         self.remotes[0].send(("get_spaces", None))
         self.single_observation_space, self.single_action_space = self.remotes[0].recv()
         self._last_infos: list[dict] = []
+        self._last_action_masks: Optional[np.ndarray] = None
 
     def reset(self, seed=None, options=None):
         for remote in self.remotes:
             remote.send(("reset", (seed, options)))
         results = [remote.recv() for remote in self.remotes]
-        obs_list, info_lists = zip(*results)
+        obs_list, info_lists, mask_list = zip(*results)
         self._last_infos = [info for infos in info_lists for info in infos]
+        self._last_action_masks = np.concatenate(mask_list, axis=0)
         return _concat_obs(list(obs_list))
 
     def step(self, actions: np.ndarray):
@@ -254,7 +259,7 @@ class ShardedNativeBatchedVecEnv:
         for remote, shard_actions in zip(self.remotes, shards):
             remote.send(("step", shard_actions))
         results = [remote.recv() for remote in self.remotes]
-        obs_list, rew_list, term_list, trunc_list, info_lists = zip(*results)
+        obs_list, rew_list, term_list, trunc_list, info_lists, mask_list = zip(*results)
 
         obs = _concat_obs(list(obs_list))
         rewards = np.concatenate(rew_list, axis=0)
@@ -263,6 +268,7 @@ class ShardedNativeBatchedVecEnv:
         dones = terminated | truncated
         infos = [info for infos in info_lists for info in infos]
         self._last_infos = infos
+        self._last_action_masks = np.concatenate(mask_list, axis=0)
         return obs, rewards, dones, infos
 
     def close(self) -> None:
@@ -275,9 +281,7 @@ class ShardedNativeBatchedVecEnv:
             p.join(timeout=5)
 
     def action_masks(self) -> np.ndarray:
-        for remote in self.remotes:
-            remote.send(("action_masks", None))
-        return np.concatenate([remote.recv() for remote in self.remotes], axis=0)
+        return self._last_action_masks
 
     def env_method(self, method_name: str, *args, indices=None, **kwargs) -> list:
         for remote in self.remotes:
