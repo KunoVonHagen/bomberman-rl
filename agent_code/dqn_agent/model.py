@@ -248,6 +248,7 @@ class MaskableDQN:
 
         self.profile_every: int = 0
         self._profiler = StepProfiler()
+        self._rollout_iter = 0
 
     def _sample_masked_actions(self, action_masks: np.ndarray) -> np.ndarray:
         """Sample actions only from valid mask choices."""
@@ -430,25 +431,40 @@ class MaskableDQN:
             cb.on_training_start(self, env)
 
         while self.num_timesteps < target_num_timesteps:
+            do_profile = self.profile_every > 0 and (self._rollout_iter % self.profile_every == 0)
+            prof = self._profiler if do_profile else None
+            dev = self.device if do_profile else None
+
             for cb in callbacks:
                 cb.on_rollout_start(self, env)
 
             self.exploration_rate = self.exploration_schedule.value(self.num_timesteps)
 
+            if prof: prof.start("action_select")
             if self.num_timesteps < self.learning_starts:
                 actions = self._sample_masked_actions(self._last_action_masks)
             else:
                 actions, _ = self.predict(
                     self._last_obs, deterministic=False, action_masks=self._last_action_masks,
                 )
+            if prof: prof.stop("action_select", device=dev)
 
+            if prof: prof.start("env_step")
             next_obs, rewards, dones, infos = env.step(actions)
-            next_action_masks = env.action_masks()
+            if prof: prof.stop("env_step")
 
+            if prof: prof.start("action_masks")
+            next_action_masks = env.action_masks()
+            if prof: prof.stop("action_masks")
+
+            if prof: prof.start("buffer_add")
             self.replay_buffer.add(
                 self._last_obs, next_obs, actions, rewards, dones,
                 self._last_action_masks, next_action_masks,
             )
+            if prof: prof.stop("buffer_add")
+
+            self._rollout_iter += 1
 
             prev_num_timesteps = self.num_timesteps
             self._last_obs = next_obs
@@ -456,8 +472,10 @@ class MaskableDQN:
             self.num_timesteps += self.n_envs
             self._steps_since_train += 1
 
+            if prof: prof.start("callbacks_on_step")
             for cb in callbacks:
                 cb.on_step(self, env)
+            if prof: prof.stop("callbacks_on_step")
 
             if self.num_timesteps >= self.learning_starts and self._steps_since_train >= self.train_freq:
                 n_updates = self.gradient_steps if self.gradient_steps > 0 else self._steps_since_train

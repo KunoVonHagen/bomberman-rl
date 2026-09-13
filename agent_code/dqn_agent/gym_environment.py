@@ -1098,7 +1098,8 @@ class BombermanGymEnv(gym.Env):
 
         obs = self._build_observation()
         infos = [self._get_info(env) for env in range(self.n_envs)]
-        return obs, infos
+        masks = self.action_masks()
+        return obs, infos, masks
 
     def step(self, actions):
         actions = np.asarray(actions, dtype=np.int64).reshape(-1)
@@ -1145,7 +1146,8 @@ class BombermanGymEnv(gym.Env):
             self._update_prev_helpers(done_idx)
             obs = self._build_observation()
 
-        return obs, rewards, terminated, truncated, infos
+        masks = self.action_masks()
+        return obs, rewards, terminated, truncated, infos, masks
 
     def _advance(self, env: int, action: int):
         """Game logic for one env (the Python-heavy, but cheap, part)."""
