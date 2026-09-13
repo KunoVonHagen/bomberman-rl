@@ -324,15 +324,15 @@ class TrainingConfig:
 
 DEFAULT_CONFIG = TrainingConfig(
     run_name=None,
-    n_envs=16,
-    n_shards=4,
+    n_envs=256,
+    n_shards=32,
     total_timesteps=150_000_000,
     save_every_timesteps=1_048_576,
     dqn=DQNConfig(
         learning_rate=1e-4,
         buffer_size=500_000,
         learning_starts=50_000,
-        batch_size=256,
+        batch_size=2048,
         tau=1.0,
         gamma=0.99,
         train_freq=4,
