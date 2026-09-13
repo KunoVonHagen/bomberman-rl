@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections import deque
 from typing import Optional, Tuple
 
@@ -13,6 +14,29 @@ from agent_code.dqn_agent.replay_buffer import DictReplayBuffer
 from agent_code.dqn_agent.schedules import LinearSchedule
 
 __all__ = ["BombermanFeatureExtractor", "QNetwork", "MaskableDQN"]
+
+
+class StepProfiler:
+    """Opt-in timing breakdown of train-step stages using a rolling window."""
+
+    def __init__(self, window: int = 50):
+        self._times: dict[str, deque] = {}
+        self._t0: dict[str, float] = {}
+        self.window = window
+
+    def start(self, name: str) -> None:
+        self._t0[name] = time.perf_counter()
+
+    def stop(self, name: str, device: Optional[torch.device] = None) -> None:
+        if device is not None and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        dt_ms = (time.perf_counter() - self._t0[name]) * 1000.0
+        bucket = self._times.setdefault(name, deque(maxlen=self.window))
+        bucket.append(dt_ms)
+
+    def summary(self) -> dict[str, float]:
+        """Mean milliseconds per stage over the rolling window."""
+        return {name: (sum(vals) / len(vals)) for name, vals in self._times.items() if vals}
 
 
 class ResidualBlock(nn.Module):
@@ -114,19 +138,24 @@ class QNetwork(nn.Module):
         return self.q_head(self.features_extractor(observations))
 
 
-def _obs_to_tensors(observation: dict, device: torch.device) -> dict:
+def _obs_to_tensors(observation: dict, device: torch.device, pinned: Optional[dict] = None) -> dict:
     """Convert observation arrays to PyTorch tensors on a device."""
-    grid = observation["grid_tensor"]
-    feats = observation["features"]
-    grid = grid if torch.is_tensor(grid) else torch.as_tensor(np.asarray(grid), dtype=torch.float32)
-    feats = feats if torch.is_tensor(feats) else torch.as_tensor(np.asarray(feats), dtype=torch.float32)
+    grid_np = np.asarray(observation["grid_tensor"])
+    feats_np = np.asarray(observation["features"])
     non_blocking = device.type == "cuda"
-    if non_blocking:
-        grid = grid.pin_memory()
-        feats = feats.pin_memory()
+
+    if non_blocking and pinned is not None:
+        pinned["grid"].copy_(torch.from_numpy(grid_np))
+        pinned["features"].copy_(torch.from_numpy(feats_np))
+        grid_t = pinned["grid"]
+        feats_t = pinned["features"]
+    else:
+        grid_t = torch.as_tensor(grid_np, dtype=torch.float32)
+        feats_t = torch.as_tensor(feats_np, dtype=torch.float32)
+
     return {
-        "grid_tensor": grid.to(device, non_blocking=non_blocking),
-        "features": feats.to(device, non_blocking=non_blocking),
+        "grid_tensor": grid_t.to(device, non_blocking=non_blocking),
+        "features": feats_t.to(device, non_blocking=non_blocking),
     }
 
 
@@ -214,6 +243,12 @@ class MaskableDQN:
         self._mean_q_window: deque = deque(maxlen=100)
         self._td_error_window: deque = deque(maxlen=100)
 
+        self._pinned_obs: Optional[dict] = None
+        self._pinned_next_obs: Optional[dict] = None
+
+        self.profile_every: int = 0
+        self._profiler = StepProfiler()
+
     def _sample_masked_actions(self, action_masks: np.ndarray) -> np.ndarray:
         """Sample actions only from valid mask choices."""
         action_masks = np.asarray(action_masks)
@@ -271,26 +306,58 @@ class MaskableDQN:
                 self.buffer_size, n_envs, self.observation_space, self.n_actions,
             )
 
+    def _ensure_pinned_buffers(self, batch_size: int) -> None:
+        """Lazily allocate persistent pinned CPU staging buffers."""
+        if self.device.type != "cuda":
+            return
+        grid_shape = tuple(self.observation_space["grid_tensor"].shape)
+        feat_shape = tuple(self.observation_space["features"].shape)
+
+        need_alloc = (
+            self._pinned_obs is None
+            or self._pinned_obs["grid"].shape[0] != batch_size
+        )
+        if need_alloc:
+            def make(shape):
+                return torch.empty((batch_size, *shape), dtype=torch.float32, pin_memory=True)
+
+            self._pinned_obs = {"grid": make(grid_shape), "features": make(feat_shape)}
+            self._pinned_next_obs = {"grid": make(grid_shape), "features": make(feat_shape)}
+
     def train_step(self) -> Optional[dict]:
         """Run one gradient step on a minibatch from the replay buffer."""
         if self.replay_buffer is None or len(self.replay_buffer) < max(self.batch_size, 1):
             return None
 
+        do_profile = self.profile_every > 0 and (self.n_updates % self.profile_every == 0)
+        prof = self._profiler if do_profile else None
+        dev = self.device if do_profile else None
+
+        self._ensure_pinned_buffers(self.batch_size)
+
+        if prof: prof.start("sample")
         batch = self.replay_buffer.sample(self.batch_size)
-        obs = _obs_to_tensors(batch["obs"], self.device)
-        next_obs = _obs_to_tensors(batch["next_obs"], self.device)
+        if prof: prof.stop("sample")
+
+        if prof: prof.start("host_to_device")
+        obs = _obs_to_tensors(batch["obs"], self.device, pinned=self._pinned_obs)
+        next_obs = _obs_to_tensors(batch["next_obs"], self.device, pinned=self._pinned_next_obs)
         actions = torch.as_tensor(batch["actions"], device=self.device, dtype=torch.int64)
         rewards = torch.as_tensor(batch["rewards"], device=self.device, dtype=torch.float32)
         dones = torch.as_tensor(batch["dones"], device=self.device, dtype=torch.float32)
         next_masks = torch.as_tensor(batch["next_action_masks"], device=self.device, dtype=torch.bool)
+        if prof: prof.stop("host_to_device", device=dev)
 
+        if prof: prof.start("target_forward")
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self._amp_enabled):
             next_q = self.q_net_target(next_obs)
             next_q = next_q.masked_fill(~next_masks, float("-inf"))
             next_q = torch.nan_to_num(next_q, neginf=0.0)
             next_q_max = next_q.max(dim=1).values
             target = rewards + (1.0 - dones) * self.gamma * next_q_max
+        if prof: prof.stop("target_forward", device=dev)
 
+        if prof: prof.start("online_forward_backward")
         self.q_net.train()
         with torch.autocast(device_type=self.device.type, enabled=self._amp_enabled):
             q_values_all = self.q_net(obs)
@@ -304,10 +371,17 @@ class MaskableDQN:
         grad_norm = nn.utils.clip_grad_norm_(self.q_net.parameters(), clip_at)
         self.scaler.step(self.optimizer)
         self.scaler.update()
+        if prof: prof.stop("online_forward_backward", device=dev)
 
         with torch.no_grad():
             td_error = (target - q_values).abs().mean()
             mean_q = q_values_all.mean()
+
+        if prof:
+            self._last_profile = prof.summary()
+            self._last_profile["replay_sample_reported_ms"] = (
+                (self.replay_buffer.last_sample_time_s or 0.0) * 1000.0
+            )
 
         return {
             "loss": loss.detach(),
@@ -315,6 +389,10 @@ class MaskableDQN:
             "mean_q": mean_q.detach(),
             "td_error": td_error.detach(),
         }
+
+    def get_profile_stats(self) -> Optional[dict]:
+        """Return the most recent profiled train-step breakdown in milliseconds, or None if unavailable."""
+        return getattr(self, "_last_profile", None)
 
     def update_target(self) -> None:
         """Blend the target network toward the online network."""
