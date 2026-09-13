@@ -449,6 +449,8 @@ class BombermanGymEnv(gym.Env):
         self._enable_crate_distance = "crate_distance" in self.enabled_groups
         self._enable_coin_distance = "coin_distance" in self.enabled_groups
 
+        self._crate_potential_cache: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+
         output_indices = sorted(idx for g in self.enabled_groups for idx in LAYER_GROUPS[g])
         self._full_output = len(output_indices) == NUM_LAYERS
         self._output_layer_indices = (
@@ -1396,7 +1398,7 @@ class BombermanGymEnv(gym.Env):
         self._rebuild_static_layers(env)
         self._refresh_dynamic_layers()
         if self._enable_crate_potential:
-            self._init_crate_potential([env])
+            self._refresh_crate_potential_cached(env)
         self._refresh_forecast_layers()
 
         obs = self._build_observation()
@@ -1404,6 +1406,22 @@ class BombermanGymEnv(gym.Env):
             "grid_tensor": obs["grid_tensor"][env],
             "features": obs["features"][env],
         }
+
+    def _refresh_crate_potential_cached(self, env: int) -> None:
+        """Fill CRATE_POTENTIAL_LAYER[env] from cache when the crate layout
+        hasn't changed since the last call"""
+        crate_mask = (self.arena[env] == 1)
+        cached = self._crate_potential_cache.get(env)
+        if cached is not None and cached[0].shape == crate_mask.shape \
+                and np.array_equal(cached[0], crate_mask):
+            self.grid_tensor[env, CRATE_POTENTIAL_LAYER] = cached[1]
+            return
+
+        self._init_crate_potential([env])
+        self._crate_potential_cache[env] = (
+            crate_mask.copy(),
+            self.grid_tensor[env, CRATE_POTENTIAL_LAYER].copy(),
+        )
 
     def _tile_is_free(self, env: int, x, y) -> bool:
         if self.arena[env, x, y] != 0:

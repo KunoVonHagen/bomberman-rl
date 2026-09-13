@@ -15,6 +15,9 @@ from agent_code.dqn_agent.model import MaskableDQN
 
 OpponentPair = Tuple[Callable, Callable]
 
+_MODEL_CACHE: Dict[str, "MaskableDQN"] = {}
+_OBS_ENV_CACHE: Dict[str, "BombermanGymEnv"] = {}
+
 
 class _CheckpointOpponent:
     """Wrap a checkpointed DQN model as an in-game opponent."""
@@ -39,8 +42,16 @@ class _CheckpointOpponent:
     def _ensure_ready(self):
         """Load the model and observation environment lazily."""
         if self._model is None:
-            self._model = MaskableDQN.load(self.model_path, device="cpu")
+            self._model = _MODEL_CACHE.get(self.model_path)
+            if self._model is None:
+                self._model = MaskableDQN.load(self.model_path, device="cpu")
+                _MODEL_CACHE[self.model_path] = self._model
 
+        if self._obs_env is None:
+            self._obs_env = _OBS_ENV_CACHE.get(self.model_path)
+        if self._obs_env is not None:
+            self._action_names = {v: k for k, v in ACTION_INDICES.items() if k is not None}
+            return
         if self._obs_env is None:
             log_dir = tempfile.mkdtemp(prefix="dqn_checkpoint_opponent_")
             world_args = WorldArgs(
@@ -64,6 +75,7 @@ class _CheckpointOpponent:
                 opponents=[((lambda handle: None), (lambda handle, state: "WAIT"))] * 3,
                 layer_config=self.env_cfg.layer_config,
             )
+            _OBS_ENV_CACHE[self.model_path] = self._obs_env
             self._action_names = {v: k for k, v in ACTION_INDICES.items() if k is not None}
 
     def setup(self, agent):
@@ -118,6 +130,15 @@ class OpponentPool:
         if saved_count % every == 0:
             self._checkpoints.append(checkpoint_dir)
             self._checkpoints = self._checkpoints[-self.cfg.pool_size:]
+            self._prune_opponent_cache()
+
+    def _prune_opponent_cache(self) -> None:
+        """Drop cached opponent pairs for checkpoints that fell out of the
+        active pool."""
+        active_keys = {str(p.resolve()) for p in self._checkpoints}
+        for key in list(self._opponent_cache):
+            if key not in active_keys:
+                del self._opponent_cache[key]
 
     def _sample_checkpoint(self) -> Optional[pathlib.Path]:
         """Sample one checkpoint from the active pool."""
@@ -261,4 +282,3 @@ class OpponentSampler:
         descriptions = self.pool.last_opponent_descriptions()
         scenario = self.pool.current_scenario()
         return opponents, scenario, descriptions
-
