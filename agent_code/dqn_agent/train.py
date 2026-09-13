@@ -543,6 +543,11 @@ class ProgressLoggingCallback:
             except TypeError:
                 pass
 
+        profile_stats = getattr(model, "get_profile_stats", lambda: None)()
+        if profile_stats:
+            for stage, ms in profile_stats.items():
+                train[f"profile_{stage}_ms"] = round(ms, 3)
+
         if self.verbose:
             print(_format_metrics_table({"rollout": rollout, "time": time_stats, "train": train}))
 
@@ -684,6 +689,7 @@ def run(
     overrides: dict | None = None,
     overrides_file: str | None = None,
     schedule: list[dict] | None = DEFAULT_SCHEDULE,
+    profile_every: int = 0,
 ) -> None:
     freeze_support()
 
@@ -730,6 +736,7 @@ def run(
     env.env_method("set_opponent_resampler", OpponentSampler(pool))
 
     model = build_model(env, cfg, device)
+    model.profile_every = profile_every
 
     timesteps_done = 0
     if resume_from:
@@ -739,6 +746,7 @@ def run(
         )
         if checkpoint_dir is not None:
             model = ckman.load_model(MaskableDQN, checkpoint_dir, env=env, device=device)
+            model.profile_every = profile_every
             timesteps_done = ckman.resolved_timesteps(checkpoint_dir)
             apply_dqn_hyperparams(model, cfg.dqn, cfg.total_timesteps)
             print(f"Loaded checkpoint {checkpoint_dir.name} ({timesteps_done} timesteps)")
@@ -808,6 +816,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default=None, choices=["auto", "cuda", "cpu"])
     p.add_argument("--n-envs", type=int, default=None)
     p.add_argument("--n-shards", type=int, default=None)
+    p.add_argument("--profile-every", type=int, default=0,
+                    help="Profile every Nth train_step() (ms per stage: sample, "
+                         "host_to_device, target_forward, online_forward_backward). "
+                         "0 (default) disables profiling.")
     p.add_argument("--set", dest="overrides", type=str, nargs="*", default=[],
                    metavar="path.to.field=value",
                    help="Override any TrainingConfig field by dotted path, e.g. --set dqn.learning_rate=5e-5")
@@ -846,4 +858,5 @@ if __name__ == "__main__":
         overrides=overrides or None,
         overrides_file=args.overrides_file,
         schedule=schedule,
+        profile_every=args.profile_every,
     )
