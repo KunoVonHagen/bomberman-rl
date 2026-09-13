@@ -1,4 +1,5 @@
 import pickle
+import time
 from collections import namedtuple
 from pathlib import Path
 from typing import List, Tuple, Callable, Optional, Dict, Any, Iterable, Set
@@ -498,6 +499,10 @@ class BombermanGymEnv(gym.Env):
 
         self.agent_actions: List[Dict[Any, str]] = [{} for _ in range(E)]
         self._replays: List[Optional[Dict[str, Any]]] = [None] * E
+
+        self.profile_every_steps: int = 0
+        self._step_profile_totals: Dict[str, float] = {}
+        self._step_profile_count = 0
 
         T_bfs = self._BT + self._ET
         self._ta_bfs_visited = np.zeros((E, W, H, T_bfs + 1), dtype=np.bool_)
@@ -1110,12 +1115,19 @@ class BombermanGymEnv(gym.Env):
         if np.any(actions < 0) or np.any(actions >= len(ACTIONS)):
             raise ValueError("action index out of range")
 
+        prof = self.profile_every_steps > 0
+        t0 = time.perf_counter() if prof else None
+
         for env in range(self.n_envs):
             self._advance(env, int(actions[env]))
+
+        t1 = time.perf_counter() if prof else None
 
         self._refresh_dynamic_layers()
         self._refresh_forecast_layers()
         obs = self._build_observation()
+
+        t2 = time.perf_counter() if prof else None
 
         rewards = np.zeros(self.n_envs, dtype=np.float32)
         for env in range(self.n_envs):
@@ -1147,6 +1159,11 @@ class BombermanGymEnv(gym.Env):
             obs = self._build_observation()
 
         masks = self.action_masks()
+
+        if prof:
+            t3 = time.perf_counter()
+            self._accumulate_step_profile(t0, t1, t2, t3)
+
         return obs, rewards, terminated, truncated, infos, masks
 
     def _advance(self, env: int, action: int):
@@ -1603,6 +1620,25 @@ class BombermanGymEnv(gym.Env):
             "score": self.agents[env].score,
             "events": list(self.agents[env].events),
         }
+
+    def set_step_profiling(self, every_steps: int) -> None:
+        self.profile_every_steps = max(0, int(every_steps))
+        self._step_profile_totals = {}
+        self._step_profile_count = 0
+
+    def _accumulate_step_profile(self, t0, t1, t2, t3) -> None:
+        totals = self._step_profile_totals
+        totals["advance"] = totals.get("advance", 0.0) + (t1 - t0)
+        totals["refresh_and_observation"] = totals.get("refresh_and_observation", 0.0) + (t2 - t1)
+        totals["reward_done_masks"] = totals.get("reward_done_masks", 0.0) + (t3 - t2)
+        self._step_profile_count += 1
+
+        if self._step_profile_count >= self.profile_every_steps:
+            n = self._step_profile_count
+            parts = ", ".join(f"{k}={1000.0 * v / n:.2f}ms" for k, v in totals.items())
+            print(f"[env-profile] n_envs={self.n_envs} avg over {n} steps: {parts}", flush=True)
+            self._step_profile_totals = {}
+            self._step_profile_count = 0
 
     def action_masks(self) -> np.ndarray:
         """

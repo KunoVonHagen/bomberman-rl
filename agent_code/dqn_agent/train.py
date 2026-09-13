@@ -738,6 +738,8 @@ def run(
 
     env = make_train_env(cfg, opponents, str(ckman.logs_dir))
     env.env_method("set_opponent_resampler", OpponentSampler(pool))
+    if profile_every > 0:
+        env.env_method("set_step_profiling", profile_every)
 
     model = build_model(env, cfg, device)
     model.profile_every = profile_every
