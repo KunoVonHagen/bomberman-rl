@@ -680,7 +680,8 @@ def play_test_game(
         total_reward += reward[0]
         done = dones[0]
     test_env.close()
-    print(f"Eval game finished at {timesteps_done} timesteps, total_reward={total_reward}")
+    print(f"Eval game finished at {timesteps_done} timesteps, score={info[0]['score']}, "
+          f"alive={info[0]['alive']}, total_reward={total_reward}")
     print(f"Saved eval replay -> {replay_path}")
 
 
@@ -707,7 +708,7 @@ def run_eval_suite(
     bot_paths: list[str] | None = None,
     generalization_cases: list[tuple[str, int]] | None = None,
     generalization_opponent: str = "agent_code.rule_based_agent.callbacks",
-) -> dict[str, float]:
+) -> dict[str, dict[str, float | None]]:
     """
     Run a suite of evaluation games against a set of bots (all at the standard 1v3
     "classic" table) plus a set of generalization cases that vary the scenario and/or
@@ -717,15 +718,15 @@ def run_eval_suite(
     generalization_cases = (
         generalization_cases if generalization_cases is not None else EVAL_SUITE_GENERALIZATION_CASES
     )
-    results: dict[str, float] = {}
+    results: dict[str, dict[str, float | None]] = {}
 
-    def _play_episodes(opponents, scenario: str, tag: str) -> float:
+    def _play_episodes(opponents, scenario: str, tag: str) -> dict[str, float | None]:
         case_cfg = cfg
         if scenario != cfg.env.scenario:
             case_cfg = copy.deepcopy(cfg)
             case_cfg.env.scenario = scenario
 
-        rewards = []
+        stats: dict[str, list[float]] = {"score": [], "win": [], "survived": [], "length": [], "reward": []}
         for i in range(n_episodes):
             replay_path = ckman.replays_dir / f"eval_{tag}_{timesteps_done:010d}_{i}.pkl"
             test_env = make_test_env(case_cfg, opponents, str(ckman.logs_dir), str(replay_path))
@@ -739,22 +740,33 @@ def run_eval_suite(
                 total_reward += float(reward[0])
                 done = bool(dones[0])
             test_env.close()
-            rewards.append(total_reward)
-        return float(sum(rewards) / len(rewards))
+            final = info[0]
+            stats["score"].append(float(final["score"]))
+            stats["survived"].append(float(final["alive"]))
+            stats["length"].append(float(final["step"]))
+            stats["reward"].append(total_reward)
+            if final["opponent_scores"]:
+                stats["win"].append(float(final["score"] > max(final["opponent_scores"])))
+        return {key: (sum(values) / len(values) if values else None) for key, values in stats.items()}
+
+    def _format(summary: dict[str, float | None]) -> str:
+        win = "-" if summary["win"] is None else f"{100 * summary['win']:.0f}%"
+        return (f"score {summary['score']:.2f}, win {win}, survived {100 * summary['survived']:.0f}%, "
+                f"length {summary['length']:.0f}, reward {summary['reward']:.2f}")
 
     for bot_path in bot_paths:
         opponents = [OpponentPool._resolve_static(bot_path)] * 3
         bot_short_name = bot_path.split(".")[1]
-        mean_reward = _play_episodes(opponents, cfg.env.scenario, bot_short_name)
-        results[bot_path] = mean_reward
-        print(f"  eval vs {bot_short_name} ({cfg.env.scenario}, 3 opp): {mean_reward:.2f} (n={n_episodes})")
+        summary = _play_episodes(opponents, cfg.env.scenario, bot_short_name)
+        results[bot_path] = summary
+        print(f"  eval vs {bot_short_name} ({cfg.env.scenario}, 3 opp): {_format(summary)} (n={n_episodes})")
 
     for scenario, n_opponents in generalization_cases:
         opponents = [OpponentPool._resolve_static(generalization_opponent)] * n_opponents
         tag = f"gen_{scenario}_{n_opponents}opp"
-        mean_reward = _play_episodes(opponents, scenario, tag)
-        results[tag] = mean_reward
-        print(f"  eval generalization [{scenario}, {n_opponents} opp]: {mean_reward:.2f} (n={n_episodes})")
+        summary = _play_episodes(opponents, scenario, tag)
+        results[tag] = summary
+        print(f"  eval generalization [{scenario}, {n_opponents} opp]: {_format(summary)} (n={n_episodes})")
 
     return results
 

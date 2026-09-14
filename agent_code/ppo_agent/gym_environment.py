@@ -1176,8 +1176,12 @@ class BombermanGymEnv(gym.Env):
         self._refresh_forecast_layers()
         obs = self._build_observation()
 
+        round_over = self.step_counts >= s.MAX_STEPS
         if self._fixes:
-            for env in np.nonzero(self.step_counts >= s.MAX_STEPS)[0]:
+            for env in range(self.n_envs):
+                if not round_over[env] and self._nothing_left_for_sole_survivor(env):
+                    round_over[env] = True
+            for env in np.nonzero(round_over)[0]:
                 if not self.agents[int(env)].dead:
                     self.agents[int(env)].add_event(e.SURVIVED_ROUND)
 
@@ -1187,7 +1191,7 @@ class BombermanGymEnv(gym.Env):
             rewards[env] = self.reward_fn(env)
 
         terminated = np.fromiter((a.dead for a in self.agents), dtype=bool, count=self.n_envs)
-        truncated = self.step_counts >= s.MAX_STEPS
+        truncated = round_over
         done = terminated | truncated
 
         infos = [self._get_info(env) for env in range(self.n_envs)]
@@ -1211,6 +1215,13 @@ class BombermanGymEnv(gym.Env):
             obs = self._build_observation()
 
         return obs, rewards, terminated, truncated, infos
+
+    def _nothing_left_for_sole_survivor(self, env: int) -> bool:
+        if self.agents[env].dead or any(not h.dead for h in self.opponent_handles[env]):
+            return False
+        if np.any(self.arena[env] == 1) or np.any(self.coins_collectable[env]):
+            return False
+        return not self.bombs[env] and not self.explosions[env]
 
     def _advance(self, env: int, action: int):
         """Game logic for one env (the Python-heavy, but cheap, part)."""
@@ -1690,6 +1701,8 @@ class BombermanGymEnv(gym.Env):
             "round": int(self.rounds[env]),
             "step": int(self.step_counts[env]),
             "score": self.agents[env].score,
+            "alive": not self.agents[env].dead,
+            "opponent_scores": [h.score for h in self.opponent_handles[env][:self.n_real_opponents[env]]],
             "events": list(self.agents[env].events),
         }
 
