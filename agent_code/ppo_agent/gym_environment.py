@@ -782,7 +782,10 @@ class BombermanGymEnv(gym.Env):
                     pos_ch = 8 + b["timer"]
                     danger_ch = 8 + BT + b["timer"]
                     g[pos_ch, b["x"], b["y"]] = 1.0
-                    g[danger_ch] = self._blast_tensor[b["x"], b["y"]]
+                    if self._fixes:
+                        np.maximum(g[danger_ch], self._blast_tensor[b["x"], b["y"]], out=g[danger_ch])
+                    else:
+                        g[danger_ch] = self._blast_tensor[b["x"], b["y"]]
 
                 for ex in self.explosions[env]:
                     if ex["stage"] == 0:
