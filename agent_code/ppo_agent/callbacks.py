@@ -3,8 +3,12 @@ from __future__ import annotations
 import pathlib
 import time
 from typing import Optional
+
+import numpy as np
+import torch
 from sb3_contrib import MaskablePPO
 
+import settings as s
 from agent_code.ppo_agent.checkpoint_manager import CheckpointManager
 from agent_code.ppo_agent.config import DEFAULT_CONFIG
 from agent_code.ppo_agent.gym_environment import ACTION_INDICES, BombermanGymEnv, WorldArgs
@@ -77,11 +81,56 @@ def _get_dummy_env(run_dir: pathlib.Path) -> BombermanGymEnv:
     )
 
 
+def _make_warmup_state() -> dict:
+    W, H = s.COLS, s.ROWS
+    field = np.zeros((W, H), dtype=np.int8)
+    field[0, :] = field[-1, :] = field[:, 0] = field[:, -1] = -1
+    for x in range(W):
+        for y in range(H):
+            if (x + 1) * (y + 1) % 2 == 1:
+                field[x, y] = -1
+    for x, y in ((3, 1), (1, 3), (7, 8), (8, 7), (9, 9)):
+        field[x, y] = 1
+
+    explosion_map = np.zeros((W, H))
+    for x, y in ((5, 5), (5, 6), (5, 7)):
+        explosion_map[x, y] = 1
+
+    return {
+        "round": 0,
+        "step": 1,
+        "field": field,
+        "self": ("warmup", 0, False, (1, 1)),
+        "others": [("warmup_opponent", 0, True, (W - 2, H - 2))],
+        "bombs": [((1, 1), 3), ((W - 2, 1), 1)],
+        "coins": [(1, 5), (11, 11)],
+        "explosion_map": explosion_map,
+        "user_input": None,
+    }
+
+
+def _warm_up(self) -> None:
+    time_start = time.time()
+    obs_env = self._ppo_obs_env
+
+    state = _make_warmup_state()
+    obs = obs_env.observation_from_game_state(state)
+    self._ppo_model.predict(obs, deterministic=True, action_masks=obs_env.action_masks())
+
+    state["bombs"] = []
+    state["explosion_map"] = np.zeros_like(state["explosion_map"])
+    obs = obs_env.observation_from_game_state(state)
+    self._ppo_model.predict(obs, deterministic=True, action_masks=obs_env.action_masks())
+
+    self.logger.info(f"ppo_agent.setup: warm-up finished in {time.time() - time_start:.2f}s")
+
+
 def setup(self):
     """
     Called once at the start of a match.
     Loads the trained MaskablePPO checkpoint and prepares a BombermanGymEnv for observation conversion.
     """
+    torch.set_num_threads(1)
 
     _RUN_DIR = _resolve_run_dir()
 
@@ -89,6 +138,11 @@ def setup(self):
     self._ppo_obs_env = _get_dummy_env(_RUN_DIR)
 
     self._ppo_model.requires_grad_(False)
+
+    try:
+        _warm_up(self)
+    except Exception as exc:
+        self.logger.warning(f"ppo_agent.setup: warm-up failed ({exc!r}) the first steps may exceed the time limit")
 
 
 def act(self, game_state: dict) -> str:
