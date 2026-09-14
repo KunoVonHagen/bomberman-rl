@@ -1055,7 +1055,17 @@ class BombermanGymEnv(gym.Env):
 
         f[:, FEATURE_BOMB_TARGET_VALUE] = np.clip(
             gt[idx, CRATE_POTENTIAL_LAYER, ax, ay] / self._CRATE_POTENTIAL_MAX, 0.0, 1.0)
-        trap = gt[idx, OPPONENTS_LEAST_DISTANCE_LAYER, ax, ay]
+        if self._fixes:
+            trap = np.full(E, -1.0, dtype=np.float32)
+            for env in range(E):
+                for h in self.opponent_handles[env]:
+                    if h.dead or gt[env, DANGER_ONSET_LAYER, h.x, h.y] < 0:
+                        continue
+                    d = gt[env, SELF_DISTANCE_LAYER, h.x, h.y]
+                    if d >= 0 and (trap[env] < 0 or d < trap[env]):
+                        trap[env] = d
+        else:
+            trap = gt[idx, OPPONENTS_LEAST_DISTANCE_LAYER, ax, ay]
         f[:, FEATURE_TRAPPED_OPPONENT_DISTANCE] = np.where(
             trap < 0, -1.0, trap / self._T_HORIZON)
         return f
