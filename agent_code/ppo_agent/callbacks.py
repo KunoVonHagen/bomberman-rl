@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import pathlib
+import sys
 import time
+import traceback
 from typing import Optional
 
 import numpy as np
@@ -9,53 +12,74 @@ import torch
 from sb3_contrib import MaskablePPO
 
 import settings as s
-from agent_code.ppo_agent.checkpoint_manager import CheckpointManager
-from agent_code.ppo_agent.config import DEFAULT_CONFIG
-from agent_code.ppo_agent.gym_environment import ACTION_INDICES, BombermanGymEnv, WorldArgs
+from .config import TrainingConfig
+from .gym_environment import ACTION_INDICES, BombermanGymEnv, WorldArgs
+from .model import BombermanFeatureExtractor
 
 RUN: str = "run_20260831-190704"
 CHECKPOINT: Optional[str] = "checkpoint_0143654912"
 DETERMINISTIC: bool = True
 
+AGENT_DIR = pathlib.Path(__file__).resolve().parent
 _ACTION_NAMES = {v: k for k, v in ACTION_INDICES.items() if k is not None}
 
 
 def _resolve_run_dir() -> pathlib.Path:
-    """Resolve RUN (a run name or a path to a run directory) to a run dir."""
-    run_dir = pathlib.Path(RUN)
-    if not run_dir.exists():
-        run_dir = pathlib.Path(DEFAULT_CONFIG.runs_dir) / RUN
-    if not run_dir.exists():
-        raise FileNotFoundError(
-            f"ppo_agent: no run found at '{RUN}' -- set RUN at the top of "
-            f"callbacks.py to a valid run name or path."
-        )
-    return run_dir
-
-def _load_model(run_dir: pathlib.Path, checkpoint: Optional[str] = None) -> MaskablePPO:
-    """Load a MaskablePPO model from a run directory and optional checkpoint name."""
-    manager = CheckpointManager.resume(str(run_dir))
-    if checkpoint is None:
-        checkpoint_path = manager.latest_checkpoint()
-    else:
-        checkpoint_path = manager.get_checkpoint(checkpoint)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(
-            f"ppo_agent: no checkpoint found at '{checkpoint_path}' -- set CHECKPOINT at the top of "
-            f"callbacks.py to a valid checkpoint name or None for the latest."
-        )
-    return MaskablePPO.load(
-        checkpoint_path / "model.zip",
-        device="cpu",
-        custom_objects={"n_envs": 1, "n_steps": 1}
+    candidates = [
+        AGENT_DIR / "runs" / RUN,
+        AGENT_DIR / RUN,
+        pathlib.Path(RUN),
+        AGENT_DIR.parent.parent / "runs" / RUN,
+    ]
+    for run_dir in candidates:
+        if (run_dir / "run_manifest.json").exists():
+            return run_dir
+    raise FileNotFoundError(
+        f"ppo_agent: no run '{RUN}' with a run_manifest.json in any of "
+        f"{[str(c) for c in candidates]} -- set RUN at the top of callbacks.py"
     )
 
-def _get_dummy_env(run_dir: pathlib.Path) -> BombermanGymEnv:
-    """Get a dummy BombermanGymEnv for the given run directory."""
-    manager = CheckpointManager.resume(run_dir)
-    manifest = manager.read_manifest()
-    env_cfg = manager.config.env
 
+def _resolve_checkpoint_dir(run_dir: pathlib.Path, checkpoint: Optional[str]) -> pathlib.Path:
+    checkpoints = run_dir / "checkpoints"
+    if checkpoint:
+        checkpoint_dir = checkpoints / checkpoint
+    else:
+        pointer = checkpoints / "latest.txt"
+        if pointer.exists():
+            checkpoint_dir = checkpoints / pointer.read_text().strip()
+        else:
+            found = sorted(p for p in checkpoints.glob("checkpoint_*") if p.is_dir())
+            if not found:
+                raise FileNotFoundError(f"ppo_agent: no checkpoints in '{checkpoints}'")
+            checkpoint_dir = found[-1]
+    if not (checkpoint_dir / "model.zip").exists():
+        raise FileNotFoundError(
+            f"ppo_agent: no model.zip in '{checkpoint_dir}' -- set CHECKPOINT at the top of "
+            f"callbacks.py to a valid checkpoint name or None for the latest."
+        )
+    return checkpoint_dir
+
+
+def _load_config(run_dir: pathlib.Path) -> TrainingConfig:
+    manifest = json.loads((run_dir / "run_manifest.json").read_text())
+    return TrainingConfig.from_dict(manifest["config"])
+
+
+def _load_model(checkpoint_dir: pathlib.Path) -> MaskablePPO:
+    return MaskablePPO.load(
+        checkpoint_dir / "model.zip",
+        device="cpu",
+        custom_objects={
+            "n_envs": 1,
+            "n_steps": 1,
+            "policy_kwargs": dict(features_extractor_class=BombermanFeatureExtractor),
+        },
+    )
+
+
+def _get_dummy_env(cfg: TrainingConfig) -> BombermanGymEnv:
+    env_cfg = cfg.env
     world_args = WorldArgs(
         scenario=env_cfg.scenario,
         seed=None,
@@ -72,7 +96,6 @@ def _get_dummy_env(run_dir: pathlib.Path) -> BombermanGymEnv:
         replay=False,
         continue_without_training=env_cfg.continue_without_training,
     )
-
     dummy_opponents = [((lambda handle: None), (lambda handle, state: "WAIT"))] * 3
     return BombermanGymEnv(
         world_args,
@@ -126,49 +149,57 @@ def _warm_up(self) -> None:
     self.logger.info(f"ppo_agent.setup: warm-up finished in {time.time() - time_start:.2f}s")
 
 
+def _fail(self, message: str) -> None:
+    text = f"{message}\n{traceback.format_exc()}"
+    self.logger.error(text)
+    print(text, file=sys.stderr)
+
+
 def setup(self):
-    """
-    Called once at the start of a match.
-    Loads the trained MaskablePPO checkpoint and prepares a BombermanGymEnv for observation conversion.
-    """
     torch.set_num_threads(1)
+    self._ppo_model = None
+    self._ppo_obs_env = None
 
-    _RUN_DIR = _resolve_run_dir()
-
-    self._ppo_model = _load_model(_RUN_DIR, CHECKPOINT).policy
-    self._ppo_obs_env = _get_dummy_env(_RUN_DIR)
-
-    self._ppo_model.requires_grad_(False)
+    try:
+        run_dir = _resolve_run_dir()
+        cfg = _load_config(run_dir)
+        checkpoint_dir = _resolve_checkpoint_dir(run_dir, CHECKPOINT)
+        model = _load_model(checkpoint_dir).policy
+        model.requires_grad_(False)
+        self._ppo_obs_env = _get_dummy_env(cfg)
+        self._ppo_model = model
+        self.logger.info(f"ppo_agent.setup: loaded {checkpoint_dir}")
+    except Exception:
+        _fail(self, "ppo_agent.setup: could not load the model, every action will be WAIT")
+        return
 
     try:
         _warm_up(self)
-    except Exception as exc:
-        self.logger.warning(f"ppo_agent.setup: warm-up failed ({exc!r}) the first steps may exceed the time limit")
+    except Exception:
+        _fail(self, "ppo_agent.setup: warm-up failed, the first steps may exceed the time limit")
 
 
 def act(self, game_state: dict) -> str:
-    """
-    Called on every game step.
-    Converts the game_state to an observation, applies action masks, and uses the trained MaskablePPO model to predict the next action.
-    """
+    if self._ppo_model is None:
+        return "WAIT"
+
     time_start = time.time()
-
-    obs_env = self._ppo_obs_env
-    obs = obs_env.observation_from_game_state(game_state)
-
-    action_masks = obs_env.action_masks()
-
-    action_idx, _ = self._ppo_model.predict(
-        obs,
-        deterministic=DETERMINISTIC,
-        action_masks=action_masks,
-    )
-
-    chosen_action = _ACTION_NAMES[int(action_idx)]
+    try:
+        obs_env = self._ppo_obs_env
+        obs = obs_env.observation_from_game_state(game_state)
+        action_masks = obs_env.action_masks()
+        action_idx, _ = self._ppo_model.predict(
+            obs,
+            deterministic=DETERMINISTIC,
+            action_masks=action_masks,
+        )
+        chosen_action = _ACTION_NAMES[int(action_idx)]
+    except Exception:
+        _fail(self, f"ppo_agent.act: failed at step {game_state.get('step')}, returning WAIT")
+        return "WAIT"
 
     self.logger.debug(
         f"ppo_agent.act: step={game_state['step']}, round={game_state['round']}, "
         f"action={chosen_action}, time={time.time() - time_start:.3f}s"
     )
     return chosen_action
-

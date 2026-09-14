@@ -2,8 +2,8 @@ import time
 import pathlib
 import numpy as np
 
-from agent_code.ppo_agent.config import DEFAULT_CONFIG
-from agent_code.ppo_agent.gym_environment import BombermanGymEnv
+from .config import DEFAULT_CONFIG
+from .gym_environment import BombermanGymEnv
 from environment import WorldArgs
 from agent_code.my_agent.callbacks import setup as my_agent_setup, act as my_agent_act
 

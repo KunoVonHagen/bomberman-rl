@@ -14,13 +14,13 @@ import torch
 
 from environment import WorldArgs
 
-from agent_code.dqn_agent.config import DEFAULT_CONFIG, TrainingConfig, DQNConfig, RewardConfig, load_overrides_file
-from agent_code.dqn_agent.checkpoint_manager import CheckpointManager
-from agent_code.dqn_agent.gym_environment import BombermanGymEnv
-from agent_code.dqn_agent.model import BombermanFeatureExtractor, MaskableDQN
-from agent_code.dqn_agent.opponent_pool import OpponentPool, OpponentSampler
-from agent_code.dqn_agent.schedules import LinearSchedule
-from agent_code.dqn_agent.training_schedule import DEFAULT_SCHEDULE, load_schedule
+from .config import DEFAULT_CONFIG, TrainingConfig, DQNConfig, RewardConfig, load_overrides_file
+from .checkpoint_manager import CheckpointManager
+from .gym_environment import BombermanGymEnv
+from .model import BombermanFeatureExtractor, MaskableDQN
+from .opponent_pool import OpponentPool, OpponentSampler
+from .schedules import LinearSchedule
+from .training_schedule import DEFAULT_SCHEDULE, load_schedule
 
 
 def resolve_device(requested: str = "auto") -> str:

@@ -18,18 +18,18 @@ from stable_baselines3.common.vec_env import VecEnv, VecMonitor
 
 from environment import WorldArgs
 
-from agent_code.ppo_agent.gym_environment import BombermanGymEnv
-from agent_code.ppo_agent.model import BombermanFeatureExtractor
-from agent_code.ppo_agent.config import (
+from .gym_environment import BombermanGymEnv
+from .model import BombermanFeatureExtractor
+from .config import (
     DEFAULT_CONFIG,
     TrainingConfig,
     PPOConfig,
     RewardConfig,
     load_overrides_file,
 )
-from agent_code.ppo_agent.checkpoint_manager import CheckpointManager
-from agent_code.ppo_agent.opponent_pool import OpponentPool, OpponentSampler
-from agent_code.ppo_agent.training_schedule import DEFAULT_SCHEDULE, load_schedule
+from .checkpoint_manager import CheckpointManager
+from .opponent_pool import OpponentPool, OpponentSampler
+from .training_schedule import DEFAULT_SCHEDULE, load_schedule
 
 
 def mask_fn(env):
