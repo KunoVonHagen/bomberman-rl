@@ -36,15 +36,18 @@ def _extend_danger_map(base_danger_map, field, bomb_pos, bomb_timer, power, hori
     return extended
 
 
-def _time_expanded_search(field, occupied, danger_map, start, horizon):
+def _time_expanded_search(field, occupied, danger_map, start, horizon, start_time=0):
     """BFS over (position, time) states to find a first action leading to permanent safety.
 
     Returns (first_action_to_full_safety, first_action_of_longest_survival_path); either may be None.
     """
-    visited = {(start, 0)}
-    queue = deque([(start, 0, None)])
+    if start_time > 0 and start in danger_map[min(start_time, horizon)]:
+        return None, None
 
-    best_survival = (0, None)
+    visited = {(start, start_time)}
+    queue = deque([(start, start_time, None)])
+
+    best_survival = (start_time, None)
 
     while queue:
         pos, t, first_action = queue.popleft()
@@ -52,7 +55,7 @@ def _time_expanded_search(field, occupied, danger_map, start, horizon):
         if t > best_survival[0]:
             best_survival = (t, first_action)
 
-        if t > 0 and all(pos not in danger_map[tt] for tt in range(t, horizon + 1)):
+        if t > start_time and all(pos not in danger_map[tt] for tt in range(t, horizon + 1)):
             return first_action, best_survival[1]
 
         if t >= horizon:
@@ -87,14 +90,14 @@ def find_escape_action(field, bombs, danger_map, start, horizon, opponent_positi
 
 
 def has_escape_route(field, bombs, explosion_map, bomb_pos, bomb_timer, power, horizon, start, occupied,
-                      base_danger_map=None):
+                      base_danger_map=None, start_time=0):
     """Return True if a path to full safety exists from `start`, assuming a bomb is placed at `bomb_pos`."""
     if base_danger_map is not None:
         danger_map = _extend_danger_map(base_danger_map, field, bomb_pos, bomb_timer, power, horizon)
     else:
         hypothetical_bombs = list(bombs) + [(bomb_pos, bomb_timer)]
         danger_map = compute_danger_map(field, hypothetical_bombs, explosion_map, power, horizon)
-    full_safe, _ = _time_expanded_search(field, occupied, danger_map, start, horizon)
+    full_safe, _ = _time_expanded_search(field, occupied, danger_map, start, horizon, start_time)
     return full_safe is not None
 
 
@@ -104,4 +107,4 @@ def can_escape_own_bomb(field, bombs, explosion_map, pos, power, timer, horizon,
     occupied = {b_pos for b_pos, _ in bombs} | opponent_positions
     occupied.add(pos)
     return has_escape_route(field, bombs, explosion_map, pos, timer, power, horizon, pos, occupied,
-                             base_danger_map=base_danger_map)
+                             base_danger_map=base_danger_map, start_time=1)

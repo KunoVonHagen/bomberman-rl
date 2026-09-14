@@ -76,8 +76,11 @@ def count_contested_tiles_we_win(
     if not tiles:
         return 0
 
-    own_dist = connected_cell_distances(own_position, obstacles)
-    others_dist = [connected_cell_distances(pos, obstacles) for pos in others]
+    passable = obstacles.copy()
+    for tile in tiles:
+        passable[tile] = False
+    own_dist = connected_cell_distances(own_position, passable)
+    others_dist = [connected_cell_distances(pos, passable) for pos in others]
 
     won = 0
     for (tx, ty) in tiles:
@@ -132,7 +135,7 @@ def evaluate_bomb_placement(
         opponent_kill_bonus: float = 60.0,
         trapped_kill_bonus: float = 80.0,
         trapped_positions: set = None,
-        min_score_to_bomb: float = 3.0,
+        min_score_to_bomb: float = 12.0,
         single_route_score_floor: float = 12.0,
 ) -> Dict:
 
