@@ -2,6 +2,7 @@ import time
 import pathlib
 import numpy as np
 
+from agent_code.ppo_agent.config import DEFAULT_CONFIG
 from agent_code.ppo_agent.gym_environment import BombermanGymEnv
 from environment import WorldArgs
 from agent_code.my_agent.callbacks import setup as my_agent_setup, act as my_agent_act
@@ -36,7 +37,8 @@ def benchmark_environment(n_envs=8, total_steps=50000, opponents=None):
         CLASSIC_ENV_ARGS,
         opponents=opponents,
         n_envs=n_envs,
-        auto_reset=True
+        auto_reset=True,
+        env_version=DEFAULT_CONFIG.env.env_version,
     )
 
     print(f"Profiling batched environment with {n_envs} parallel games for {total_steps} steps...")

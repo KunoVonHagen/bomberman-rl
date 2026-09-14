@@ -78,6 +78,7 @@ def _get_dummy_env(run_dir: pathlib.Path) -> BombermanGymEnv:
         world_args,
         opponents=dummy_opponents,
         layer_config=env_cfg.layer_config,
+        env_version=env_cfg.env_version,
     )
 
 
