@@ -192,6 +192,10 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
     Worker function for a single shard process.
     It creates a BombermanGymEnv with the given world_args and handles commands from the parent process via the remote pipe.
     """
+    import torch
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
     parent_remote.close()
 
     world_args = WorldArgs(**world_args_kwargs)
