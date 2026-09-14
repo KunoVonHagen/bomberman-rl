@@ -64,7 +64,7 @@ class _CheckpointOpponent:
                 replay=False,
                 continue_without_training=self.env_cfg.continue_without_training,
             )
-            self._obs_env = BombermanGymEnv(world_args, opponents=[((lambda handle: None), (lambda handle, state: "WAIT"))] * 3, layer_config=self.env_cfg.layer_config)
+            self._obs_env = BombermanGymEnv(world_args, opponents=[((lambda handle: None), (lambda handle, state: "WAIT"))] * 3, layer_config=self.env_cfg.layer_config, env_version=self.env_cfg.env_version)
             self._action_names = {v: k for k, v in ACTION_INDICES.items() if k is not None}
 
     def setup(self, agent):

@@ -153,14 +153,14 @@ def _concat_obs(obs_list: list) -> dict:
 
 
 def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, layer_config,
-                   shard_n_envs: int, reward_config: Optional[RewardConfig] = None):
+                   shard_n_envs: int, reward_config: Optional[RewardConfig] = None, env_version: int = 1):
     """Run a single shard's BombermanGymEnv, serving commands from the parent process."""
     parent_remote.close()
 
     world_args = WorldArgs(**world_args_kwargs)
     env = BombermanGymEnv(
         world_args, opponents=opponents, layer_config=layer_config,
-        n_envs=shard_n_envs, reward_config=reward_config,
+        n_envs=shard_n_envs, reward_config=reward_config, env_version=env_version,
     )
 
     while True:
@@ -233,7 +233,7 @@ class ShardedNativeBatchedVecEnv:
             p = ctx.Process(
                 target=_shard_worker,
                 args=(work_remote, remote, world_args_kwargs, opponents, e.layer_config,
-                      self.shard_size, cfg.rewards),
+                      self.shard_size, cfg.rewards, e.env_version),
                 daemon=True,
             )
             p.start()
@@ -391,6 +391,7 @@ def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> NativeMonito
             world_args,
             opponents=opponents,
             layer_config=cfg.env.layer_config,
+            env_version=cfg.env.env_version,
             n_envs=cfg.n_envs,
             reward_config=cfg.rewards,
         )

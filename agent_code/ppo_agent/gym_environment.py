@@ -230,7 +230,7 @@ def resolve_layer_groups(requested: Optional[Iterable[str]]) -> Set[str]:
 
 
 @njit(cache=True)
-def _time_aware_bfs_kernel(starts, start_counts, occ, W, H, T, dist, visited, qx, qy, qt):
+def _time_aware_bfs_kernel(starts, start_counts, occ, danger, W, H, T, dist, visited, qx, qy, qt, fixes):
     """
     Batched time-aware BFS. starts/occ/dist/visited: (n_envs, W, H, T+1).
     """
@@ -246,7 +246,7 @@ def _time_aware_bfs_kernel(starts, start_counts, occ, W, H, T, dist, visited, qx
         for i in range(start_counts[env]):
             x = starts[env, i, 0]
             y = starts[env, i, 1]
-            if occ[env, 0, x, y] > 0:
+            if not fixes and occ[env, 0, x, y] > 0:
                 continue
             if not vis[x, y, 0]:
                 vis[x, y, 0] = True
@@ -265,7 +265,15 @@ def _time_aware_bfs_kernel(starts, start_counts, occ, W, H, T, dist, visited, qx
             next_t = t + 1
             if next_t > T:
                 next_t = T
-            occ_next = occ[env, next_t]
+            if fixes:
+                land_t = t if t < T else T
+                occ_next = occ[env, land_t]
+                danger_t = land_t if land_t < T else T - 1
+                any_danger = t < T
+            else:
+                occ_next = occ[env, next_t]
+                danger_t = 0
+                any_danger = False
 
             for k in range(5):
                 if k == 0:
@@ -281,7 +289,10 @@ def _time_aware_bfs_kernel(starts, start_counts, occ, W, H, T, dist, visited, qx
 
                 if nx < 0 or nx >= W or ny < 0 or ny >= H:
                     continue
-                if occ_next[nx, ny] > 0:
+                if fixes and k == 4:
+                    if any_danger and danger[env, danger_t, nx, ny] > 0:
+                        continue
+                elif occ_next[nx, ny] > 0:
                     continue
                 if vis[nx, ny, next_t]:
                     continue
@@ -345,12 +356,13 @@ def _multi_source_bfs_kernel(targets, occ, W, H, dist, qx, qy):
 @njit(cache=True)
 def _forecast_kernel(bomb_x, bomb_y, bomb_timer, bomb_counts, blast_tensor,
                      exp_x, exp_y, exp_timer, exp_counts,
-                     wall, crate, T, ET, danger_out, occ_out):
+                     wall, crate, T, ET, danger_out, occ_out, fixes):
     """
     Batched forecast of danger and occupied maps. All inputs/outputs are (n_envs, ...) arrays.
     """
     n_envs = bomb_counts.shape[0]
     width, height = wall.shape
+    exp_offset = 1 if fixes else 0
 
     for env in range(n_envs):
         nb = bomb_counts[env]
@@ -361,7 +373,7 @@ def _forecast_kernel(bomb_x, bomb_y, bomb_timer, bomb_counts, blast_tensor,
             d = danger_out[env, t]
             d[:, :] = 0.0
             for i in range(ne):
-                if exp_timer[env, i] - t > 0:
+                if exp_timer[env, i] - exp_offset - t > 0:
                     d[exp_x[env, i], exp_y[env, i]] = 1.0
             for i in range(nb):
                 bt = bomb_timer[env, i]
@@ -408,11 +420,14 @@ class BombermanGymEnv(gym.Env):
         layer_config: Optional[Iterable[str]] = None,
         n_envs: int = 1,
         auto_reset: bool = True,
+        env_version: int = 1,
     ):
         super().__init__()
         self.args = args
         self.set_reward_config(reward_config)
         self.n_envs = int(n_envs)
+        self.env_version = int(env_version)
+        self._fixes = self.env_version >= 2
         if self.n_envs < 1:
             raise ValueError("n_envs must be >= 1")
         self.auto_reset = auto_reset
@@ -771,6 +786,8 @@ class BombermanGymEnv(gym.Env):
 
                 for ex in self.explosions[env]:
                     if ex["stage"] == 0:
+                        if self._fixes and ex["timer"] <= 1:
+                            continue
                         ch = 7 + 2 * BT + ex["timer"]
                         for (x, y) in ex["coords"]:
                             g[ch, x, y] = 1.0
@@ -826,7 +843,7 @@ class BombermanGymEnv(gym.Env):
             bx, by, bt, bc, self._blast_tensor,
             exx, exy, ext, exc,
             self._wall_bool, gt[:, CRATE_LAYER].astype(bool),
-            T, self._ET, gt[:, _DANGER_SLICE], gt[:, _OCC_SLICE],
+            T, self._ET, gt[:, _DANGER_SLICE], gt[:, _OCC_SLICE], self._fixes,
         )
 
     def _time_aware_bfs(self, starts_per_env, out_layer):
@@ -842,9 +859,9 @@ class BombermanGymEnv(gym.Env):
                 starts[env, i, 1] = y
 
         _time_aware_bfs_kernel(
-            starts, counts, self.grid_tensor[:, _OCC_SLICE], W, H, T,
+            starts, counts, self.grid_tensor[:, _OCC_SLICE], self.grid_tensor[:, _DANGER_SLICE], W, H, T,
             self.grid_tensor[:, out_layer], self._ta_bfs_visited,
-            self._ta_bfs_qx, self._ta_bfs_qy, self._ta_bfs_qt,
+            self._ta_bfs_qx, self._ta_bfs_qy, self._ta_bfs_qt, self._fixes,
         )
 
     def _compute_danger_summary(self):
@@ -865,8 +882,9 @@ class BombermanGymEnv(gym.Env):
         m = np.zeros_like(free)
         m[:, 1:, :] += free[:, :-1, :]
         m[:, :-1, :] += free[:, 1:, :]
-        m[:, 1:, :] += free[:, :-1, :]
-        m[:, :-1, :] += free[:, 1:, :]
+        if not self._fixes:
+            m[:, 1:, :] += free[:, :-1, :]
+            m[:, :-1, :] += free[:, 1:, :]
         m[:, :, 1:] += free[:, :, :-1]
         m[:, :, :-1] += free[:, :, 1:]
         gt[:, MOBILITY_LAYER] = m
@@ -884,9 +902,14 @@ class BombermanGymEnv(gym.Env):
             return
         gt = self.grid_tensor
         occ_now = gt[:, OCCUPIED_MAP_LAYERS[0]].astype(bool)
+        blocked_targets = occ_now
+        if self._fixes:
+            blocked_targets = occ_now.copy()
+            for env, agent in enumerate(self.agents):
+                occ_now[env, agent.x, agent.y] = False
 
         if self._enable_crate_distance:
-            crate_targets = (gt[:, CRATE_POTENTIAL_LAYER] > 0) & ~occ_now
+            crate_targets = (gt[:, CRATE_POTENTIAL_LAYER] > 0) & ~blocked_targets
             self._multi_source_bfs(crate_targets, occ_now, gt[:, CRATE_DISTANCE_LAYER])
 
         if self._enable_coin_distance:
@@ -999,11 +1022,18 @@ class BombermanGymEnv(gym.Env):
         f[:, FEATURE_OPPONENTS_ALIVE] = alive / float(MAX_OPPONENTS)
 
         coins_left = self.coins_collectable.sum(axis=1)
-        f[:, FEATURE_COINS_REMAINING] = coins_left / np.maximum(self._initial_coin_count, 1)
+        if self._fixes:
+            total_coins = np.fromiter(
+                (s.SCENARIOS[self.env_scenarios[env]]["COIN_COUNT"] for env in range(E)), np.float32, E)
+            total_coins = np.maximum(total_coins, self._initial_coin_count)
+            f[:, FEATURE_COINS_REMAINING] = np.minimum(coins_left / np.maximum(total_coins, 1), 1.0)
+        else:
+            f[:, FEATURE_COINS_REMAINING] = coins_left / np.maximum(self._initial_coin_count, 1)
         crates_left = (self.arena == 1).sum(axis=(1, 2))
         f[:, FEATURE_CRATES_REMAINING] = crates_left / np.maximum(self._initial_crate_count, 1)
 
-        occ1, dng1 = OCCUPIED_MAP_LAYERS[1], DANGER_MAP_LAYERS[1]
+        step_idx = 0 if self._fixes else 1
+        occ1, dng1 = OCCUPIED_MAP_LAYERS[step_idx], DANGER_MAP_LAYERS[step_idx]
 
         def _safe_dir(tx, ty):
             valid = (tx >= 0) & (tx < W) & (ty >= 0) & (ty < H)
@@ -1017,7 +1047,10 @@ class BombermanGymEnv(gym.Env):
         f[:, FEATURE_SAFE_RIGHT] = _safe_dir(ax + 1, ay)
         f[:, FEATURE_SAFE_DOWN] = _safe_dir(ax, ay + 1)
         f[:, FEATURE_SAFE_LEFT] = _safe_dir(ax - 1, ay)
-        f[:, FEATURE_SAFE_WAIT] = _safe_dir(ax, ay)
+        if self._fixes:
+            f[:, FEATURE_SAFE_WAIT] = (gt[idx, dng1, ax, ay] <= 0).astype(np.float32)
+        else:
+            f[:, FEATURE_SAFE_WAIT] = _safe_dir(ax, ay)
 
         f[:, FEATURE_SAFE_BOMB] = np.maximum(
             np.maximum(f[:, FEATURE_SAFE_UP], f[:, FEATURE_SAFE_RIGHT]),
@@ -1129,6 +1162,11 @@ class BombermanGymEnv(gym.Env):
         self._refresh_dynamic_layers()
         self._refresh_forecast_layers()
         obs = self._build_observation()
+
+        if self._fixes:
+            for env in np.nonzero(self.step_counts >= s.MAX_STEPS)[0]:
+                if not self.agents[int(env)].dead:
+                    self.agents[int(env)].add_event(e.SURVIVED_ROUND)
 
         rewards = np.zeros(self.n_envs, dtype=np.float32)
         for env in range(self.n_envs):
@@ -1530,6 +1568,32 @@ class BombermanGymEnv(gym.Env):
             return
         active = self.active_agents[env]
         kill_reward = getattr(s, "REWARD_KILL", 0)
+        if self._fixes:
+            hit = []
+            for ex in explosions:
+                if ex["stage"] != 0:
+                    continue
+                cells = ex["coords_set"]
+                owner = ex["owner"]
+                for a in active:
+                    if (a.x, a.y) in cells:
+                        if a not in hit:
+                            hit.append(a)
+                        if a is owner:
+                            a.add_event(e.KILLED_SELF)
+                        elif owner is not None:
+                            owner.add_event(e.KILLED_OPPONENT)
+                            if kill_reward:
+                                owner.update_score(kill_reward)
+            for a in hit:
+                a.dead = True
+                a.add_event(e.GOT_KILLED)
+            self.active_agents[env] = [a for a in active if not a.dead]
+            if hit:
+                for a in self.active_agents[env]:
+                    for _ in hit:
+                        a.add_event(e.OPPONENT_ELIMINATED)
+            return
         for ex in explosions:
             if ex["stage"] != 0:
                 continue

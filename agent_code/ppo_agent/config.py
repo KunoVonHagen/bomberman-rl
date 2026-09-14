@@ -146,6 +146,7 @@ class EnvConfig:
     fps: int = 60
     replay: Optional[str] = None
     continue_without_training: bool = False
+    env_version: int = 1
     scenario_mix: List[ScenarioArrangement] = field(
         default_factory=lambda: [ScenarioArrangement(scenario="classic", weight=1.0)]
     )
@@ -398,7 +399,7 @@ DEFAULT_CONFIG = TrainingConfig(
         vf_coef=0.7,
         target_kl=0.02,
     ),
-    env=EnvConfig(),
+    env=EnvConfig(env_version=2),
     self_play=SelfPlayConfig(
         enabled=True,
         static_opponents=[

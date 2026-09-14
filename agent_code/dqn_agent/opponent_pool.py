@@ -74,6 +74,7 @@ class _CheckpointOpponent:
                 world_args,
                 opponents=[((lambda handle: None), (lambda handle, state: "WAIT"))] * 3,
                 layer_config=self.env_cfg.layer_config,
+                env_version=self.env_cfg.env_version,
             )
             _OBS_ENV_CACHE[self.model_path] = self._obs_env
             self._action_names = {v: k for k, v in ACTION_INDICES.items() if k is not None}
