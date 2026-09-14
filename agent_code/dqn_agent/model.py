@@ -10,8 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import gymnasium as gym
 
-from agent_code.dqn_agent.replay_buffer import DictReplayBuffer
-from agent_code.dqn_agent.schedules import LinearSchedule
+from .replay_buffer import DictReplayBuffer
+from .schedules import LinearSchedule
 
 __all__ = ["BombermanFeatureExtractor", "QNetwork", "MaskableDQN"]
 

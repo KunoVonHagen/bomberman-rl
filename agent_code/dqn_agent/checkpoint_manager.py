@@ -8,7 +8,7 @@ from typing import Optional, List
 
 import numpy as np
 
-from agent_code.dqn_agent.config import TrainingConfig
+from .config import TrainingConfig
 
 
 def to_json_compatible(obj):

@@ -9,7 +9,7 @@ from sb3_contrib import MaskablePPO
 
 from .config import EnvConfig, SelfPlayConfig, OpponentArrangement, ScenarioArrangement
 from .checkpoint_manager import CheckpointManager
-from agent_code.ppo_agent.gym_environment import BombermanGymEnv, ACTION_INDICES
+from .gym_environment import BombermanGymEnv, ACTION_INDICES
 from environment import WorldArgs
 
 OpponentPair = Tuple[Callable, Callable]

@@ -8,10 +8,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from environment import WorldArgs
 
-from agent_code.dqn_agent.config import EnvConfig, SelfPlayConfig, OpponentArrangement, ScenarioArrangement
-from agent_code.dqn_agent.checkpoint_manager import CheckpointManager
-from agent_code.dqn_agent.gym_environment import BombermanGymEnv, ACTION_INDICES
-from agent_code.dqn_agent.model import MaskableDQN
+from .config import EnvConfig, SelfPlayConfig, OpponentArrangement, ScenarioArrangement
+from .checkpoint_manager import CheckpointManager
+from .gym_environment import BombermanGymEnv, ACTION_INDICES
+from .model import MaskableDQN
 
 OpponentPair = Tuple[Callable, Callable]
 
