@@ -12,6 +12,7 @@ import gymnasium as gym
 
 from .replay_buffer import DictReplayBuffer
 from .schedules import LinearSchedule
+from .symmetry import TensorAugmenter
 
 __all__ = ["BombermanFeatureExtractor", "QNetwork", "MaskableDQN"]
 
@@ -188,6 +189,7 @@ class MaskableDQN:
         max_grad_norm: float = 10.0,
         features_dim: int = 256,
         exploration_duration: int = 300_000,
+        symmetry_augmentation: bool = False,
         n_envs: int = 1,
         device: str = "cpu",
     ):
@@ -208,6 +210,8 @@ class MaskableDQN:
         self.target_update_interval = max(1, int(target_update_interval))
         self.max_grad_norm = max_grad_norm
         self.features_dim = features_dim
+        self.symmetry_augmentation = bool(symmetry_augmentation)
+        self._augmenter = TensorAugmenter(self.device)
 
         self.exploration_initial_eps = exploration_initial_eps
         self.exploration_final_eps = exploration_final_eps
@@ -374,6 +378,11 @@ class MaskableDQN:
         dones = torch.as_tensor(batch["dones"], device=self.device, dtype=torch.float32)
         next_masks = torch.as_tensor(batch["next_action_masks"], device=self.device, dtype=torch.bool)
         if prof: prof.stop("host_to_device", device=dev)
+
+        if self.symmetry_augmentation:
+            if prof: prof.start("augment")
+            self._augmenter.augment(obs, next_obs, actions, next_masks)
+            if prof: prof.stop("augment", device=dev)
 
         if prof: prof.start("target_forward")
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self._amp_enabled):
@@ -542,6 +551,7 @@ class MaskableDQN:
             max_grad_norm=self.max_grad_norm,
             features_dim=self.features_dim,
             exploration_duration=self.exploration_duration,
+            symmetry_augmentation=self.symmetry_augmentation,
         )
 
     def save(self, path) -> None:

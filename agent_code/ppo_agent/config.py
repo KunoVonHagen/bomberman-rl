@@ -113,6 +113,7 @@ class PPOConfig:
     ent_coef: float = 0.01
     vf_coef: float = 0.7
     target_kl: float = 0.02
+    symmetry_augmentation: bool = True
 
 
 @dataclass(frozen=True)
@@ -266,6 +267,7 @@ class TrainingConfig:
         "ppo.ent_coef",
         "ppo.vf_coef",
         "ppo.target_kl",
+        "ppo.symmetry_augmentation",
         "self_play.enabled",
         "self_play.static_opponents",
         "self_play.arrangements",
@@ -398,6 +400,7 @@ DEFAULT_CONFIG = TrainingConfig(
         ent_coef=0.025,
         vf_coef=0.7,
         target_kl=0.02,
+        symmetry_augmentation=True,
     ),
     env=EnvConfig(env_version=2),
     self_play=SelfPlayConfig(

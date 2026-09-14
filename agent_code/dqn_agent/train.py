@@ -622,6 +622,7 @@ def build_model(env, cfg: TrainingConfig, device: str) -> MaskableDQN:
         exploration_final_eps=cfg.dqn.exploration_final_eps,
         max_grad_norm=cfg.dqn.max_grad_norm,
         exploration_duration=exploration_duration,
+        symmetry_augmentation=cfg.dqn.symmetry_augmentation,
     )
 
 
@@ -636,6 +637,7 @@ def apply_dqn_hyperparams(model: MaskableDQN, dqn_cfg: DQNConfig, total_timestep
     model.gradient_steps = dqn_cfg.gradient_steps
     model.target_update_interval = max(1, int(dqn_cfg.target_update_interval))
     model.max_grad_norm = dqn_cfg.max_grad_norm
+    model.symmetry_augmentation = bool(dqn_cfg.symmetry_augmentation)
     model.exploration_initial_eps = dqn_cfg.exploration_initial_eps
     model.exploration_final_eps = dqn_cfg.exploration_final_eps
     model.exploration_fraction = dqn_cfg.exploration_fraction

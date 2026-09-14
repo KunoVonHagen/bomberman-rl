@@ -28,6 +28,7 @@ from .config import (
     load_overrides_file,
 )
 from .checkpoint_manager import CheckpointManager
+from .symmetry import augment_rollout_buffer
 from .opponent_pool import OpponentPool, OpponentSampler
 from .training_schedule import DEFAULT_SCHEDULE, load_schedule
 
@@ -507,6 +508,20 @@ def apply_ppo_hyperparams(
     model._pending_n_steps = ppo_cfg.n_steps
 
 
+class SymmetryAugmentationCallback(BaseCallback):
+    def __init__(self, cfg: TrainingConfig, verbose: int = 0):
+        super().__init__(verbose)
+        self.cfg = cfg
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if not self.cfg.ppo.symmetry_augmentation:
+            return
+        augment_rollout_buffer(self.model.rollout_buffer, self.model.policy, self.model.batch_size)
+
+
 class OpponentResampleCallback(BaseCallback):
     """
     A callback that resamples opponents at the end of each training rollout.
@@ -864,7 +879,9 @@ def run(
     schedule_callback = ScheduleCallback(
         cfg, ckman, pool, schedule or [], applied_idx=schedule_applied_idx, verbose=1,
     )
-    learn_callback = CallbackList([opponent_callback, max_rollouts_callback, schedule_callback])
+    learn_callback = CallbackList([
+        opponent_callback, SymmetryAugmentationCallback(cfg), max_rollouts_callback, schedule_callback,
+    ])
 
     while timesteps_done < cfg.total_timesteps:
         chunk = min(cfg.save_every_timesteps, cfg.total_timesteps - timesteps_done)
