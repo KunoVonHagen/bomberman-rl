@@ -307,6 +307,24 @@ class MaskableDQN:
                 self.buffer_size, n_envs, self.observation_space, self.n_actions,
             )
 
+    def save_replay_buffer(self, path, max_transitions: Optional[int] = None) -> int:
+        """
+        Persist the newest `max_transitions` transitions. 
+        Returns how many were written.
+        """
+        if self.replay_buffer is None:
+            return 0
+        max_rows = None if max_transitions is None else max(1, int(max_transitions) // self.n_envs)
+        return self.replay_buffer.save(path, max_rows=max_rows, num_timesteps=self.num_timesteps) * self.n_envs
+
+    def load_replay_buffer(self, path) -> int:
+        """
+        Restore transitions saved by `save_replay_buffer`. 
+        Returns how many were restored.
+        """
+        self._ensure_replay_buffer(self.n_envs)
+        return self.replay_buffer.load(path) * self.n_envs
+
     def _ensure_pinned_buffers(self, batch_size: int) -> None:
         """Lazily allocate persistent pinned CPU staging buffers."""
         if self.device.type != "cuda":
@@ -328,6 +346,8 @@ class MaskableDQN:
     def train_step(self) -> Optional[dict]:
         """Run one gradient step on a minibatch from the replay buffer."""
         if self.replay_buffer is None or len(self.replay_buffer) < max(self.batch_size, 1):
+            return None
+        if self.replay_buffer.n_sampleable_rows() == 0:
             return None
 
         do_profile = self.profile_every > 0 and (self.n_updates % self.profile_every == 0)
@@ -352,9 +372,8 @@ class MaskableDQN:
         if prof: prof.start("target_forward")
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self._amp_enabled):
             next_q = self.q_net_target(next_obs)
-            next_q = next_q.masked_fill(~next_masks, float("-inf"))
-            next_q = torch.nan_to_num(next_q, neginf=0.0)
-            next_q_max = next_q.max(dim=1).values
+            next_q_max = next_q.masked_fill(~next_masks, float("-inf")).max(dim=1).values
+            next_q_max = torch.where(next_masks.any(dim=1), next_q_max, torch.zeros_like(next_q_max))
             target = rewards + (1.0 - dones) * self.gamma * next_q_max
         if prof: prof.stop("target_forward", device=dev)
 
@@ -477,7 +496,10 @@ class MaskableDQN:
                 cb.on_step(self, env)
             if prof: prof.stop("callbacks_on_step")
 
-            if self.num_timesteps >= self.learning_starts and self._steps_since_train >= self.train_freq:
+            buffer_ready = len(self.replay_buffer) >= min(self.learning_starts, self.replay_buffer.capacity)
+            if not buffer_ready:
+                self._steps_since_train = 0
+            elif self._steps_since_train >= self.train_freq:
                 n_updates = self.gradient_steps if self.gradient_steps > 0 else self._steps_since_train
                 for _ in range(max(1, n_updates)):
                     metrics = self.train_step()

@@ -686,6 +686,48 @@ def apply_schedule_up_to(
     return target_idx
 
 
+REPLAY_BUFFER_FILE = "replay_buffer.npz"
+
+
+def _restore_replay_buffer(model: MaskableDQN, cfg: TrainingConfig, ckman: CheckpointManager) -> None:
+    """Refill the replay buffer from the run directory when a previous job persisted it."""
+    if cfg.save_replay_buffer_transitions <= 0:
+        print("Replay buffer persistence is disabled (save_replay_buffer_transitions=0); "
+              "the buffer refills before training resumes.")
+        return
+    path = ckman.run_dir / REPLAY_BUFFER_FILE
+    if not path.exists():
+        print("No persisted replay buffer found -- the buffer refills before training resumes.")
+        return
+    t0 = time.perf_counter()
+    try:
+        n = model.load_replay_buffer(path)
+    except Exception as exc:
+        print(f"Could not restore the replay buffer from {path}: {exc!r}")
+        return
+    saved_at = model.replay_buffer.num_timesteps
+    print(f"Restored {n} transitions into the replay buffer from {path.name} "
+          f"(saved at {saved_at} timesteps) in {time.perf_counter() - t0:.1f}s")
+    if saved_at != model.num_timesteps:
+        print(f"  note: the buffer was saved at {saved_at} timesteps but the checkpoint is at "
+              f"{model.num_timesteps}; the restored transitions come from a different policy version.")
+
+
+def _persist_replay_buffer(model: MaskableDQN, cfg: TrainingConfig, ckman: CheckpointManager) -> None:
+    """Write the newest transitions next to the checkpoints (one rolling file per run)."""
+    if cfg.save_replay_buffer_transitions <= 0:
+        return
+    path = ckman.run_dir / REPLAY_BUFFER_FILE
+    t0 = time.perf_counter()
+    try:
+        n = model.save_replay_buffer(path, cfg.save_replay_buffer_transitions)
+        size_gb = path.stat().st_size / 1e9
+    except Exception as exc:
+        print(f"Could not save the replay buffer to {path}: {exc!r}")
+        return
+    print(f"Saved {n} replay transitions to {path.name} ({size_gb:.2f} GB) in {time.perf_counter() - t0:.1f}s")
+
+
 def run(
     cfg: TrainingConfig,
     resume_from: str | None = None,
@@ -756,6 +798,7 @@ def run(
             timesteps_done = ckman.resolved_timesteps(checkpoint_dir)
             apply_dqn_hyperparams(model, cfg.dqn, cfg.total_timesteps)
             print(f"Loaded checkpoint {checkpoint_dir.name} ({timesteps_done} timesteps)")
+            _restore_replay_buffer(model, cfg, ckman)
         else:
             print("No checkpoint found in this run yet -- starting from scratch.")
 
@@ -807,6 +850,7 @@ def run(
             },
         )
         print(f"Saved checkpoint at {timesteps_done} timesteps -> {ckpt_dir}")
+        _persist_replay_buffer(model, cfg, ckman)
 
         if cfg.self_play.enabled:
             pool.maybe_add_checkpoint(ckpt_dir, timesteps_done)
