@@ -172,7 +172,17 @@ ALL_LAYER_GROUPS: Tuple[str, ...] = tuple(LAYER_GROUPS.keys())
     FEATURE_SAFE_BOMB,
     FEATURE_BOMB_TARGET_VALUE,
     FEATURE_TRAPPED_OPPONENT_DISTANCE,
-) = range(20)
+    FEATURE_BOMB_ESCAPE_TILES,
+    FEATURE_BOMB_HITS_OPPONENTS,
+    FEATURE_COIN_DIR_UP,
+    FEATURE_COIN_DIR_RIGHT,
+    FEATURE_COIN_DIR_DOWN,
+    FEATURE_COIN_DIR_LEFT,
+    FEATURE_CRATE_DIR_UP,
+    FEATURE_CRATE_DIR_RIGHT,
+    FEATURE_CRATE_DIR_DOWN,
+    FEATURE_CRATE_DIR_LEFT,
+) = range(30)
 
 FEATURE_NAMES: Tuple[str, ...] = (
     "self_x",
@@ -195,8 +205,21 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "safe_bomb",
     "bomb_target_value",
     "trapped_opponent_distance",
+    "bomb_escape_tiles",
+    "bomb_hits_opponents",
+    "coin_dir_up",
+    "coin_dir_right",
+    "coin_dir_down",
+    "coin_dir_left",
+    "crate_dir_up",
+    "crate_dir_right",
+    "crate_dir_down",
+    "crate_dir_left",
 )
 NUM_FEATURES = len(FEATURE_NAMES)
+NUM_FEATURES_V2 = 20
+COIN_DIRECTION_FEATURES = (FEATURE_COIN_DIR_UP, FEATURE_COIN_DIR_RIGHT, FEATURE_COIN_DIR_DOWN, FEATURE_COIN_DIR_LEFT)
+CRATE_DIRECTION_FEATURES = (FEATURE_CRATE_DIR_UP, FEATURE_CRATE_DIR_RIGHT, FEATURE_CRATE_DIR_DOWN, FEATURE_CRATE_DIR_LEFT)
 
 
 def resolve_layer_groups(requested: Optional[Iterable[str]]) -> Set[str]:
@@ -354,6 +377,62 @@ def _multi_source_bfs_kernel(targets, occ, W, H, dist, qx, qy):
 
 
 @njit(cache=True)
+def _own_bomb_escape_kernel(ax, ay, blast_tensor, occ, danger, W, H, T, bomb_timer, ET, visited, qx, qy, qt):
+    n_envs = ax.shape[0]
+    counts = np.zeros(n_envs, dtype=np.int64)
+    for env in range(n_envs):
+        x0 = ax[env]
+        y0 = ay[env]
+        if danger[env, 0, x0, y0] > 0:
+            continue
+        blast = blast_tensor[x0, y0]
+        vis = visited[env]
+        vis[:, :, :] = False
+        vis[x0, y0, 1] = True
+        qx[env, 0] = x0
+        qy[env, 0] = y0
+        qt[env, 0] = 1
+        head = 0
+        tail = 1
+        while head < tail:
+            x = qx[env, head]
+            y = qy[env, head]
+            t = qt[env, head]
+            head += 1
+            if t >= T:
+                counts[env] += 1
+                continue
+            for k in range(5):
+                if k == 0:
+                    nx, ny = x - 1, y
+                elif k == 1:
+                    nx, ny = x + 1, y
+                elif k == 2:
+                    nx, ny = x, y - 1
+                elif k == 3:
+                    nx, ny = x, y + 1
+                else:
+                    nx, ny = x, y
+                if nx < 0 or nx >= W or ny < 0 or ny >= H:
+                    continue
+                own_blast = blast[nx, ny] > 0 and bomb_timer <= t < bomb_timer + ET
+                if k < 4:
+                    own_bomb = nx == x0 and ny == y0 and t <= bomb_timer
+                    if occ[env, t, nx, ny] > 0 or own_bomb or own_blast:
+                        continue
+                elif danger[env, t, nx, ny] > 0 or own_blast:
+                    continue
+                if vis[nx, ny, t + 1]:
+                    continue
+                vis[nx, ny, t + 1] = True
+                qx[env, tail] = nx
+                qy[env, tail] = ny
+                qt[env, tail] = t + 1
+                tail += 1
+    return counts
+
+
+@njit(cache=True)
 def _forecast_kernel(bomb_x, bomb_y, bomb_timer, bomb_counts, blast_tensor,
                      exp_x, exp_y, exp_timer, exp_counts,
                      wall, crate, T, ET, danger_out, occ_out, fixes):
@@ -428,6 +507,8 @@ class BombermanGymEnv(gym.Env):
         self.n_envs = int(n_envs)
         self.env_version = int(env_version)
         self._fixes = self.env_version >= 2
+        self._extra_features = self.env_version >= 3
+        self.n_features = NUM_FEATURES if self._extra_features else NUM_FEATURES_V2
         if self.n_envs < 1:
             raise ValueError("n_envs must be >= 1")
         self.auto_reset = auto_reset
@@ -488,13 +569,14 @@ class BombermanGymEnv(gym.Env):
         self._T_HORIZON = float(self._BT + self._ET)
         self._CRATE_POTENTIAL_MAX = float(4 * s.BOMB_POWER)
         self._DIST_MAX = float(self.width * self.height)
+        self._ESCAPE_TILES_MAX = 8.0
 
         E = self.n_envs
         W, H = self.width, self.height
 
         self.grid_tensor = np.zeros((E, self.n_observation_layers, W, H), dtype=np.float32)
         self._centered_tensor = np.zeros_like(self.grid_tensor)
-        self._features = np.zeros((E, NUM_FEATURES), dtype=np.float32)
+        self._features = np.zeros((E, self.n_features), dtype=np.float32)
 
         self.rounds = np.zeros(E, dtype=np.int64)
         self.step_counts = np.zeros(E, dtype=np.int64)
@@ -511,7 +593,7 @@ class BombermanGymEnv(gym.Env):
 
         self.previous_visited_count = np.ones(E, dtype=np.int64)
         self.visited = np.zeros((E, W, H), dtype=bool)
-        self.previous_features = np.zeros((E, NUM_FEATURES), dtype=np.float32)
+        self.previous_features = np.zeros((E, self.n_features), dtype=np.float32)
         self._has_previous_features = np.zeros(E, dtype=bool)
         self._initial_crate_count = np.zeros(E, dtype=np.int64)
         self._initial_coin_count = np.zeros(E, dtype=np.int64)
@@ -533,6 +615,7 @@ class BombermanGymEnv(gym.Env):
         self._ta_bfs_qt = np.empty((E, max_nodes_ta), dtype=np.int32)
         self._ta_starts = np.zeros((E, 1 + MAX_OPPONENTS, 2), dtype=np.int64)
         self._ta_start_counts = np.zeros(E, dtype=np.int64)
+        self._escape_visited = np.zeros((E, W, H, T_bfs + 1), dtype=np.bool_)
 
         max_nodes_ms = W * H
         self._ms_bfs_qx = np.empty((E, max_nodes_ms), dtype=np.int32)
@@ -555,7 +638,7 @@ class BombermanGymEnv(gym.Env):
                 shape=(self.n_output_layers, W, H), dtype=np.float32,
             ),
             "features": spaces.Box(
-                low=-1.0, high=1.0, shape=(NUM_FEATURES,), dtype=np.float32,
+                low=-1.0, high=1.0, shape=(self.n_features,), dtype=np.float32,
             ),
         })
         self.observation_space = spaces.Dict({
@@ -564,7 +647,7 @@ class BombermanGymEnv(gym.Env):
                 shape=(E, self.n_output_layers, W, H), dtype=np.float32,
             ),
             "features": spaces.Box(
-                low=-1.0, high=1.0, shape=(E, NUM_FEATURES), dtype=np.float32,
+                low=-1.0, high=1.0, shape=(E, self.n_features), dtype=np.float32,
             ),
         })
         self.single_action_space = spaces.Discrete(len(ACTIONS))
@@ -1074,7 +1157,45 @@ class BombermanGymEnv(gym.Env):
             trap = gt[idx, OPPONENTS_LEAST_DISTANCE_LAYER, ax, ay]
         f[:, FEATURE_TRAPPED_OPPONENT_DISTANCE] = np.where(
             trap < 0, -1.0, trap / self._T_HORIZON)
+        if self._extra_features:
+            self._compute_extra_features(f, ax, ay)
         return f
+
+    def _compute_extra_features(self, f: np.ndarray, ax: np.ndarray, ay: np.ndarray) -> None:
+        E = self.n_envs
+        escape = self._own_bomb_escape_tiles(ax, ay)
+        f[:, FEATURE_BOMB_ESCAPE_TILES] = np.minimum(escape, self._ESCAPE_TILES_MAX) / self._ESCAPE_TILES_MAX
+        f[:, FEATURE_SAFE_BOMB] = (escape > 0).astype(np.float32) * f[:, FEATURE_BOMBS_LEFT]
+
+        blast = self._blast_tensor[ax, ay] > 0
+        hits = np.zeros(E, dtype=np.float32)
+        for env in range(E):
+            for h in self.opponent_handles[env]:
+                if not h.dead and blast[env, h.x, h.y]:
+                    hits[env] += 1.0
+        f[:, FEATURE_BOMB_HITS_OPPONENTS] = hits / float(MAX_OPPONENTS)
+
+        self._direction_features(f, COIN_DISTANCE_LAYER, COIN_DIRECTION_FEATURES, ax, ay)
+        self._direction_features(f, CRATE_DISTANCE_LAYER, CRATE_DIRECTION_FEATURES, ax, ay)
+
+    def _own_bomb_escape_tiles(self, ax: np.ndarray, ay: np.ndarray) -> np.ndarray:
+        gt = self.grid_tensor
+        return _own_bomb_escape_kernel(
+            ax, ay, self._blast_tensor, gt[:, _OCC_SLICE], gt[:, _DANGER_SLICE],
+            self.width, self.height, self._BT + self._ET, self._BT, self._ET,
+            self._escape_visited, self._ta_bfs_qx, self._ta_bfs_qy, self._ta_bfs_qt,
+        ).astype(np.float32)
+
+    def _direction_features(self, f: np.ndarray, layer: int, features, ax: np.ndarray, ay: np.ndarray) -> None:
+        gt = self.grid_tensor
+        W, H = self.width, self.height
+        idx = np.arange(self.n_envs)
+        here = gt[idx, layer, ax, ay]
+        for feature, (dx, dy) in zip(features, ((0, -1), (1, 0), (0, 1), (-1, 0))):
+            tx, ty = ax + dx, ay + dy
+            valid = (tx >= 0) & (tx < W) & (ty >= 0) & (ty < H)
+            there = gt[idx, layer, np.clip(tx, 0, W - 1), np.clip(ty, 0, H - 1)]
+            f[:, feature] = (valid & (here >= 0) & (there >= 0) & (there < here)).astype(np.float32)
 
     def _build_observation(self) -> Dict[str, np.ndarray]:
         grid_tensor = self._normalize_observation(self._get_centered_tensor())

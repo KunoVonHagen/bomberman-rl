@@ -402,7 +402,7 @@ DEFAULT_CONFIG = TrainingConfig(
         target_kl=0.02,
         symmetry_augmentation=True,
     ),
-    env=EnvConfig(env_version=2),
+    env=EnvConfig(env_version=3),
     self_play=SelfPlayConfig(
         enabled=True,
         static_opponents=[

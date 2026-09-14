@@ -350,7 +350,7 @@ DEFAULT_CONFIG = TrainingConfig(
         max_grad_norm=10.0,
         symmetry_augmentation=True,
     ),
-    env=EnvConfig(env_version=2),
+    env=EnvConfig(env_version=3),
     self_play=SelfPlayConfig(
         enabled=True,
         static_opponents=[

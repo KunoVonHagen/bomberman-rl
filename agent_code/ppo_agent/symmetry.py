@@ -6,6 +6,8 @@ import torch
 import settings as s
 from .gym_environment import (
     ACTIONS,
+    COIN_DIRECTION_FEATURES,
+    CRATE_DIRECTION_FEATURES,
     FEATURE_SAFE_DOWN,
     FEATURE_SAFE_LEFT,
     FEATURE_SAFE_RIGHT,
@@ -17,7 +19,11 @@ from .gym_environment import (
 N_SYMMETRIES = 8
 _W, _H = s.COLS, s.ROWS
 _MOVE_DELTAS = {"UP": (0, -1), "RIGHT": (1, 0), "DOWN": (0, 1), "LEFT": (-1, 0)}
-SAFE_FEATURES = [FEATURE_SAFE_UP, FEATURE_SAFE_RIGHT, FEATURE_SAFE_DOWN, FEATURE_SAFE_LEFT]
+DIRECTION_FEATURES = [
+    [FEATURE_SAFE_UP, FEATURE_SAFE_RIGHT, FEATURE_SAFE_DOWN, FEATURE_SAFE_LEFT],
+    list(COIN_DIRECTION_FEATURES),
+    list(CRATE_DIRECTION_FEATURES),
+]
 
 
 def transform_array(array: np.ndarray, k: int) -> np.ndarray:
@@ -78,7 +84,9 @@ def transform_features(features: np.ndarray, k: int) -> np.ndarray:
     moved = POSITION[k, xs, ys]
     out[..., FEATURE_SELF_X] = moved[..., 0] * (2.0 / (_W - 1)) - 1.0
     out[..., FEATURE_SELF_Y] = moved[..., 1] * (2.0 / (_H - 1)) - 1.0
-    out[..., SAFE_FEATURES] = out[..., SAFE_FEATURES][..., ACTION_PERM_INV[k, :4]]
+    for group in DIRECTION_FEATURES:
+        if group[-1] < out.shape[-1]:
+            out[..., group] = out[..., group][..., ACTION_PERM_INV[k, :4]]
     return out
 
 
