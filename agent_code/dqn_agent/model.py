@@ -290,10 +290,16 @@ class MaskableDQN:
             if masks.ndim == 1:
                 masks = masks[None, :]
 
-        if not deterministic and np.random.rand() < self.exploration_rate:
-            action = self._sample_masked_actions(masks)
-        else:
+        if deterministic:
             action = self._predict_masked(obs_batch, masks)
+        else:
+            explore = np.random.rand(masks.shape[0]) < self.exploration_rate
+            if explore.all():
+                action = self._sample_masked_actions(masks)
+            else:
+                action = self._predict_masked(obs_batch, masks)
+                if explore.any():
+                    action[explore] = self._sample_masked_actions(masks[explore])
 
         if not vectorized:
             action = action[0]

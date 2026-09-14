@@ -45,6 +45,7 @@ class _CheckpointOpponent:
             self._model = _MODEL_CACHE.get(self.model_path)
             if self._model is None:
                 self._model = MaskableDQN.load(self.model_path, device="cpu")
+                self._model.exploration_rate = self._model.exploration_final_eps
                 _MODEL_CACHE[self.model_path] = self._model
 
         if self._obs_env is None:
