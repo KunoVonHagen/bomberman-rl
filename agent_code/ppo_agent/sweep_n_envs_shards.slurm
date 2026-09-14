@@ -53,7 +53,7 @@ for combo in "${COMBOS[@]}"; do
     echo "=================================================================="
 
     start_ts=$(date +%s)
-    python -m agent_code.my_agent.train \
+    python -m agent_code.ppo_agent.train \
         --smoke-test --device cuda \
         --n-envs "$n_envs" --n-shards "$n_shards" \
         > "$combo_log" 2>&1

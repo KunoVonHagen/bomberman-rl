@@ -984,7 +984,6 @@ class BombermanGymEnv(gym.Env):
         return tensor[:, self._output_layer_indices]
 
     def _compute_global_features(self) -> np.ndarray:
-        """RECONSTRUCTED: see porting notes -- verify against your original."""
         E = self.n_envs
         idx = np.arange(E)
         gt = self.grid_tensor
@@ -1571,7 +1570,6 @@ class BombermanGymEnv(gym.Env):
         self.explosions[env] = remaining
 
     def _update_bombs(self, env: int):
-        """RECONSTRUCTED tail (your file was cut off inside this method)."""
         bombs = self.bombs[env]
         if not bombs:
             return
@@ -1609,7 +1607,6 @@ class BombermanGymEnv(gym.Env):
         self.bombs[env] = remaining
 
     def _evaluate_explosions(self, env: int):
-        """RECONSTRUCTED (was beyond the truncation point)."""
         explosions = self.explosions[env]
         if not explosions:
             return
@@ -1718,7 +1715,6 @@ class BombermanGymEnv(gym.Env):
         return float(d) if d >= 0 else self._T_HORIZON
 
     def _get_info(self, env: int) -> Dict[str, Any]:
-        """RECONSTRUCTED -- adapt to whatever your original returned."""
         return {
             "env_id": env,
             "round": int(self.rounds[env]),

@@ -56,10 +56,10 @@ trap cleanup EXIT
 
 echo "=== Running smoke test (tiny config: few envs, ~3 rollouts, checkpoint + eval game exercised) ==="
 echo "--- pass 1: n_shards=1 (old single-process behavior, baseline) ---"
-time python -m agent_code.my_agent.train --smoke-test --device cuda --n-shards 1
+time python -m agent_code.ppo_agent.train --smoke-test --device cuda --n-shards 1
 echo
 echo "--- pass 2: n_shards=8 (sharded across subprocesses) ---"
-time python -m agent_code.my_agent.train --smoke-test --device cuda --n-envs 8 --n-shards 8
+time python -m agent_code.ppo_agent.train --smoke-test --device cuda --n-envs 8 --n-shards 8
 
 echo
 echo "=== Smoke test finished. Utilization logs written to: $MONITOR_DIR ==="
