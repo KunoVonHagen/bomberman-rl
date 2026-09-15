@@ -124,12 +124,17 @@ def print_metadata_table(result: Dict[str, Any]) -> None:
 
 
 def play_run(agent: str, prefix: str, run: str, checkpoint: Optional[str], label: str, matchups: List[str],
-             n_rounds: int, seed: int, workers: int, silence_errors: bool, log_dir: pathlib.Path) -> Dict[str, Any]:
+             n_rounds: int, seed: int, workers: int, silence_errors: bool, log_dir: pathlib.Path,
+             ensemble: Optional[List[str]] = None) -> Dict[str, Any]:
     os.environ[f"{prefix}_RUN"] = run
     if checkpoint is None:
         os.environ.pop(f"{prefix}_CHECKPOINT", None)
     else:
         os.environ[f"{prefix}_CHECKPOINT"] = checkpoint
+    if ensemble:
+        os.environ[f"{prefix}_ENSEMBLE"] = ",".join(ensemble)
+    else:
+        os.environ.pop(f"{prefix}_ENSEMBLE", None)
     out: Dict[str, Any] = {}
     for name in matchups:
         spec = resolve_matchup(name, agent)
@@ -159,7 +164,7 @@ def rank_by_play(results: Dict[str, Dict[str, Any]], matchups: List[str], criter
     key = {"score": "score", "win": "win", "survival": "alive"}[criterion]
     per_round = {name: np.mean([np.asarray(res[m][key]) for m in matchups], axis=0) for name, res in results.items()}
     overall = {name: float(v.mean()) for name, v in per_round.items()}
-    best = max(overall, key=lambda name: (overall[name], name))
+    best = max(overall, key=lambda name: (overall[name], not name.startswith("ensemble("), name))
     rows = []
     for name, res in results.items():
         diff = per_round[name] - per_round[best]
@@ -210,6 +215,10 @@ def main(argv=None) -> None:
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--silence-errors", action="store_true")
     p.add_argument("--env-prefix", help="environment-variable prefix the agent's callbacks read (default AGENT upper-cased)")
+    p.add_argument("--ensemble", action="store_true",
+                   help="also play the ensemble that averages all candidates (needs play mode)")
+    p.add_argument("--mc-dropout", type=int, default=0,
+                   help="dropout samples averaged per prediction for every candidate (dqn_agent with dropout > 0)")
     p.add_argument("--write-best", action="store_true", help="write the winner to <run>/checkpoints/best.txt")
     p.add_argument("--tag", help="result file name (default select__<agent>__<run>__<timestamp>)")
     args = p.parse_args(argv)
@@ -230,13 +239,20 @@ def main(argv=None) -> None:
         best = ranking["best"]
     else:
         prefix = args.env_prefix or args.agent.upper()
+        if args.mc_dropout > 0:
+            os.environ[f"{prefix}_MC_DROPOUT_SAMPLES"] = str(args.mc_dropout)
         results = {}
         for ckpt in candidates:
             results[ckpt.name] = play_candidate(args.agent, prefix, str(run_dir), ckpt,
                                                 args.matchups, args.n_rounds, args.seed, args.workers,
                                                 args.silence_errors, LOG_DIR / tag)
-        os.environ.pop(f"{prefix}_RUN", None)
-        os.environ.pop(f"{prefix}_CHECKPOINT", None)
+        if args.ensemble and len(candidates) > 1:
+            label = f"ensemble({len(candidates)})"
+            results[label] = play_run(args.agent, prefix, str(run_dir), None, label, args.matchups, args.n_rounds,
+                                      args.seed, args.workers, args.silence_errors, LOG_DIR / tag,
+                                      ensemble=[c.name for c in candidates])
+        for name in ("RUN", "CHECKPOINT", "ENSEMBLE", "MC_DROPOUT_SAMPLES"):
+            os.environ.pop(f"{prefix}_{name}", None)
         ranking = rank_by_play(results, args.matchups, args.criterion)
         print_play_table(ranking, args.matchups, metadata)
         best = ranking["best"]
@@ -257,7 +273,9 @@ def main(argv=None) -> None:
         print("no candidate has a validation score")
         return
     print(f"best checkpoint by {args.criterion}: {best}")
-    if args.write_best:
+    if args.write_best and best.startswith("ensemble("):
+        print(f"the ensemble wins; set ENSEMBLE = {[c.name for c in candidates]} in {args.agent}/callbacks.py instead of best.txt")
+    elif args.write_best:
         pointer = write_best(run_dir, best)
         print(f"wrote {pointer} -- set CHECKPOINT = \"best\" in {args.agent}/callbacks.py to use it")
 

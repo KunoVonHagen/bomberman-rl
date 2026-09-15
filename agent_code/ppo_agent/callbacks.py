@@ -19,6 +19,7 @@ from .model import BombermanFeatureExtractor
 
 RUN: str = "run_20260831-190704"
 CHECKPOINT: Optional[str] = "checkpoint_0143654912"
+ENSEMBLE: list = []
 DETERMINISTIC: bool = True
 
 AGENT_DIR = pathlib.Path(__file__).resolve().parent
@@ -28,6 +29,18 @@ _ACTION_NAMES = {v: k for k, v in ACTION_INDICES.items() if k is not None}
 
 def _setting(name: str, default):
     return os.environ.get(f"{ENV_PREFIX}_{name}", default)
+
+
+def _member_specs(raw) -> list:
+    entries = [e.strip() for e in raw.split(",")] if isinstance(raw, str) else list(raw)
+    return [e for e in entries if e]
+
+
+def _split_member(entry: str, default_run: str):
+    run, sep, checkpoint = entry.rpartition("/")
+    if not sep or run in ("", "."):
+        return default_run, entry
+    return run, checkpoint
 
 
 def _resolve_run_dir(run: str) -> pathlib.Path:
@@ -146,18 +159,30 @@ def _make_warmup_state() -> dict:
     }
 
 
+def _choose(self, game_state: dict) -> str:
+    obs_env = self._ppo_obs_env
+    obs = obs_env.observation_from_game_state(game_state)
+    action_masks = obs_env.action_masks()
+    if len(self._ppo_models) == 1:
+        action_idx, _ = self._ppo_model.predict(obs, deterministic=DETERMINISTIC, action_masks=action_masks)
+        return _ACTION_NAMES[int(action_idx)]
+    probs = []
+    with torch.no_grad():
+        for policy in self._ppo_models:
+            obs_t, _ = policy.obs_to_tensor(obs)
+            probs.append(policy.get_distribution(obs_t, action_masks=action_masks).distribution.probs[0])
+    mean = torch.stack(probs).mean(dim=0)
+    action_idx = int(mean.argmax()) if DETERMINISTIC else int(torch.multinomial(mean, 1))
+    return _ACTION_NAMES[action_idx]
+
+
 def _warm_up(self) -> None:
     time_start = time.time()
-    obs_env = self._ppo_obs_env
-
     state = _make_warmup_state()
-    obs = obs_env.observation_from_game_state(state)
-    self._ppo_model.predict(obs, deterministic=True, action_masks=obs_env.action_masks())
-
+    _choose(self, state)
     state["bombs"] = []
     state["explosion_map"] = np.zeros_like(state["explosion_map"])
-    obs = obs_env.observation_from_game_state(state)
-    self._ppo_model.predict(obs, deterministic=True, action_masks=obs_env.action_masks())
+    _choose(self, state)
 
     self.logger.info(f"ppo_agent.setup: warm-up finished in {time.time() - time_start:.2f}s")
 
@@ -171,17 +196,31 @@ def _fail(self, message: str) -> None:
 def setup(self):
     torch.set_num_threads(1)
     self._ppo_model = None
+    self._ppo_models = []
     self._ppo_obs_env = None
 
     try:
-        run_dir = _resolve_run_dir(_setting("RUN", RUN))
+        run = _setting("RUN", RUN)
+        members = _member_specs(_setting("ENSEMBLE", ENSEMBLE)) or [_setting("CHECKPOINT", CHECKPOINT) or "latest"]
+        run_dir = _resolve_run_dir(run)
         cfg = _load_config(run_dir)
-        checkpoint_dir = _resolve_checkpoint_dir(run_dir, _setting("CHECKPOINT", CHECKPOINT))
-        model = _load_model(checkpoint_dir, cfg).policy
-        model.requires_grad_(False)
+        loaded = []
+        for entry in members:
+            member_run, checkpoint = _split_member(entry, run)
+            member_run_dir = run_dir if member_run == run else _resolve_run_dir(member_run)
+            member_cfg = cfg if member_run == run else _load_config(member_run_dir)
+            checkpoint_dir = _resolve_checkpoint_dir(member_run_dir, checkpoint)
+            policy = _load_model(checkpoint_dir, member_cfg).policy
+            policy.requires_grad_(False)
+            if loaded and policy.observation_space["features"].shape != loaded[0].observation_space["features"].shape:
+                raise ValueError(f"ensemble member {checkpoint_dir} has a different observation space than {members[0]}")
+            loaded.append(policy)
+            self.logger.info(f"ppo_agent.setup: loaded {checkpoint_dir}")
         self._ppo_obs_env = _get_dummy_env(cfg)
-        self._ppo_model = model
-        self.logger.info(f"ppo_agent.setup: loaded {checkpoint_dir}")
+        self._ppo_models = loaded
+        self._ppo_model = loaded[0]
+        if len(loaded) > 1:
+            self.logger.info(f"ppo_agent.setup: averaging the action probabilities of {len(loaded)} policies")
     except Exception:
         _fail(self, "ppo_agent.setup: could not load the model, every action will be WAIT")
         return
@@ -198,15 +237,7 @@ def act(self, game_state: dict) -> str:
 
     time_start = time.time()
     try:
-        obs_env = self._ppo_obs_env
-        obs = obs_env.observation_from_game_state(game_state)
-        action_masks = obs_env.action_masks()
-        action_idx, _ = self._ppo_model.predict(
-            obs,
-            deterministic=DETERMINISTIC,
-            action_masks=action_masks,
-        )
-        chosen_action = _ACTION_NAMES[int(action_idx)]
+        chosen_action = _choose(self, game_state)
     except Exception:
         _fail(self, f"ppo_agent.act: failed at step {game_state.get('step')}, returning WAIT")
         return "WAIT"

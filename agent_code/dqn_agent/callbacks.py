@@ -18,6 +18,8 @@ from .model import MaskableDQN
 
 RUN: str = "run_20260901-120000"
 CHECKPOINT: Optional[str] = None
+ENSEMBLE: list = []
+MC_DROPOUT_SAMPLES: int = 0
 DETERMINISTIC: bool = True
 
 AGENT_DIR = pathlib.Path(__file__).resolve().parent
@@ -27,6 +29,18 @@ _ACTION_NAMES = {v: k for k, v in ACTION_INDICES.items() if k is not None}
 
 def _setting(name: str, default):
     return os.environ.get(f"{ENV_PREFIX}_{name}", default)
+
+
+def _member_specs(raw) -> list:
+    entries = [e.strip() for e in raw.split(",")] if isinstance(raw, str) else list(raw)
+    return [e for e in entries if e]
+
+
+def _split_member(entry: str, default_run: str):
+    run, sep, checkpoint = entry.rpartition("/")
+    if not sep or run in ("", "."):
+        return default_run, entry
+    return run, checkpoint
 
 
 def _resolve_run_dir(run: str) -> pathlib.Path:
@@ -134,18 +148,26 @@ def _make_warmup_state() -> dict:
     }
 
 
+def _choose(self, game_state: dict) -> str:
+    obs_env = self._dqn_obs_env
+    obs = obs_env.observation_from_game_state(game_state)
+    action_masks = obs_env.action_masks()
+    if not DETERMINISTIC and len(self._dqn_models) == 1 and self._dqn_mc_samples == 0:
+        action_idx, _ = self._dqn_model.predict(obs, deterministic=False, action_masks=action_masks)
+        return _ACTION_NAMES[int(action_idx)]
+    batch = {"grid_tensor": obs["grid_tensor"][None], "features": obs["features"][None]}
+    q = np.mean([model.q_values(batch, self._dqn_mc_samples)[0] for model in self._dqn_models], axis=0)
+    q = np.where(np.asarray(action_masks[0]).astype(bool), q, -np.inf)
+    return _ACTION_NAMES[int(np.argmax(q))]
+
+
 def _warm_up(self) -> None:
     time_start = time.time()
-    obs_env = self._dqn_obs_env
-
     state = _make_warmup_state()
-    obs = obs_env.observation_from_game_state(state)
-    self._dqn_model.predict(obs, deterministic=True, action_masks=obs_env.action_masks())
-
+    _choose(self, state)
     state["bombs"] = []
     state["explosion_map"] = np.zeros_like(state["explosion_map"])
-    obs = obs_env.observation_from_game_state(state)
-    self._dqn_model.predict(obs, deterministic=True, action_masks=obs_env.action_masks())
+    _choose(self, state)
 
     self.logger.info(f"dqn_agent.setup: warm-up finished in {time.time() - time_start:.2f}s")
 
@@ -159,16 +181,30 @@ def _fail(self, message: str) -> None:
 def setup(self):
     torch.set_num_threads(1)
     self._dqn_model = None
+    self._dqn_models = []
     self._dqn_obs_env = None
+    self._dqn_mc_samples = int(_setting("MC_DROPOUT_SAMPLES", MC_DROPOUT_SAMPLES))
 
     try:
-        run_dir = _resolve_run_dir(_setting("RUN", RUN))
+        run = _setting("RUN", RUN)
+        members = _member_specs(_setting("ENSEMBLE", ENSEMBLE)) or [_setting("CHECKPOINT", CHECKPOINT) or "latest"]
+        run_dir = _resolve_run_dir(run)
         cfg = _load_config(run_dir)
-        checkpoint_dir = _resolve_checkpoint_dir(run_dir, _setting("CHECKPOINT", CHECKPOINT))
-        model = _load_model(checkpoint_dir)
+        loaded = []
+        for entry in members:
+            member_run, checkpoint = _split_member(entry, run)
+            member_run_dir = run_dir if member_run == run else _resolve_run_dir(member_run)
+            checkpoint_dir = _resolve_checkpoint_dir(member_run_dir, checkpoint)
+            model = _load_model(checkpoint_dir)
+            if loaded and model.observation_space["features"].shape != loaded[0].observation_space["features"].shape:
+                raise ValueError(f"ensemble member {checkpoint_dir} has a different observation space than {members[0]}")
+            loaded.append(model)
+            self.logger.info(f"dqn_agent.setup: loaded {checkpoint_dir}")
         self._dqn_obs_env = _get_dummy_env(cfg)
-        self._dqn_model = model
-        self.logger.info(f"dqn_agent.setup: loaded {checkpoint_dir}")
+        self._dqn_models = loaded
+        self._dqn_model = loaded[0]
+        if len(loaded) > 1 or self._dqn_mc_samples:
+            self.logger.info(f"dqn_agent.setup: averaging {len(loaded)} model(s), {self._dqn_mc_samples} dropout samples")
     except Exception:
         _fail(self, "dqn_agent.setup: could not load the model, every action will be WAIT")
         return
@@ -185,15 +221,7 @@ def act(self, game_state: dict) -> str:
 
     time_start = time.time()
     try:
-        obs_env = self._dqn_obs_env
-        obs = obs_env.observation_from_game_state(game_state)
-        action_masks = obs_env.action_masks()
-        action_idx, _ = self._dqn_model.predict(
-            obs,
-            deterministic=DETERMINISTIC,
-            action_masks=action_masks,
-        )
-        chosen_action = _ACTION_NAMES[int(action_idx)]
+        chosen_action = _choose(self, game_state)
     except Exception:
         _fail(self, f"dqn_agent.act: failed at step {game_state.get('step')}, returning WAIT")
         return "WAIT"

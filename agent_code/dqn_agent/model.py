@@ -274,12 +274,21 @@ class MaskableDQN:
             actions[i] = np.random.choice(valid) if len(valid) else np.random.randint(self.n_actions)
         return actions
 
-    def _predict_masked(self, observation: dict, action_masks: np.ndarray) -> np.ndarray:
-        """Pick the highest-Q action among the valid masks."""
-        self.q_net.eval()
+    def q_values(self, observation: dict, mc_dropout_samples: int = 0) -> np.ndarray:
+        samples = int(mc_dropout_samples) if self.dropout > 0 else 0
+        self.q_net.train(samples > 0)
         with torch.no_grad():
             obs_t = _obs_to_tensors(observation, self.device)
-            q_values = self.q_net(obs_t).cpu().numpy()
+            if samples > 0:
+                q = torch.stack([self.q_net(obs_t) for _ in range(samples)]).mean(dim=0)
+            else:
+                q = self.q_net(obs_t)
+        self.q_net.eval()
+        return q.cpu().numpy()
+
+    def _predict_masked(self, observation: dict, action_masks: np.ndarray) -> np.ndarray:
+        """Pick the highest-Q action among the valid masks."""
+        q_values = self.q_values(observation)
         q_values = np.where(np.asarray(action_masks).astype(bool), q_values, -np.inf)
         return q_values.argmax(axis=1)
 
