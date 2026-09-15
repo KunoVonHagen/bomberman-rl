@@ -40,6 +40,10 @@ class StepProfiler:
         return {name: (sum(vals) / len(vals)) for name, vals in self._times.items() if vals}
 
 
+def _dropout_layer(dropout: float) -> list:
+    return [nn.Dropout(dropout)] if dropout > 0 else []
+
+
 class ResidualBlock(nn.Module):
     """A residual CNN block with group normalization."""
 
@@ -61,7 +65,7 @@ class ResidualBlock(nn.Module):
 class BombermanFeatureExtractor(nn.Module):
     """Encode board and feature vectors into a latent representation."""
 
-    def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 256):
+    def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 256, dropout: float = 0.0):
         super().__init__()
         self.features_dim = features_dim
 
@@ -93,16 +97,19 @@ class BombermanFeatureExtractor(nn.Module):
         self.grid_fc = nn.Sequential(
             nn.Linear(n_cnn_flatten, 128),
             nn.ReLU(),
+            *_dropout_layer(dropout),
         )
 
         self.features_preprocess_fc = nn.Sequential(
             nn.Linear(feature_space.shape[0], 64),
             nn.ReLU(),
+            *_dropout_layer(dropout),
         )
 
         self.combined_fc = nn.Sequential(
             nn.Linear(128 + 64, features_dim),
             nn.ReLU(),
+            *_dropout_layer(dropout),
         )
 
     def _conv_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -129,9 +136,9 @@ class BombermanFeatureExtractor(nn.Module):
 class QNetwork(nn.Module):
     """Feature extractor plus Q-value head for discrete actions."""
 
-    def __init__(self, observation_space: gym.spaces.Dict, n_actions: int, features_dim: int = 256):
+    def __init__(self, observation_space: gym.spaces.Dict, n_actions: int, features_dim: int = 256, dropout: float = 0.0):
         super().__init__()
-        self.features_extractor = BombermanFeatureExtractor(observation_space, features_dim)
+        self.features_extractor = BombermanFeatureExtractor(observation_space, features_dim, dropout)
         self.q_head = nn.Linear(features_dim, n_actions)
 
     def forward(self, observations: dict) -> torch.Tensor:
@@ -190,6 +197,8 @@ class MaskableDQN:
         features_dim: int = 256,
         exploration_duration: int = 300_000,
         symmetry_augmentation: bool = False,
+        weight_decay: float = 0.0,
+        dropout: float = 0.0,
         n_envs: int = 1,
         device: str = "cpu",
     ):
@@ -212,6 +221,8 @@ class MaskableDQN:
         self.features_dim = features_dim
         self.symmetry_augmentation = bool(symmetry_augmentation)
         self._augmenter = TensorAugmenter(self.device)
+        self.weight_decay = float(weight_decay)
+        self.dropout = float(dropout)
 
         self.exploration_initial_eps = exploration_initial_eps
         self.exploration_final_eps = exploration_final_eps
@@ -222,12 +233,12 @@ class MaskableDQN:
         )
         self.exploration_rate = exploration_initial_eps
 
-        self.q_net = QNetwork(observation_space, self.n_actions, features_dim).to(self.device)
-        self.q_net_target = QNetwork(observation_space, self.n_actions, features_dim).to(self.device)
+        self.q_net = QNetwork(observation_space, self.n_actions, features_dim, self.dropout).to(self.device)
+        self.q_net_target = QNetwork(observation_space, self.n_actions, features_dim, self.dropout).to(self.device)
         self.q_net_target.load_state_dict(self.q_net.state_dict())
         self.q_net_target.eval()
 
-        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.learning_rate)
+        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         self._amp_enabled = self.device.type == "cuda"
         self.scaler = torch.cuda.amp.GradScaler(enabled=self._amp_enabled)
 
@@ -552,6 +563,8 @@ class MaskableDQN:
             features_dim=self.features_dim,
             exploration_duration=self.exploration_duration,
             symmetry_augmentation=self.symmetry_augmentation,
+            weight_decay=self.weight_decay,
+            dropout=self.dropout,
         )
 
     def save(self, path) -> None:

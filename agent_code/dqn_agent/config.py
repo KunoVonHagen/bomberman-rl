@@ -88,6 +88,8 @@ class DQNConfig:
     exploration_final_eps: float = 0.05
     max_grad_norm: float = 10.0
     symmetry_augmentation: bool = True
+    weight_decay: float = 0.0
+    dropout: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -222,6 +224,7 @@ class TrainingConfig:
         "dqn.gamma",
         "dqn.max_grad_norm",
         "dqn.symmetry_augmentation",
+        "dqn.weight_decay",
         "self_play.enabled",
         "self_play.static_opponents",
         "self_play.arrangements",
@@ -349,6 +352,8 @@ DEFAULT_CONFIG = TrainingConfig(
         exploration_final_eps=0.05,
         max_grad_norm=10.0,
         symmetry_augmentation=True,
+        weight_decay=1e-5,
+        dropout=0.0,
     ),
     env=EnvConfig(env_version=3),
     self_play=SelfPlayConfig(

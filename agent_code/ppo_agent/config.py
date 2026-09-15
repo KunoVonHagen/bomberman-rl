@@ -114,6 +114,8 @@ class PPOConfig:
     vf_coef: float = 0.7
     target_kl: float = 0.02
     symmetry_augmentation: bool = True
+    weight_decay: float = 0.0
+    dropout: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -268,6 +270,7 @@ class TrainingConfig:
         "ppo.vf_coef",
         "ppo.target_kl",
         "ppo.symmetry_augmentation",
+        "ppo.weight_decay",
         "self_play.enabled",
         "self_play.static_opponents",
         "self_play.arrangements",
@@ -401,6 +404,8 @@ DEFAULT_CONFIG = TrainingConfig(
         vf_coef=0.7,
         target_kl=0.02,
         symmetry_augmentation=True,
+        weight_decay=1e-5,
+        dropout=0.0,
     ),
     env=EnvConfig(env_version=3),
     self_play=SelfPlayConfig(

@@ -76,14 +76,17 @@ def _load_config(run_dir: pathlib.Path) -> TrainingConfig:
     return TrainingConfig.from_dict(manifest["config"])
 
 
-def _load_model(checkpoint_dir: pathlib.Path) -> MaskablePPO:
+def _load_model(checkpoint_dir: pathlib.Path, cfg: TrainingConfig) -> MaskablePPO:
     return MaskablePPO.load(
         checkpoint_dir / "model.zip",
         device="cpu",
         custom_objects={
             "n_envs": 1,
             "n_steps": 1,
-            "policy_kwargs": dict(features_extractor_class=BombermanFeatureExtractor),
+            "policy_kwargs": dict(
+                features_extractor_class=BombermanFeatureExtractor,
+                features_extractor_kwargs=dict(dropout=cfg.ppo.dropout),
+            ),
         },
     )
 
@@ -174,7 +177,7 @@ def setup(self):
         run_dir = _resolve_run_dir(_setting("RUN", RUN))
         cfg = _load_config(run_dir)
         checkpoint_dir = _resolve_checkpoint_dir(run_dir, _setting("CHECKPOINT", CHECKPOINT))
-        model = _load_model(checkpoint_dir).policy
+        model = _load_model(checkpoint_dir, cfg).policy
         model.requires_grad_(False)
         self._ppo_obs_env = _get_dummy_env(cfg)
         self._ppo_model = model

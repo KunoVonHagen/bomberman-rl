@@ -431,12 +431,17 @@ def architecture_info(cfg: TrainingConfig) -> dict:
         "policy": "MultiInputPolicy",
         "algorithm": "MaskablePPO",
         "features_extractor_class": BombermanFeatureExtractor.__name__,
+        "dropout": cfg.ppo.dropout,
         "layer_config": cfg.env.layer_config,
     }
 
 
 def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str, device: str) -> MaskablePPO:
-    policy_kwargs = dict(features_extractor_class=BombermanFeatureExtractor)
+    policy_kwargs = dict(
+        features_extractor_class=BombermanFeatureExtractor,
+        features_extractor_kwargs=dict(dropout=cfg.ppo.dropout),
+        optimizer_kwargs=dict(weight_decay=cfg.ppo.weight_decay),
+    )
     return MaskablePPO(
         "MultiInputPolicy",
         env,
@@ -497,6 +502,8 @@ def apply_ppo_hyperparams(
     model.n_epochs = ppo_cfg.n_epochs
     model.target_kl = ppo_cfg.target_kl
     model.batch_size = ppo_cfg.batch_size
+    for group in model.policy.optimizer.param_groups:
+        group["weight_decay"] = float(ppo_cfg.weight_decay)
 
     if model.n_steps == ppo_cfg.n_steps:
         return

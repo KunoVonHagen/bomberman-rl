@@ -1,0 +1,56 @@
+{
+  "name": "dqn_regularisation",
+  "agent": "dqn_agent",
+  "train": [
+    "python",
+    "-m",
+    "agent_code.dqn_agent.train",
+    "--device",
+    "auto",
+    "--n-envs",
+    "64",
+    "--n-shards",
+    "4",
+    "--no-schedule"
+  ],
+  "override_style": "set",
+  "fixed": {
+    "total_timesteps": 1000000,
+    "save_every_timesteps": 1000000,
+    "save_replay_buffer_transitions": 0,
+    "dqn.learning_starts": 20000,
+    "self_play.enabled": false,
+    "self_play.static_opponents": "agent_code.rule_based_agent.callbacks,agent_code.rule_based_agent.callbacks,agent_code.rule_based_agent.callbacks"
+  },
+  "parameters": [
+    {
+      "name": "dqn.weight_decay",
+      "values": [
+        0.0,
+        1e-06,
+        1e-05,
+        0.0001,
+        0.001
+      ]
+    },
+    {
+      "name": "dqn.dropout",
+      "values": [
+        0.0,
+        0.1,
+        0.2,
+        0.3
+      ]
+    }
+  ],
+  "validation": {
+    "matchups": [
+      "task2-classic-solo",
+      "task4-rule-based-x3"
+    ],
+    "n_rounds": 20,
+    "seed": 0,
+    "workers": 4,
+    "criterion": "score"
+  }
+}

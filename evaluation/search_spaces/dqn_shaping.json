@@ -1,0 +1,77 @@
+{
+  "name": "dqn_shaping",
+  "agent": "dqn_agent",
+  "train": [
+    "python",
+    "-m",
+    "agent_code.dqn_agent.train",
+    "--device",
+    "auto",
+    "--n-envs",
+    "64",
+    "--n-shards",
+    "4",
+    "--no-schedule"
+  ],
+  "override_style": "set",
+  "fixed": {
+    "total_timesteps": 1000000,
+    "save_every_timesteps": 1000000,
+    "save_replay_buffer_transitions": 0,
+    "dqn.learning_starts": 20000,
+    "self_play.enabled": false,
+    "self_play.static_opponents": "agent_code.rule_based_agent.callbacks,agent_code.rule_based_agent.callbacks,agent_code.rule_based_agent.callbacks"
+  },
+  "parameters": [
+    {
+      "name": "rewards.coin_shaping_coef",
+      "values": [
+        0.0,
+        0.02,
+        0.05,
+        0.1,
+        0.2
+      ]
+    },
+    {
+      "name": "rewards.crate_shaping_coef",
+      "values": [
+        0.0,
+        0.01,
+        0.02,
+        0.05,
+        0.1
+      ]
+    },
+    {
+      "name": "rewards.danger_penalty_coef",
+      "values": [
+        0.0,
+        0.02,
+        0.05,
+        0.1,
+        0.2
+      ]
+    },
+    {
+      "name": "rewards.trap_shaping_coef",
+      "values": [
+        0.0,
+        0.05,
+        0.1,
+        0.2,
+        0.4
+      ]
+    }
+  ],
+  "validation": {
+    "matchups": [
+      "task2-classic-solo",
+      "task4-rule-based-x3"
+    ],
+    "n_rounds": 20,
+    "seed": 0,
+    "workers": 4,
+    "criterion": "score"
+  }
+}

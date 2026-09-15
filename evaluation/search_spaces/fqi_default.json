@@ -1,0 +1,75 @@
+{
+  "name": "fqi_default",
+  "agent": "fqi_agent",
+  "train": [
+    "python",
+    "-m",
+    "agent_code.fqi_agent.train",
+    "--model",
+    "forest",
+    "--n-envs",
+    "32",
+    "--epochs",
+    "12",
+    "--steps-per-epoch",
+    "400",
+    "--eps-epochs",
+    "8",
+    "--eval-every",
+    "0"
+  ],
+  "override_style": "flags",
+  "run_name_key": "--run-name",
+  "fixed": {},
+  "parameters": [
+    {
+      "name": "gamma",
+      "arg": "--gamma",
+      "values": [
+        0.9,
+        0.95,
+        0.98,
+        0.99
+      ]
+    },
+    {
+      "name": "n_estimators",
+      "arg": "--n-estimators",
+      "values": [
+        20,
+        50,
+        100
+      ],
+      "log": true
+    },
+    {
+      "name": "max_depth",
+      "arg": "--max-depth",
+      "values": [
+        8,
+        12,
+        16
+      ]
+    },
+    {
+      "name": "min_samples_leaf",
+      "arg": "--min-samples-leaf",
+      "values": [
+        5,
+        20,
+        50
+      ],
+      "log": true
+    }
+  ],
+  "validation": {
+    "matchups": [
+      "task2-classic-solo",
+      "task4-rule-based-x3"
+    ],
+    "n_rounds": 20,
+    "seed": 0,
+    "workers": 4,
+    "criterion": "score"
+  }
+}

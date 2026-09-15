@@ -4,6 +4,10 @@ import gymnasium as gym
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
+def _dropout_layer(dropout: float) -> list:
+    return [nn.Dropout(dropout)] if dropout > 0 else []
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels: int, groups: int = 8):
         super().__init__()
@@ -22,7 +26,7 @@ class ResidualBlock(nn.Module):
 
 class BombermanFeatureExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Dict,
-                 features_dim: int = 256):
+                 features_dim: int = 256, dropout: float = 0.0):
 
         super().__init__(observation_space, features_dim)
 
@@ -54,16 +58,19 @@ class BombermanFeatureExtractor(BaseFeaturesExtractor):
         self.grid_fc = nn.Sequential(
             nn.Linear(n_cnn_flatten, 128),
             nn.ReLU(),
+            *_dropout_layer(dropout),
         )
 
         self.features_preprocess_fc = nn.Sequential(
             nn.Linear(feature_space.shape[0], 64),
             nn.ReLU(),
+            *_dropout_layer(dropout),
         )
 
         self.combined_fc = nn.Sequential(
             nn.Linear(128 + 64, features_dim),
             nn.ReLU(),
+            *_dropout_layer(dropout),
         )
 
     def _conv_forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -597,6 +597,7 @@ def architecture_info(cfg: TrainingConfig) -> dict:
         "policy": "MultiInputPolicy",
         "algorithm": "MaskableDQN",
         "features_extractor_class": BombermanFeatureExtractor.__name__,
+        "dropout": cfg.dqn.dropout,
         "layer_config": cfg.env.layer_config,
     }
 
@@ -623,6 +624,8 @@ def build_model(env, cfg: TrainingConfig, device: str) -> MaskableDQN:
         max_grad_norm=cfg.dqn.max_grad_norm,
         exploration_duration=exploration_duration,
         symmetry_augmentation=cfg.dqn.symmetry_augmentation,
+        weight_decay=cfg.dqn.weight_decay,
+        dropout=cfg.dqn.dropout,
     )
 
 
@@ -638,6 +641,9 @@ def apply_dqn_hyperparams(model: MaskableDQN, dqn_cfg: DQNConfig, total_timestep
     model.target_update_interval = max(1, int(dqn_cfg.target_update_interval))
     model.max_grad_norm = dqn_cfg.max_grad_norm
     model.symmetry_augmentation = bool(dqn_cfg.symmetry_augmentation)
+    model.weight_decay = float(dqn_cfg.weight_decay)
+    for group in model.optimizer.param_groups:
+        group["weight_decay"] = model.weight_decay
     model.exploration_initial_eps = dqn_cfg.exploration_initial_eps
     model.exploration_final_eps = dqn_cfg.exploration_final_eps
     model.exploration_fraction = dqn_cfg.exploration_fraction
