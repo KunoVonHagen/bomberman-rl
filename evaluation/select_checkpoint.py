@@ -5,7 +5,6 @@ import json
 import math
 import os
 import pathlib
-import platform
 import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -24,6 +23,14 @@ VALIDATION_MATCHUPS = ["task2-classic-solo", "task3-hunt", "task4-rule-based-x3"
 CRITERIA = {"score": ("score_mean", "score_sem"), "win": ("win_rate", "win_rate_sem"),
             "survival": ("survival_rate", "survival_rate_sem")}
 BEST_FILE = "best.txt"
+
+
+def relative_path(path: pathlib.Path) -> str:
+    path = pathlib.Path(path).resolve()
+    try:
+        return path.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return path.name
 
 
 def find_run_dir(agent: str, run: str) -> pathlib.Path:
@@ -116,22 +123,36 @@ def print_metadata_table(result: Dict[str, Any]) -> None:
     print(_table(headers, rows))
 
 
-def play_candidate(agent: str, prefix: str, run: str, checkpoint: pathlib.Path, matchups: List[str],
-                   n_rounds: int, seed: int, workers: int, silence_errors: bool, log_dir: pathlib.Path) -> Dict[str, Any]:
+def play_run(agent: str, prefix: str, run: str, checkpoint: Optional[str], label: str, matchups: List[str],
+             n_rounds: int, seed: int, workers: int, silence_errors: bool, log_dir: pathlib.Path) -> Dict[str, Any]:
     os.environ[f"{prefix}_RUN"] = run
-    os.environ[f"{prefix}_CHECKPOINT"] = checkpoint.name
+    if checkpoint is None:
+        os.environ.pop(f"{prefix}_CHECKPOINT", None)
+    else:
+        os.environ[f"{prefix}_CHECKPOINT"] = checkpoint
     out: Dict[str, Any] = {}
     for name in matchups:
         spec = resolve_matchup(name, agent)
-        print(f"[{checkpoint.name}] {name}: {' vs '.join(spec['agents'])} -- {n_rounds} rounds, seed {seed}")
+        print(f"[{label}] {name}: {' vs '.join(spec['agents'])} -- {n_rounds} rounds, seed {seed}")
         records = play_parallel(spec["agents"], spec["scenario"], n_rounds, seed, workers,
-                                log_dir / checkpoint.name / name, silence_errors)
+                                log_dir / label / name, silence_errors)
         records.sort(key=lambda r: r["round"])
         summary = summarize_records(records)[agent]
         rounds = [next(a for a in r["agents"] if a["name"] == agent) for r in records]
         out[name] = dict(summary=summary, score=[float(a["score"]) for a in rounds],
                          win=[float(a["win"]) for a in rounds], alive=[float(a["alive"]) for a in rounds])
     return out
+
+
+def play_candidate(agent: str, prefix: str, run: str, checkpoint: pathlib.Path, matchups: List[str],
+                   n_rounds: int, seed: int, workers: int, silence_errors: bool, log_dir: pathlib.Path) -> Dict[str, Any]:
+    return play_run(agent, prefix, run, checkpoint.name, checkpoint.name, matchups, n_rounds, seed, workers,
+                    silence_errors, log_dir)
+
+
+def score_run(results: Dict[str, Any], criterion: str) -> float:
+    metric, _ = CRITERIA[criterion]
+    return float(np.mean([results[m]["summary"][metric] for m in results]))
 
 
 def rank_by_play(results: Dict[str, Dict[str, Any]], matchups: List[str], criterion: str) -> Dict[str, Any]:
@@ -223,8 +244,8 @@ def main(argv=None) -> None:
     STATS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = STATS_DIR / f"{tag}.json"
     out_path.write_text(json.dumps(dict(
-        meta=dict(created=timestamp, git_commit=_git_commit(), host=platform.node(), agent=args.agent,
-                  run=str(run_dir), mode="metadata" if args.metadata else "play", matchups=args.matchups,
+        meta=dict(created=timestamp, git_commit=_git_commit(), agent=args.agent,
+                  run=relative_path(run_dir), mode="metadata" if args.metadata else "play", matchups=args.matchups,
                   n_rounds=args.n_rounds, seed=args.seed, criterion=args.criterion),
         candidates={c.name: dict(timesteps=timesteps_of(c), ep_rew_mean=metadata[c.name].get("ep_rew_mean"),
                                  eval_suite=metadata[c.name].get("eval_suite")) for c in candidates},

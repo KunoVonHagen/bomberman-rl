@@ -464,8 +464,6 @@ def run_matchup(spec: Dict[str, Any], n_rounds: int, seed: Optional[int], worker
         "meta": {
             "created": timestamp,
             "git_commit": _git_commit(),
-            "host": platform.node(),
-            "platform": platform.platform(),
             "python": platform.python_version(),
             "workers": workers,
             "note": note,
