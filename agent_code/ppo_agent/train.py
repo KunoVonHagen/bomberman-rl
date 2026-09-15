@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import multiprocessing as mp
+import os
 import pathlib
 from datetime import datetime
 from multiprocessing import freeze_support
@@ -187,6 +188,9 @@ class NativeBatchedVecEnv(VecEnv):
         return [None] * self.num_envs
 
 
+_WORKER_THREAD_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMBA_NUM_THREADS")
+
+
 def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, layer_config,
                    shard_n_envs: int, reward_config: Optional[RewardConfig] = None, env_version: int = 1):
     """
@@ -198,6 +202,7 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
     torch.set_num_interop_threads(1)
 
     parent_remote.close()
+    torch.set_num_threads(1)
 
     world_args = WorldArgs(**world_args_kwargs)
     env = BombermanGymEnv(
@@ -259,6 +264,8 @@ class ShardedNativeBatchedVecEnv(VecEnv):
         self._cfg = cfg
 
         ctx = mp.get_context("spawn")
+        saved_thread_vars = {name: os.environ.get(name) for name in _WORKER_THREAD_VARS}
+        os.environ.update({name: "1" for name in _WORKER_THREAD_VARS})
         self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(n_shards)])
         self.processes = []
         for i, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
@@ -288,6 +295,11 @@ class ShardedNativeBatchedVecEnv(VecEnv):
             p.start()
             self.processes.append(p)
             work_remote.close()
+        for name, value in saved_thread_vars.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
         self.remotes[0].send(("get_spaces", None))
         obs_space, act_space = self.remotes[0].recv()

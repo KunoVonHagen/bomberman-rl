@@ -148,21 +148,20 @@ class QNetwork(nn.Module):
 
 def _obs_to_tensors(observation: dict, device: torch.device, pinned: Optional[dict] = None) -> dict:
     """Convert observation arrays to PyTorch tensors on a device."""
-    grid_np = np.asarray(observation["grid_tensor"])
-    feats_np = np.asarray(observation["features"])
+    grid = observation["grid_tensor"]
+    grid_t = grid if torch.is_tensor(grid) else torch.from_numpy(np.ascontiguousarray(grid))
+    feats_t = torch.as_tensor(np.asarray(observation["features"]), dtype=torch.float32)
     non_blocking = device.type == "cuda"
 
     if non_blocking and pinned is not None:
-        pinned["grid"].copy_(torch.from_numpy(grid_np))
-        pinned["features"].copy_(torch.from_numpy(feats_np))
-        grid_t = pinned["grid"]
+        if pinned["grid"].dtype == grid_t.dtype and pinned["grid"].data_ptr() != grid_t.data_ptr():
+            pinned["grid"].copy_(grid_t)
+            grid_t = pinned["grid"]
+        pinned["features"].copy_(feats_t)
         feats_t = pinned["features"]
-    else:
-        grid_t = torch.as_tensor(grid_np, dtype=torch.float32)
-        feats_t = torch.as_tensor(feats_np, dtype=torch.float32)
 
     return {
-        "grid_tensor": grid_t.to(device, non_blocking=non_blocking),
+        "grid_tensor": grid_t.to(device, non_blocking=non_blocking).float(),
         "features": feats_t.to(device, non_blocking=non_blocking),
     }
 
@@ -367,11 +366,12 @@ class MaskableDQN:
             or self._pinned_obs["grid"].shape[0] != batch_size
         )
         if need_alloc:
-            def make(shape):
-                return torch.empty((batch_size, *shape), dtype=torch.float32, pin_memory=True)
+            def make(shape, dtype):
+                return torch.empty((batch_size, *shape), dtype=dtype, pin_memory=True)
 
-            self._pinned_obs = {"grid": make(grid_shape), "features": make(feat_shape)}
-            self._pinned_next_obs = {"grid": make(grid_shape), "features": make(feat_shape)}
+            grid_dtype = torch.float16 if self.replay_buffer is None else torch.from_numpy(self.replay_buffer.grid[:1, :1]).dtype
+            self._pinned_obs = {"grid": make(grid_shape, grid_dtype), "features": make(feat_shape, torch.float32)}
+            self._pinned_next_obs = {"grid": make(grid_shape, grid_dtype), "features": make(feat_shape, torch.float32)}
 
     def train_step(self) -> Optional[dict]:
         """Run one gradient step on a minibatch from the replay buffer."""
@@ -387,7 +387,10 @@ class MaskableDQN:
         self._ensure_pinned_buffers(self.batch_size)
 
         if prof: prof.start("sample")
-        batch = self.replay_buffer.sample(self.batch_size)
+        staging = None
+        if self._pinned_obs is not None:
+            staging = {"grid": self._pinned_obs["grid"], "next_grid": self._pinned_next_obs["grid"]}
+        batch = self.replay_buffer.sample(self.batch_size, out=staging)
         if prof: prof.stop("sample")
 
         if prof: prof.start("host_to_device")
@@ -504,8 +507,29 @@ class MaskableDQN:
             if prof: prof.stop("action_select", device=dev)
 
             if prof: prof.start("env_step")
-            next_obs, rewards, dones, infos = env.step(actions)
+            env.step_async(actions)
             if prof: prof.stop("env_step")
+
+            buffer_ready = len(self.replay_buffer) >= min(self.learning_starts, self.replay_buffer.capacity)
+            if not buffer_ready:
+                self._steps_since_train = 0
+            elif self._steps_since_train >= self.train_freq:
+                if prof: prof.start("train")
+                n_updates = self.gradient_steps if self.gradient_steps > 0 else self._steps_since_train
+                for _ in range(max(1, n_updates)):
+                    metrics = self.train_step()
+                    if metrics is not None:
+                        self._loss_window.append(metrics["loss"])
+                        self._grad_norm_window.append(metrics["grad_norm"])
+                        self._mean_q_window.append(metrics["mean_q"])
+                        self._td_error_window.append(metrics["td_error"])
+                        self.n_updates += 1
+                self._steps_since_train = 0
+                if prof: prof.stop("train", device=dev)
+
+            if prof: prof.start("env_wait")
+            next_obs, rewards, dones, infos = env.step_wait()
+            if prof: prof.stop("env_wait")
 
             if prof: prof.start("action_masks")
             next_action_masks = env.action_masks()
@@ -530,21 +554,6 @@ class MaskableDQN:
             for cb in callbacks:
                 cb.on_step(self, env)
             if prof: prof.stop("callbacks_on_step")
-
-            buffer_ready = len(self.replay_buffer) >= min(self.learning_starts, self.replay_buffer.capacity)
-            if not buffer_ready:
-                self._steps_since_train = 0
-            elif self._steps_since_train >= self.train_freq:
-                n_updates = self.gradient_steps if self.gradient_steps > 0 else self._steps_since_train
-                for _ in range(max(1, n_updates)):
-                    metrics = self.train_step()
-                    if metrics is not None:
-                        self._loss_window.append(metrics["loss"])
-                        self._grad_norm_window.append(metrics["grad_norm"])
-                        self._mean_q_window.append(metrics["mean_q"])
-                        self._td_error_window.append(metrics["td_error"])
-                        self.n_updates += 1
-                self._steps_since_train = 0
 
             crossed = (
                 self.num_timesteps // self.target_update_interval

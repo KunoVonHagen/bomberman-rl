@@ -5,6 +5,8 @@ import pathlib
 import random
 import tempfile
 from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
 from sb3_contrib import MaskablePPO
 
 from .config import EnvConfig, SelfPlayConfig, OpponentArrangement, ScenarioArrangement
@@ -15,7 +17,16 @@ from environment import WorldArgs
 OpponentPair = Tuple[Callable, Callable]
 
 _MODEL_CACHE: Dict[str, "MaskablePPO"] = {}
-_OBS_ENV_CACHE: Dict[str, "BombermanGymEnv"] = {}
+_OBS_ENV_CACHE: Dict[Tuple[str, int], "BombermanGymEnv"] = {}
+
+_BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
+
+
+def _batch_capacity(k: int) -> int:
+    for capacity in _BATCH_CAPACITIES:
+        if capacity >= k:
+            return capacity
+    return _BATCH_CAPACITIES[-1]
 
 
 class _CheckpointOpponent:
@@ -28,20 +39,18 @@ class _CheckpointOpponent:
         self.model_path = model_path
         self.env_cfg = env_cfg
         self._model = None
-        self._obs_env = None
         self._action_names = None
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_model"] = None
-        state["_obs_env"] = None
         state["_action_names"] = None
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
 
-    def _ensure_ready(self):
+    def _ensure_model(self):
         if self._model is None:
             self._model = _MODEL_CACHE.get(self.model_path)
             if self._model is None:
@@ -51,13 +60,13 @@ class _CheckpointOpponent:
                     custom_objects={"n_envs": 1, "n_steps": 1},
                 )
                 _MODEL_CACHE[self.model_path] = self._model
-
-        if self._obs_env is None:
-            self._obs_env = _OBS_ENV_CACHE.get(self.model_path)
-        if self._obs_env is not None:
+        if self._action_names is None:
             self._action_names = {v: k for k, v in ACTION_INDICES.items() if k is not None}
-            return
-        if self._obs_env is None:
+
+    def _obs_env_with(self, capacity: int) -> BombermanGymEnv:
+        key = (self.model_path, capacity)
+        env = _OBS_ENV_CACHE.get(key)
+        if env is None:
             log_dir = tempfile.mkdtemp(prefix="checkpoint_opponent_")
             world_args = WorldArgs(
                 scenario=self.env_cfg.scenario,
@@ -75,22 +84,38 @@ class _CheckpointOpponent:
                 replay=False,
                 continue_without_training=self.env_cfg.continue_without_training,
             )
-            self._obs_env = BombermanGymEnv(world_args, opponents=[((lambda handle: None), (lambda handle, state: "WAIT"))] * 3, layer_config=self.env_cfg.layer_config, env_version=self.env_cfg.env_version)
-            _OBS_ENV_CACHE[self.model_path] = self._obs_env
-            self._action_names = {v: k for k, v in ACTION_INDICES.items() if k is not None}
+            env = BombermanGymEnv(
+                world_args,
+                opponents=[((lambda handle: None), (lambda handle, state: "WAIT"))] * 3,
+                layer_config=self.env_cfg.layer_config,
+                env_version=self.env_cfg.env_version,
+                n_envs=capacity,
+            )
+            env.reset()
+            _OBS_ENV_CACHE[key] = env
+        return env
+
+    @property
+    def batch_key(self) -> str:
+        return self.model_path
 
     def setup(self, agent):
-        self._ensure_ready()
-        self._obs_env.reset()
+        self._ensure_model()
 
     def act(self, agent, game_state):
-        self._ensure_ready()
-        obs_env = self._obs_env
-        obs = obs_env.observation_from_game_state(game_state)
-        action_masks = obs_env.action_masks()
+        return self.batch_act([agent], [game_state])[0]
 
-        action_idx, _ = self._model.predict(obs, deterministic=False, action_masks=action_masks)
-        return self._action_names[int(action_idx)]
+    def batch_act(self, agents, game_states) -> List[str]:
+        self._ensure_model()
+        names: List[str] = []
+        limit = _BATCH_CAPACITIES[-1]
+        for start in range(0, len(game_states), limit):
+            chunk = game_states[start:start + limit]
+            env = self._obs_env_with(_batch_capacity(len(chunk)))
+            obs, masks = env.observations_from_game_states(chunk)
+            indices, _ = self._model.predict(obs, deterministic=False, action_masks=masks)
+            names.extend(self._action_names[int(i)] for i in np.atleast_1d(indices))
+        return names
 
     def as_pair(self) -> OpponentPair:
         return (self.setup, self.act)

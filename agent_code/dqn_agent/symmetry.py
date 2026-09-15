@@ -128,7 +128,7 @@ class TensorAugmenter:
         self.perm = torch.as_tensor(ACTION_PERM, device=device)
         self.perm_inv = torch.as_tensor(ACTION_PERM_INV, device=device)
         self.position = torch.as_tensor(POSITION, device=device, dtype=torch.float32)
-        self.groups = [torch.as_tensor(group, device=device) for group in DIRECTION_FEATURES]
+        self.groups = [(group[-1], torch.as_tensor(group, device=device)) for group in DIRECTION_FEATURES]
 
     def transform_features(self, f: torch.Tensor, k: int) -> torch.Tensor:
         f = f.clone()
@@ -137,17 +137,18 @@ class TensorAugmenter:
         moved = self.position[k, xs, ys]
         f[:, FEATURE_SELF_X] = moved[:, 0] * (2.0 / (_W - 1)) - 1.0
         f[:, FEATURE_SELF_Y] = moved[:, 1] * (2.0 / (_H - 1)) - 1.0
-        for group in self.groups:
-            if int(group[-1]) < f.shape[1]:
+        for last, group in self.groups:
+            if last < f.shape[1]:
                 f[:, group] = f[:, group][:, self.perm_inv[k, :4]]
         return f
 
     def augment(self, obs: dict, next_obs: dict, actions: torch.Tensor, next_masks: torch.Tensor) -> None:
-        ks = torch.randint(0, N_SYMMETRIES, (actions.shape[0],), device=self.device)
+        ks = np.random.randint(0, N_SYMMETRIES, size=actions.shape[0])
         for k in range(1, N_SYMMETRIES):
-            idx = torch.nonzero(ks == k).squeeze(1)
-            if idx.numel() == 0:
+            members = np.flatnonzero(ks == k)
+            if members.size == 0:
                 continue
+            idx = torch.from_numpy(members).to(self.device, non_blocking=True)
             for d in (obs, next_obs):
                 d["grid_tensor"][idx] = transform_tensor(d["grid_tensor"][idx], k)
                 d["features"][idx] = self.transform_features(d["features"][idx], k)

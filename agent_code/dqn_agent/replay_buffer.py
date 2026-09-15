@@ -6,6 +6,7 @@ import time
 from typing import Optional
 
 import numpy as np
+import torch
 
 
 class DictReplayBuffer:
@@ -25,6 +26,7 @@ class DictReplayBuffer:
 
         shape = (self.rows, self.n_envs)
         self.grid = np.zeros(shape + grid_shape, dtype=grid_dtype)
+        self._grid_flat = torch.from_numpy(self.grid.reshape((self.rows * self.n_envs,) + tuple(grid_shape)))
         self.features = np.zeros(shape + feat_shape, dtype=np.float32)
         self.actions = np.zeros(shape, dtype=np.int64)
         self.rewards = np.zeros(shape, dtype=np.float32)
@@ -55,7 +57,7 @@ class DictReplayBuffer:
     def add(self, obs, next_obs, actions, rewards, dones, action_masks, next_action_masks) -> None:
         """Store one transition for each active environment."""
         i = self._pos
-        self.grid[i] = obs["grid_tensor"]
+        torch.from_numpy(self.grid[i]).copy_(torch.from_numpy(np.ascontiguousarray(obs["grid_tensor"])))
         self.features[i] = obs["features"]
         self.actions[i] = actions
         self.rewards[i] = rewards
@@ -74,7 +76,7 @@ class DictReplayBuffer:
             self._pos = 0
             self._full = True
 
-    def sample(self, batch_size: int) -> dict:
+    def sample(self, batch_size: int, out: Optional[dict] = None) -> dict:
         t0 = time.perf_counter()
 
         rows = np.flatnonzero(self._has_next)
@@ -84,13 +86,18 @@ class DictReplayBuffer:
         env_idx = np.random.randint(0, self.n_envs, size=batch_size)
         next_row_idx = (row_idx + 1) % self.rows
 
+        flat = torch.from_numpy(row_idx * self.n_envs + env_idx)
+        next_flat = torch.from_numpy(next_row_idx * self.n_envs + env_idx)
+        grid = torch.index_select(self._grid_flat, 0, flat, out=None if out is None else out["grid"])
+        next_grid = torch.index_select(self._grid_flat, 0, next_flat, out=None if out is None else out["next_grid"])
+
         batch = dict(
             obs={
-                "grid_tensor": self.grid[row_idx, env_idx],
+                "grid_tensor": grid,
                 "features": self.features[row_idx, env_idx],
             },
             next_obs={
-                "grid_tensor": self.grid[next_row_idx, env_idx],
+                "grid_tensor": next_grid,
                 "features": self.features[next_row_idx, env_idx],
             },
             actions=self.actions[row_idx, env_idx],

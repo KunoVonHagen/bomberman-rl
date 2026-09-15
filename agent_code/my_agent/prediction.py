@@ -3,7 +3,23 @@ from typing import List, Tuple
 
 from settings import BOMB_TIMER, BOMB_POWER, EXPLOSION_TIMER
 
-def predict_danger_over_time(
+_DANGER_CACHE: dict = {}
+_DANGER_CACHE_LIMIT = 256
+
+
+def predict_danger_over_time(field, bombs, explosion_map, max_horizon):
+    key = (field.tobytes(), bombs.tobytes(), np.asarray(explosion_map).tobytes(), int(max_horizon))
+    cached = _DANGER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = _predict_danger_over_time_uncached(field, bombs, explosion_map, max_horizon)
+    if len(_DANGER_CACHE) >= _DANGER_CACHE_LIMIT:
+        _DANGER_CACHE.clear()
+    _DANGER_CACHE[key] = result
+    return result
+
+
+def _predict_danger_over_time_uncached(
         field: np.typing.NDArray[np.int_],
         bombs: np.typing.NDArray[np.int_],
         explosion_map: np.typing.NDArray[np.int_],

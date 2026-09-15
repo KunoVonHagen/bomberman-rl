@@ -606,6 +606,7 @@ class BombermanGymEnv(gym.Env):
         self._episode_over = np.zeros(E, dtype=bool)
 
         self.agent_actions: List[Dict[Any, str]] = [{} for _ in range(E)]
+        self._pending_opponent_actions: List[Dict[Any, str]] = [{} for _ in range(E)]
         self._replays: List[Optional[Dict[str, Any]]] = [None] * E
 
         T_bfs = self._BT + self._ET
@@ -1289,6 +1290,7 @@ class BombermanGymEnv(gym.Env):
         if np.any(actions < 0) or np.any(actions >= len(ACTIONS)):
             raise ValueError("action index out of range")
 
+        self._precompute_batched_opponent_actions()
         for env in range(self.n_envs):
             self._advance(env, int(actions[env]))
 
@@ -1350,14 +1352,20 @@ class BombermanGymEnv(gym.Env):
         """Game logic for one env (the Python-heavy, but cheap, part)."""
         self.step_counts[env] += 1
 
-        shared = self._build_shared_state(env)
+        shared = None
+        pending = self._pending_opponent_actions[env]
         actions = {}
         for handle, act_fn in zip(self.opponent_handles[env], self.opponent_act_fns[env]):
             handle.reset_game_events()
             if handle.dead:
                 continue
-            state = self._agent_state_dict(env, handle, shared)
-            actions[handle] = act_fn(handle, state)
+            action_name = pending.pop(handle, None)
+            if action_name is None:
+                if shared is None:
+                    shared = self._build_shared_state(env)
+                action_name = act_fn(handle, self._agent_state_dict(env, handle, shared))
+            actions[handle] = action_name
+        pending.clear()
 
         agent = self.agents[env]
         agent.reset_game_events()
@@ -1569,6 +1577,40 @@ class BombermanGymEnv(gym.Env):
             }
             for t, coords in cells_by_timer.items()
         ]
+
+    def _precompute_batched_opponent_actions(self) -> None:
+        groups: Dict[Any, Tuple[Callable, list]] = {}
+        for env in range(self.n_envs):
+            shared = None
+            for handle, act_fn in zip(self.opponent_handles[env], self.opponent_act_fns[env]):
+                owner = getattr(act_fn, "__self__", None)
+                batch_act = getattr(owner, "batch_act", None)
+                if batch_act is None or handle.dead:
+                    continue
+                if shared is None:
+                    shared = self._build_shared_state(env)
+                key = getattr(owner, "batch_key", id(owner))
+                groups.setdefault(key, (batch_act, []))[1].append(
+                    (env, handle, self._agent_state_dict(env, handle, shared)))
+        for batch_act, items in groups.values():
+            names = batch_act([handle for _, handle, _ in items], [state for _, _, state in items])
+            for (env, handle, _), name in zip(items, names):
+                self._pending_opponent_actions[env][handle] = name
+
+    def observations_from_game_states(self, game_states: list) -> Tuple[dict, np.ndarray]:
+        k = len(game_states)
+        if k > self.n_envs:
+            raise ValueError(f"{k} game states do not fit into {self.n_envs} env slots")
+        for env, game_state in enumerate(game_states):
+            self._load_game_state(game_state, env)
+            self._rebuild_static_layers(env)
+        self._refresh_dynamic_layers()
+        if self._enable_crate_potential:
+            self._init_crate_potential(list(range(k)))
+        self._refresh_forecast_layers()
+        obs = self._build_observation()
+        masks = self.action_masks()
+        return {"grid_tensor": obs["grid_tensor"][:k], "features": obs["features"][:k]}, masks[:k]
 
     def observation_from_game_state(self, game_state: dict, env: int = 0) -> dict:
         """Single-env utility: returns the un-batched observation for `env`."""

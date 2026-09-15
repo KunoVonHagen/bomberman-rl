@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import multiprocessing as mp
+import os
 import pathlib
 import time
 from collections import deque
@@ -102,6 +103,12 @@ class NativeBatchedVecEnv:
         self._last_action_masks = masks
         return obs, rewards, dones, infos
 
+    def step_async(self, actions: np.ndarray) -> None:
+        self._pending_actions = np.asarray(actions)
+
+    def step_wait(self):
+        return self.step(self._pending_actions)
+
     def close(self) -> None:
         return self.env.close()
 
@@ -152,10 +159,14 @@ def _concat_obs(obs_list: list) -> dict:
     return {k: np.concatenate([o[k] for o in obs_list], axis=0) for k in keys}
 
 
+_WORKER_THREAD_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMBA_NUM_THREADS")
+
+
 def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, layer_config,
                    shard_n_envs: int, reward_config: Optional[RewardConfig] = None, env_version: int = 1):
     """Run a single shard's BombermanGymEnv, serving commands from the parent process."""
     parent_remote.close()
+    torch.set_num_threads(1)
 
     world_args = WorldArgs(**world_args_kwargs)
     env = BombermanGymEnv(
@@ -210,6 +221,8 @@ class ShardedNativeBatchedVecEnv:
         self._cfg = cfg
 
         ctx = mp.get_context("spawn")
+        saved_thread_vars = {name: os.environ.get(name) for name in _WORKER_THREAD_VARS}
+        os.environ.update({name: "1" for name in _WORKER_THREAD_VARS})
         self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(n_shards)])
         self.processes = []
         for i, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
@@ -239,6 +252,11 @@ class ShardedNativeBatchedVecEnv:
             p.start()
             self.processes.append(p)
             work_remote.close()
+        for name, value in saved_thread_vars.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
         self.remotes[0].send(("get_spaces", None))
         self.single_observation_space, self.single_action_space = self.remotes[0].recv()
@@ -254,10 +272,16 @@ class ShardedNativeBatchedVecEnv:
         self._last_action_masks = np.concatenate(mask_list, axis=0)
         return _concat_obs(list(obs_list))
 
-    def step(self, actions: np.ndarray):
+    def step_async(self, actions: np.ndarray) -> None:
         shards = np.split(np.asarray(actions), self.n_shards)
         for remote, shard_actions in zip(self.remotes, shards):
             remote.send(("step", shard_actions))
+
+    def step(self, actions: np.ndarray):
+        self.step_async(actions)
+        return self.step_wait()
+
+    def step_wait(self):
         results = [remote.recv() for remote in self.remotes]
         obs_list, rew_list, term_list, trunc_list, info_lists, mask_list = zip(*results)
 
@@ -349,7 +373,14 @@ class NativeMonitor:
         return self.venv.reset(seed=seed, options=options)
 
     def step(self, actions):
-        obs, rewards, dones, infos = self.venv.step(actions)
+        self.step_async(actions)
+        return self.step_wait()
+
+    def step_async(self, actions):
+        self.venv.step_async(actions)
+
+    def step_wait(self):
+        obs, rewards, dones, infos = self.venv.step_wait()
         self._ep_rewards += rewards
         self._ep_lengths += 1
         for i, done in enumerate(dones):
