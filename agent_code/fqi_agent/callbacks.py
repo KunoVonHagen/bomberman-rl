@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 import time
@@ -15,22 +16,27 @@ from .model import MODEL_FILE, load_model, masked_greedy
 RUN: str = "fqi_forest"
 
 AGENT_DIR = pathlib.Path(__file__).resolve().parent
+ENV_PREFIX = "FQI_AGENT"
 MANIFEST_FILE = "run_manifest.json"
 _ACTION_NAMES = {v: k for k, v in ACTION_INDICES.items() if k is not None}
 
 
-def _resolve_run_dir() -> pathlib.Path:
+def _setting(name: str, default):
+    return os.environ.get(f"{ENV_PREFIX}_{name}", default)
+
+
+def _resolve_run_dir(run: str) -> pathlib.Path:
     candidates = [
-        AGENT_DIR / "runs" / RUN,
-        AGENT_DIR / RUN,
-        pathlib.Path(RUN),
-        AGENT_DIR.parent.parent / "runs" / RUN,
+        AGENT_DIR / "runs" / run,
+        AGENT_DIR / run,
+        pathlib.Path(run),
+        AGENT_DIR.parent.parent / "runs" / run,
     ]
     for run_dir in candidates:
         if (run_dir / MANIFEST_FILE).exists() and (run_dir / MODEL_FILE).exists():
             return run_dir
     raise FileNotFoundError(
-        f"fqi_agent: no run '{RUN}' with {MANIFEST_FILE} and {MODEL_FILE} in any of "
+        f"fqi_agent: no run '{run}' with {MANIFEST_FILE} and {MODEL_FILE} in any of "
         f"{[str(c) for c in candidates]} -- set RUN at the top of callbacks.py"
     )
 
@@ -105,7 +111,7 @@ def setup(self):
     self._fqi_obs_env = None
 
     try:
-        run_dir = _resolve_run_dir()
+        run_dir = _resolve_run_dir(_setting("RUN", RUN))
         manifest = json.loads((run_dir / MANIFEST_FILE).read_text())
         model = load_model(run_dir / MODEL_FILE)
         obs_env = _get_obs_env(manifest)

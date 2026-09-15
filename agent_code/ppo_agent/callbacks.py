@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 import time
@@ -21,31 +22,40 @@ CHECKPOINT: Optional[str] = "checkpoint_0143654912"
 DETERMINISTIC: bool = True
 
 AGENT_DIR = pathlib.Path(__file__).resolve().parent
+ENV_PREFIX = "PPO_AGENT"
 _ACTION_NAMES = {v: k for k, v in ACTION_INDICES.items() if k is not None}
 
 
-def _resolve_run_dir() -> pathlib.Path:
+def _setting(name: str, default):
+    return os.environ.get(f"{ENV_PREFIX}_{name}", default)
+
+
+def _resolve_run_dir(run: str) -> pathlib.Path:
     candidates = [
-        AGENT_DIR / "runs" / RUN,
-        AGENT_DIR / RUN,
-        pathlib.Path(RUN),
-        AGENT_DIR.parent.parent / "runs" / RUN,
+        AGENT_DIR / "runs" / run,
+        AGENT_DIR / run,
+        pathlib.Path(run),
+        AGENT_DIR.parent.parent / "runs" / run,
     ]
     for run_dir in candidates:
         if (run_dir / "run_manifest.json").exists():
             return run_dir
     raise FileNotFoundError(
-        f"ppo_agent: no run '{RUN}' with a run_manifest.json in any of "
+        f"ppo_agent: no run '{run}' with a run_manifest.json in any of "
         f"{[str(c) for c in candidates]} -- set RUN at the top of callbacks.py"
     )
 
 
 def _resolve_checkpoint_dir(run_dir: pathlib.Path, checkpoint: Optional[str]) -> pathlib.Path:
     checkpoints = run_dir / "checkpoints"
-    if checkpoint:
+    if checkpoint and checkpoint not in ("latest", "best"):
         checkpoint_dir = checkpoints / checkpoint
     else:
-        pointer = checkpoints / "latest.txt"
+        pointer = checkpoints / f"{checkpoint or 'latest'}.txt"
+        if not pointer.exists() and checkpoint == "best":
+            print(f"{ENV_PREFIX.lower()}: {pointer} not found (run evaluation.select_checkpoint --write-best), "
+                  "falling back to the latest checkpoint", file=sys.stderr)
+            pointer = checkpoints / "latest.txt"
         if pointer.exists():
             checkpoint_dir = checkpoints / pointer.read_text().strip()
         else:
@@ -161,9 +171,9 @@ def setup(self):
     self._ppo_obs_env = None
 
     try:
-        run_dir = _resolve_run_dir()
+        run_dir = _resolve_run_dir(_setting("RUN", RUN))
         cfg = _load_config(run_dir)
-        checkpoint_dir = _resolve_checkpoint_dir(run_dir, CHECKPOINT)
+        checkpoint_dir = _resolve_checkpoint_dir(run_dir, _setting("CHECKPOINT", CHECKPOINT))
         model = _load_model(checkpoint_dir).policy
         model.requires_grad_(False)
         self._ppo_obs_env = _get_dummy_env(cfg)
