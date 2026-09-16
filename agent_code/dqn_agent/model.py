@@ -235,6 +235,7 @@ class MaskableDQN:
         self.q_net = QNetwork(observation_space, self.n_actions, features_dim, self.dropout).to(self.device)
         self.q_net_target = QNetwork(observation_space, self.n_actions, features_dim, self.dropout).to(self.device)
         self.q_net_target.load_state_dict(self.q_net.state_dict())
+        self.q_net.eval()
         self.q_net_target.eval()
 
         self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
@@ -275,14 +276,15 @@ class MaskableDQN:
 
     def q_values(self, observation: dict, mc_dropout_samples: int = 0) -> np.ndarray:
         samples = int(mc_dropout_samples) if self.dropout > 0 else 0
-        self.q_net.train(samples > 0)
+        if self.q_net.training != (samples > 0):
+            self.q_net.train(samples > 0)
         with torch.no_grad():
             obs_t = _obs_to_tensors(observation, self.device)
             if samples > 0:
                 q = torch.stack([self.q_net(obs_t) for _ in range(samples)]).mean(dim=0)
+                self.q_net.eval()
             else:
                 q = self.q_net(obs_t)
-        self.q_net.eval()
         return q.cpu().numpy()
 
     def _predict_masked(self, observation: dict, action_masks: np.ndarray) -> np.ndarray:
@@ -416,7 +418,8 @@ class MaskableDQN:
         if prof: prof.stop("target_forward", device=dev)
 
         if prof: prof.start("online_forward_backward")
-        self.q_net.train()
+        if self.dropout > 0:
+            self.q_net.train()
         with torch.autocast(device_type=self.device.type, enabled=self._amp_enabled):
             q_values_all = self.q_net(obs)
             q_values = q_values_all.gather(1, actions.unsqueeze(1)).squeeze(1)
@@ -429,6 +432,8 @@ class MaskableDQN:
         grad_norm = nn.utils.clip_grad_norm_(self.q_net.parameters(), clip_at)
         self.scaler.step(self.optimizer)
         self.scaler.update()
+        if self.dropout > 0:
+            self.q_net.eval()
         if prof: prof.stop("online_forward_backward", device=dev)
 
         with torch.no_grad():

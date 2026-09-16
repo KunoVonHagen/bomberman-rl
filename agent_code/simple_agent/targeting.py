@@ -76,6 +76,9 @@ def best_bomb_spot(field, bombs, explosion_map, avoid, pos, power, timer, horizo
         if crates == 0:
             continue
 
+        if TERRITORY_SCORE == 0 and best is not None and CRATE_SCORE * crates - DISTANCE_PENALTY * dist <= best[1]:
+            continue
+
         if cand_pos not in escape_cache:
             escape_cache[cand_pos] = can_escape_own_bomb(
                 field, bombs, explosion_map, cand_pos, power, timer, horizon, opponent_positions,
@@ -83,7 +86,7 @@ def best_bomb_spot(field, bombs, explosion_map, avoid, pos, power, timer, horizo
         if not escape_cache[cand_pos]:
             continue
 
-        territory = territory_gained(field, cand_pos, power)
+        territory = territory_gained(field, cand_pos, power) if TERRITORY_SCORE != 0 else 0
         score = CRATE_SCORE * crates + TERRITORY_SCORE * territory - DISTANCE_PENALTY * dist
 
         opp_dist = fastest_opponent_to(opp_dist_maps, cand_pos)

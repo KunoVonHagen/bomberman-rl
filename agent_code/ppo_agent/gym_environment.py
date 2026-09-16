@@ -532,6 +532,8 @@ class BombermanGymEnv(gym.Env):
         self.n_real_opponents: List[int] = [len(opponents) for _ in range(self.n_envs)]
         self.env_scenarios: List[str] = [args.scenario for _ in range(self.n_envs)]
         self._opponent_resampler = None
+        self._observers: Dict[int, "BombermanGymEnv"] = {}
+        self._observer_book: Dict[Tuple[int, int], Tuple[int, int, int]] = {}
 
         for handles in self.opponent_handles:
             for handle, (setup_fn, _act_fn) in zip(handles, opponents):
@@ -1578,24 +1580,70 @@ class BombermanGymEnv(gym.Env):
             for t, coords in cells_by_timer.items()
         ]
 
+    def _opponent_observer(self, k: int) -> "BombermanGymEnv":
+        capacity = min(c for c in (1, 2, 4, 8, 16, 32, 64, 128, self.n_envs * MAX_OPPONENTS) if c >= k)
+        observer = self._observers.get(capacity)
+        if observer is None:
+            try:
+                args = self.args._replace(save_replay=False)
+            except AttributeError:
+                args = self.args
+            observer = BombermanGymEnv(
+                args,
+                opponents=[((lambda handle: None), (lambda handle, state: "WAIT"))] * MAX_OPPONENTS,
+                layer_config=self.enabled_groups,
+                env_version=self.env_version,
+                n_envs=capacity,
+            )
+            observer.reset()
+            self._observers[capacity] = observer
+        return observer
+
     def _precompute_batched_opponent_actions(self) -> None:
-        groups: Dict[Any, Tuple[Callable, list]] = {}
+        items = []
         for env in range(self.n_envs):
             shared = None
-            for handle, act_fn in zip(self.opponent_handles[env], self.opponent_act_fns[env]):
+            for i, (handle, act_fn) in enumerate(zip(self.opponent_handles[env], self.opponent_act_fns[env])):
                 owner = getattr(act_fn, "__self__", None)
-                batch_act = getattr(owner, "batch_act", None)
-                if batch_act is None or handle.dead:
+                if handle.dead or getattr(owner, "predict_batch", None) is None:
                     continue
                 if shared is None:
                     shared = self._build_shared_state(env)
-                key = getattr(owner, "batch_key", id(owner))
-                groups.setdefault(key, (batch_act, []))[1].append(
-                    (env, handle, self._agent_state_dict(env, handle, shared)))
-        for batch_act, items in groups.values():
-            names = batch_act([handle for _, handle, _ in items], [state for _, _, state in items])
-            for (env, handle, _), name in zip(items, names):
-                self._pending_opponent_actions[env][handle] = name
+                items.append((env, handle, (env, i), owner, self._agent_state_dict(env, handle, shared)))
+        if not items:
+            return
+        obs, masks = self._opponent_observer(len(items)).observations_for_games(
+            [item[4] for item in items], [item[2] for item in items], self._observer_book)
+        groups: Dict[Any, Tuple[Any, list]] = {}
+        for j, (_env, _handle, _slot, owner, _state) in enumerate(items):
+            groups.setdefault(getattr(owner, "batch_key", id(owner)), (owner, []))[1].append(j)
+        for owner, members in groups.values():
+            idx = np.asarray(members, dtype=np.int64)
+            names = owner.predict_batch(
+                {"grid_tensor": obs["grid_tensor"][idx], "features": obs["features"][idx]}, masks[idx])
+            for j, name in zip(members, names):
+                self._pending_opponent_actions[items[j][0]][items[j][1]] = name
+
+    def observations_for_games(self, game_states: list, keys: list, book: dict) -> Tuple[dict, np.ndarray]:
+        k = len(game_states)
+        if k > self.n_envs:
+            raise ValueError(f"{k} game states do not fit into {self.n_envs} env slots")
+        for slot, (game_state, key) in enumerate(zip(game_states, keys)):
+            entry = book.get(key)
+            if entry is None:
+                self.rounds[slot] = -1
+            else:
+                self.rounds[slot], self._initial_crate_count[slot], self._initial_coin_count[slot] = entry
+            self._load_game_state(game_state, slot)
+            book[key] = (int(self.rounds[slot]), int(self._initial_crate_count[slot]), int(self._initial_coin_count[slot]))
+            self._rebuild_static_layers(slot)
+        self._refresh_dynamic_layers()
+        if self._enable_crate_potential:
+            self._init_crate_potential(list(range(k)))
+        self._refresh_forecast_layers()
+        obs = self._build_observation()
+        masks = self.action_masks()
+        return {"grid_tensor": obs["grid_tensor"][:k], "features": obs["features"][:k]}, masks[:k]
 
     def observations_from_game_states(self, game_states: list) -> Tuple[dict, np.ndarray]:
         k = len(game_states)

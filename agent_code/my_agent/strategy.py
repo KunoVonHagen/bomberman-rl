@@ -219,14 +219,23 @@ def find_trap_targets(game_state: dict, max_escape_routes: int = 1) -> List[Dict
     return targets
 
 
+_CRATE_TARGET_CACHE: dict = {}
+_CRATE_TARGET_CACHE_LIMIT = 256
+
+
 def get_best_crate_targets(
         crates: List[Tuple[int, int]],
         field: np.typing.NDArray,
         top_fraction: float = 0.3,
-) -> List[Tuple[int, int]]:
+) -> Tuple[Tuple[int, int], ...]:
 
     if not crates:
-        return []
+        return ()
+
+    key = (field.tobytes(), top_fraction)
+    cached = _CRATE_TARGET_CACHE.get(key)
+    if cached is not None:
+        return cached
 
     crate_set = set(crates)
     scored = []
@@ -237,4 +246,8 @@ def get_best_crate_targets(
 
     scored.sort(key=lambda t: t[1], reverse=True)
     cutoff = max(1, int(len(scored) * top_fraction))
-    return [pos for pos, _ in scored[:cutoff]]
+    result = tuple(pos for pos, _ in scored[:cutoff])
+    if len(_CRATE_TARGET_CACHE) >= _CRATE_TARGET_CACHE_LIMIT:
+        _CRATE_TARGET_CACHE.clear()
+    _CRATE_TARGET_CACHE[key] = result
+    return result

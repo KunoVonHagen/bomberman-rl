@@ -1,3 +1,4 @@
+from collections import deque
 from random import shuffle
 
 import numpy as np
@@ -21,14 +22,15 @@ def look_for_targets(free_space, start, targets, logger=None):
     if len(targets) == 0:
         return None
 
-    frontier = [start]
+    targets = np.asarray(targets)
+    frontier = deque([start])
     parent_dict = {start: start}
     dist_so_far = {start: 0}
     best = start
     best_dist = np.sum(np.abs(np.subtract(targets, start)), axis=1).min()
 
     while len(frontier) > 0:
-        current = frontier.pop(0)
+        current = frontier.popleft()
         # Find distance from current position to all targets, track closest
         d = np.sum(np.abs(np.subtract(targets, current)), axis=1).min()
         if d + dist_so_far[current] <= best_dist:
@@ -116,11 +118,12 @@ def act(self, game_state):
     shuffle(action_ideas)
 
     # Compile a list of 'targets' the agent should head towards
-    cols = range(1, arena.shape[0] - 1)
-    rows = range(1, arena.shape[0] - 1)
-    dead_ends = [(x, y) for x in cols for y in rows if (arena[x, y] == 0)
-                 and ([arena[x + 1, y], arena[x - 1, y], arena[x, y + 1], arena[x, y - 1]].count(0) == 1)]
-    crates = [(x, y) for x in cols for y in rows if (arena[x, y] == 1)]
+    n = arena.shape[0] - 1
+    free = arena == 0
+    open_neighbours = (free[2:n + 1, 1:n].astype(np.int8) + free[0:n - 1, 1:n]
+                       + free[1:n, 2:n + 1] + free[1:n, 0:n - 1])
+    dead_ends = [tuple(p) for p in (np.argwhere(free[1:n, 1:n] & (open_neighbours == 1)) + 1).tolist()]
+    crates = [tuple(p) for p in (np.argwhere(arena[1:n, 1:n] == 1) + 1).tolist()]
     targets = coins + dead_ends + crates
 
     # Exclude targets that are currently occupied by a bomb

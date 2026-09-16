@@ -4,7 +4,7 @@ import importlib
 import pathlib
 import random
 import tempfile
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -18,7 +18,7 @@ from .model import MaskableDQN
 OpponentPair = Tuple[Callable, Callable]
 
 _MODEL_CACHE: Dict[str, "MaskableDQN"] = {}
-_OBS_ENV_CACHE: Dict[Tuple[str, int], "BombermanGymEnv"] = {}
+_OBS_ENV_CACHE: Dict[Tuple[Any, int, int], "BombermanGymEnv"] = {}
 
 _BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
 
@@ -59,7 +59,8 @@ class _CheckpointOpponent:
             self._action_names = {v: k for k, v in ACTION_INDICES.items() if k is not None}
 
     def _obs_env_with(self, capacity: int) -> BombermanGymEnv:
-        key = (self.model_path, capacity)
+        layers = self.env_cfg.layer_config
+        key = (None if layers is None else tuple(layers), int(self.env_cfg.env_version), capacity)
         env = _OBS_ENV_CACHE.get(key)
         if env is None:
             log_dir = tempfile.mkdtemp(prefix="checkpoint_opponent_")
@@ -102,16 +103,19 @@ class _CheckpointOpponent:
         """Pick the next action for the checkpointed model."""
         return self.batch_act([agent], [game_state])[0]
 
-    def batch_act(self, agents, game_states) -> List[str]:
+    def predict_batch(self, obs: dict, masks: np.ndarray) -> List[str]:
         self._ensure_model()
+        indices, _ = self._model.predict(obs, deterministic=False, action_masks=masks)
+        return [self._action_names[int(i)] for i in np.atleast_1d(indices)]
+
+    def batch_act(self, agents, game_states) -> List[str]:
         names: List[str] = []
         limit = _BATCH_CAPACITIES[-1]
         for start in range(0, len(game_states), limit):
             chunk = game_states[start:start + limit]
             env = self._obs_env_with(_batch_capacity(len(chunk)))
             obs, masks = env.observations_from_game_states(chunk)
-            indices, _ = self._model.predict(obs, deterministic=False, action_masks=masks)
-            names.extend(self._action_names[int(i)] for i in np.atleast_1d(indices))
+            names.extend(self.predict_batch(obs, masks))
         return names
 
     def as_pair(self) -> OpponentPair:
