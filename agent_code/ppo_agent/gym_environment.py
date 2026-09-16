@@ -1621,6 +1621,13 @@ class BombermanGymEnv(gym.Env):
             return
         obs, masks = self._opponent_observer(len(items)).observations_for_games(
             [item[4] for item in items], [item[2] for item in items], self._observer_book)
+        owner_type = type(items[0][3])
+        predict_grouped = getattr(owner_type, "predict_grouped", None)
+        if predict_grouped is not None and all(type(item[3]) is owner_type for item in items):
+            names = predict_grouped([item[3] for item in items], obs, masks)
+            for item, name in zip(items, names):
+                self._pending_opponent_actions[item[0]][item[1]] = name
+            return
         groups: Dict[Any, Tuple[Any, list]] = {}
         for j, (_env, _handle, _slot, owner, _state) in enumerate(items):
             groups.setdefault(getattr(owner, "batch_key", id(owner)), (owner, []))[1].append(j)

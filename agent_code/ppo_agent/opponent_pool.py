@@ -13,6 +13,8 @@ from sb3_contrib.common.maskable.buffers import MaskableDictRolloutBuffer
 
 from .config import EnvConfig, SelfPlayConfig, OpponentArrangement, ScenarioArrangement
 from .checkpoint_manager import CheckpointManager
+from .grouped_forward import (EXTRACTOR_KEYS, EXTRACTOR_PREFIX, grouped_extractor_forward, grouped_linear,
+                              model_indices, observation_tensors, stack_state_dicts)
 from .gym_environment import BombermanGymEnv, ACTION_INDICES
 from environment import WorldArgs
 
@@ -22,6 +24,41 @@ _MODEL_CACHE: Dict[str, "MaskablePPO"] = {}
 _OBS_ENV_CACHE: Dict[Tuple[Any, int, int], "BombermanGymEnv"] = {}
 
 _BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
+
+POLICY_KEYS = [
+    "mlp_extractor.policy_net.0.weight", "mlp_extractor.policy_net.0.bias",
+    "mlp_extractor.policy_net.2.weight", "mlp_extractor.policy_net.2.bias",
+    "action_net.weight", "action_net.bias",
+]
+GROUPED_KEYS = [EXTRACTOR_PREFIX + key for key in EXTRACTOR_KEYS] + POLICY_KEYS
+_GROUPED_STACK: Optional[tuple] = None
+GROUPED_MIN_MODELS = 4
+
+
+def _grouped_state_dict(model: "MaskablePPO") -> dict:
+    return model.policy.state_dict()
+
+
+def _grouped_stack():
+    global _GROUPED_STACK
+    paths = tuple(sorted(_MODEL_CACHE))
+    if _GROUPED_STACK is None or _GROUPED_STACK[0] != paths:
+        stacked = stack_state_dicts([_grouped_state_dict(_MODEL_CACHE[p]) for p in paths], GROUPED_KEYS)
+        _GROUPED_STACK = (paths, {p: i for i, p in enumerate(paths)}, stacked)
+    return _GROUPED_STACK[1], _GROUPED_STACK[2]
+
+
+def _predict_per_model(owners, obs: dict, masks: np.ndarray) -> List[str]:
+    names: List[Optional[str]] = [None] * len(owners)
+    groups: Dict[str, Tuple[Any, list]] = {}
+    for j, owner in enumerate(owners):
+        groups.setdefault(owner.model_path, (owner, []))[1].append(j)
+    for owner, members in groups.values():
+        idx = np.asarray(members, dtype=np.int64)
+        batch = {"grid_tensor": obs["grid_tensor"][idx], "features": obs["features"][idx]}
+        for j, name in zip(members, owner.predict_batch(batch, masks[idx])):
+            names[j] = name
+    return names
 
 
 def _batch_capacity(k: int) -> int:
@@ -117,6 +154,34 @@ class _CheckpointOpponent:
         with torch.no_grad():
             indices = policy._predict(obs_t, deterministic=False, action_masks=masks)
         return [self._action_names[int(i)] for i in indices.cpu().numpy().reshape(-1)]
+
+    @staticmethod
+    def predict_grouped(owners, obs: dict, masks: np.ndarray) -> List[str]:
+        paths = [owner.model_path for owner in owners]
+        n_models = len(set(paths))
+        if n_models == 1:
+            return owners[0].predict_batch(obs, masks)
+        if n_models < GROUPED_MIN_MODELS:
+            return _predict_per_model(owners, obs, masks)
+        for owner in owners:
+            owner._ensure_model()
+        index, stacked = _grouped_stack()
+        if stacked is None:
+            return _predict_per_model(owners, obs, masks)
+        grid, features = observation_tensors(obs)
+        idx = model_indices(paths, index)
+        with torch.no_grad():
+            latent = grouped_extractor_forward(stacked, idx, grid, features)
+            hidden = torch.tanh(grouped_linear(
+                latent, stacked["mlp_extractor.policy_net.0.weight"], stacked["mlp_extractor.policy_net.0.bias"], idx))
+            hidden = torch.tanh(grouped_linear(
+                hidden, stacked["mlp_extractor.policy_net.2.weight"], stacked["mlp_extractor.policy_net.2.bias"], idx))
+            logits = grouped_linear(hidden, stacked["action_net.weight"], stacked["action_net.bias"], idx)
+            mask_t = torch.as_tensor(np.asarray(masks, dtype=bool)).reshape(logits.shape)
+            logits = torch.where(mask_t, logits, torch.tensor(-1e8, dtype=logits.dtype))
+            actions = torch.distributions.Categorical(logits=logits).sample()
+        names = owners[0]._action_names
+        return [names[int(a)] for a in actions.numpy()]
 
     def batch_act(self, agents, game_states) -> List[str]:
         names: List[str] = []

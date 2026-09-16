@@ -7,12 +7,15 @@ import tempfile
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 
 from environment import WorldArgs
 
 from .config import EnvConfig, SelfPlayConfig, OpponentArrangement, ScenarioArrangement
 from .checkpoint_manager import CheckpointManager
 from .gym_environment import BombermanGymEnv, ACTION_INDICES
+from .grouped_forward import (EXTRACTOR_KEYS, EXTRACTOR_PREFIX, grouped_extractor_forward, grouped_linear,
+                              model_indices, observation_tensors, stack_state_dicts)
 from .model import MaskableDQN
 
 OpponentPair = Tuple[Callable, Callable]
@@ -21,6 +24,36 @@ _MODEL_CACHE: Dict[str, "MaskableDQN"] = {}
 _OBS_ENV_CACHE: Dict[Tuple[Any, int, int], "BombermanGymEnv"] = {}
 
 _BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
+
+GROUPED_KEYS = [EXTRACTOR_PREFIX + key for key in EXTRACTOR_KEYS] + ["q_head.weight", "q_head.bias"]
+_GROUPED_STACK: Optional[tuple] = None
+GROUPED_MIN_MODELS = 5
+
+
+def _grouped_state_dict(model: "MaskableDQN") -> dict:
+    return model.q_net.state_dict()
+
+
+def _grouped_stack():
+    global _GROUPED_STACK
+    paths = tuple(sorted(_MODEL_CACHE))
+    if _GROUPED_STACK is None or _GROUPED_STACK[0] != paths:
+        stacked = stack_state_dicts([_grouped_state_dict(_MODEL_CACHE[p]) for p in paths], GROUPED_KEYS)
+        _GROUPED_STACK = (paths, {p: i for i, p in enumerate(paths)}, stacked)
+    return _GROUPED_STACK[1], _GROUPED_STACK[2]
+
+
+def _predict_per_model(owners, obs: dict, masks: np.ndarray) -> List[str]:
+    names: List[Optional[str]] = [None] * len(owners)
+    groups: Dict[str, Tuple[Any, list]] = {}
+    for j, owner in enumerate(owners):
+        groups.setdefault(owner.model_path, (owner, []))[1].append(j)
+    for owner, members in groups.values():
+        idx = np.asarray(members, dtype=np.int64)
+        batch = {"grid_tensor": obs["grid_tensor"][idx], "features": obs["features"][idx]}
+        for j, name in zip(members, owner.predict_batch(batch, masks[idx])):
+            names[j] = name
+    return names
 
 
 def _batch_capacity(k: int) -> int:
@@ -107,6 +140,33 @@ class _CheckpointOpponent:
         self._ensure_model()
         indices, _ = self._model.predict(obs, deterministic=False, action_masks=masks)
         return [self._action_names[int(i)] for i in np.atleast_1d(indices)]
+
+    @staticmethod
+    def predict_grouped(owners, obs: dict, masks: np.ndarray) -> List[str]:
+        paths = [owner.model_path for owner in owners]
+        n_models = len(set(paths))
+        if n_models == 1:
+            return owners[0].predict_batch(obs, masks)
+        if n_models < GROUPED_MIN_MODELS:
+            return _predict_per_model(owners, obs, masks)
+        for owner in owners:
+            owner._ensure_model()
+        index, stacked = _grouped_stack()
+        if stacked is None:
+            return _predict_per_model(owners, obs, masks)
+        grid, features = observation_tensors(obs)
+        idx = model_indices(paths, index)
+        with torch.no_grad():
+            latent = grouped_extractor_forward(stacked, idx, grid, features)
+            q = grouped_linear(latent, stacked["q_head.weight"], stacked["q_head.bias"], idx).numpy()
+        masks = np.asarray(masks, dtype=bool)
+        actions = np.where(masks, q, -np.inf).argmax(axis=1)
+        eps = np.fromiter((owner._model.exploration_rate for owner in owners), dtype=np.float64, count=len(owners))
+        explore = np.random.rand(len(owners)) < eps
+        if explore.any():
+            actions[explore] = owners[0]._model._sample_masked_actions(masks[explore])
+        names = owners[0]._action_names
+        return [names[int(a)] for a in actions]
 
     def batch_act(self, agents, game_states) -> List[str]:
         names: List[str] = []
