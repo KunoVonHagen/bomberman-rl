@@ -17,6 +17,7 @@ from .rewards import (
     ESCAPE_BONUS_COEF,
     DANGER_PENALTY_COEF,
     TRAP_SHAPING_COEF,
+    RIVAL_KILLED_OPPONENT,
     build_event_rewards,
 )
 from .config import RewardConfig
@@ -2052,6 +2053,7 @@ class BombermanGymEnv(gym.Env):
         kill_reward = getattr(s, "REWARD_KILL", 0)
         if self._fixes:
             hit = []
+            learner = self.agents[env]
             for ex in explosions:
                 if ex["stage"] != 0:
                     continue
@@ -2067,6 +2069,8 @@ class BombermanGymEnv(gym.Env):
                             owner.add_event(e.KILLED_OPPONENT)
                             if kill_reward:
                                 owner.update_score(kill_reward)
+                            if owner is not learner and a is not learner:
+                                learner.add_event(RIVAL_KILLED_OPPONENT)
             for a in hit:
                 a.dead = True
                 a.add_event(e.GOT_KILLED)
@@ -2076,6 +2080,7 @@ class BombermanGymEnv(gym.Env):
                     for _ in hit:
                         a.add_event(e.OPPONENT_ELIMINATED)
             return
+        learner = self.agents[env]
         for ex in explosions:
             if ex["stage"] != 0:
                 continue
@@ -2095,6 +2100,8 @@ class BombermanGymEnv(gym.Env):
                         owner.add_event(e.KILLED_OPPONENT)
                         if kill_reward:
                             owner.update_score(kill_reward)
+                        if owner is not learner and a is not learner:
+                            learner.add_event(RIVAL_KILLED_OPPONENT)
         self.active_agents[env] = [a for a in active if not a.dead]
 
     def shaped_reward(self, env: int) -> float:
