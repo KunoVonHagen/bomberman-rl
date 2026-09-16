@@ -16,7 +16,7 @@ from sb3_contrib.common.maskable.buffers import MaskableDictRolloutBuffer
 import settings as s
 from .config import TrainingConfig
 from .gym_environment import ACTION_INDICES, BombermanGymEnv, WorldArgs
-from .model import BombermanFeatureExtractor
+from .model import BombermanFeatureExtractor, InferenceOptimizer
 
 RUN: str = "run_20260831-190704"
 CHECKPOINT: Optional[str] = "checkpoint_0143654912"
@@ -101,6 +101,7 @@ def _load_model(checkpoint_dir: pathlib.Path, cfg: TrainingConfig) -> MaskablePP
             "policy_kwargs": dict(
                 features_extractor_class=BombermanFeatureExtractor,
                 features_extractor_kwargs=dict(dropout=cfg.ppo.dropout),
+                optimizer_class=InferenceOptimizer,
             ),
         },
     )

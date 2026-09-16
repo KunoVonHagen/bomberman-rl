@@ -85,7 +85,7 @@ class _CheckpointOpponent:
         if self._model is None:
             self._model = _MODEL_CACHE.get(self.model_path)
             if self._model is None:
-                self._model = MaskableDQN.load(self.model_path, device="cpu")
+                self._model = MaskableDQN.load(self.model_path, device="cpu", inference=True)
                 self._model.exploration_rate = self._model.exploration_final_eps
                 _MODEL_CACHE[self.model_path] = self._model
         if self._action_names is None:
@@ -367,3 +367,10 @@ class OpponentSampler:
         descriptions = self.pool.last_opponent_descriptions()
         scenario = self.pool.current_scenario()
         return opponents, scenario, descriptions
+
+    def preload(self) -> None:
+        for checkpoint in list(self.pool._checkpoints):
+            _setup_fn, act_fn = self.pool._checkpoint_opponent(checkpoint)
+            owner = getattr(act_fn, "__self__", None)
+            if owner is not None and hasattr(owner, "_ensure_model"):
+                owner._ensure_model()

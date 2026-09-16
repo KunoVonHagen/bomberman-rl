@@ -196,6 +196,7 @@ class TrainingConfig:
     device: str = "auto"
     save_every_timesteps: int = 1_048_576
     save_replay_buffer_transitions: int = 131_072
+    save_replay_buffer_every: int = 10
 
     resume_from: Optional[str] = None
     resume_checkpoint: Optional[str] = None
@@ -209,6 +210,7 @@ class TrainingConfig:
         "total_timesteps",
         "save_every_timesteps",
         "save_replay_buffer_transitions",
+        "save_replay_buffer_every",
         "device",
         "n_envs",
         "n_shards",
@@ -337,6 +339,7 @@ DEFAULT_CONFIG = TrainingConfig(
     total_timesteps=150_000_000,
     save_every_timesteps=1_048_576,
     save_replay_buffer_transitions=131_072,
+    save_replay_buffer_every=10,
     dqn=DQNConfig(
         learning_rate=1e-4,
         buffer_size=500_000,

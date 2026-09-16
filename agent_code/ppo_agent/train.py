@@ -13,7 +13,6 @@ from typing import Optional
 import numpy as np
 import torch
 from sb3_contrib import MaskablePPO
-from sb3_contrib.common.maskable.buffers import MaskableDictRolloutBuffer
 from sb3_contrib.common.maskable.utils import get_action_masks
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.utils import get_schedule_fn
@@ -33,7 +32,7 @@ from .config import (
 from .checkpoint_manager import CheckpointManager
 from .rollout_buffer import PinnedMaskableDictRolloutBuffer
 from .symmetry import augment_rollout_buffer
-from .opponent_pool import OpponentPool, OpponentSampler
+from .opponent_pool import OpponentPool, OpponentSampler, load_inference_model
 from .training_schedule import DEFAULT_SCHEDULE, load_schedule
 
 
@@ -894,10 +893,7 @@ def _eval_pool_case(args) -> tuple[str, dict]:
 
 
 def _load_eval_model(model_path: str):
-    return MaskablePPO.load(
-        model_path, device="cpu",
-        custom_objects={"n_envs": 1, "n_steps": 1, "rollout_buffer_class": MaskableDictRolloutBuffer},
-    )
+    return load_inference_model(model_path)
 
 
 def run_eval_suite(

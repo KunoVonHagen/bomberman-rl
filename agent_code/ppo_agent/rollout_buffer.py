@@ -4,15 +4,66 @@ import numpy as np
 import torch as th
 from sb3_contrib.common.maskable.buffers import MaskableDictRolloutBuffer, MaskableDictRolloutBufferSamples
 
+_STEP_FIELDS = ("rewards", "returns", "episode_starts", "values", "log_probs", "advantages")
+_FLAT_FIELDS = ("actions", "values", "log_probs", "advantages", "returns", "action_masks")
+
 
 class PinnedMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
     def reset(self) -> None:
-        super().reset()
+        if getattr(self, "_arrays_ready", False):
+            for key, obs in self.observations.items():
+                self.observations[key] = obs.reshape((self.buffer_size, self.n_envs) + tuple(self.obs_shape[key]))
+            self.actions = self.actions.reshape(self.buffer_size, self.n_envs, self.action_dim)
+            for name in _STEP_FIELDS:
+                setattr(self, name, getattr(self, name).reshape(self.buffer_size, self.n_envs))
+            self.action_masks = self.action_masks.reshape(self.buffer_size, self.n_envs, self.mask_dims)
+            self.pos = 0
+            self.full = False
+            self.generator_ready = False
+        else:
+            super().reset()
+            self._arrays_ready = True
         self._obs_views: dict = {}
         self._staging_slot = 0
         if not hasattr(self, "_staging"):
             self._staging: list = [{}, {}]
             self._staging_events: list = [None, None]
+
+    def add(self, obs: dict, action: np.ndarray, reward: np.ndarray, episode_start: np.ndarray,
+            value: th.Tensor, log_prob: th.Tensor, action_masks=None) -> None:
+        if action_masks is not None:
+            self.action_masks[self.pos] = np.reshape(action_masks, (self.n_envs, self.mask_dims))
+        if len(log_prob.shape) == 0:
+            log_prob = log_prob.reshape(-1, 1)
+        for key, target in self.observations.items():
+            target[self.pos] = obs[key]
+        self.actions[self.pos] = np.reshape(action, (self.n_envs, self.action_dim))
+        self.rewards[self.pos] = reward
+        self.episode_starts[self.pos] = episode_start
+        self.values[self.pos] = value.clone().cpu().numpy().flatten()
+        self.log_probs[self.pos] = log_prob.clone().cpu().numpy()
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+
+    def get(self, batch_size=None):
+        assert self.full, ""
+        total = self.buffer_size * self.n_envs
+        indices = np.random.permutation(total)
+        if not self.generator_ready:
+            for key, obs in self.observations.items():
+                self.observations[key] = obs.reshape((total,) + tuple(obs.shape[2:]))
+            for name in _FLAT_FIELDS:
+                arr = self.__dict__[name]
+                shape = arr.shape if arr.ndim >= 3 else (*arr.shape, 1)
+                self.__dict__[name] = arr.reshape((shape[0] * shape[1], *shape[2:]))
+            self.generator_ready = True
+        if batch_size is None:
+            batch_size = total
+        start_idx = 0
+        while start_idx < total:
+            yield self._get_samples(indices[start_idx:start_idx + batch_size])
+            start_idx += batch_size
 
     def _obs_view(self, key: str) -> th.Tensor:
         array = self.observations[key]
@@ -51,6 +102,7 @@ class PinnedMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
         return out
 
     def _get_samples(self, batch_inds: np.ndarray, env=None) -> MaskableDictRolloutBufferSamples:
+        batch_inds = (batch_inds % self.buffer_size) * self.n_envs + batch_inds // self.buffer_size
         return MaskableDictRolloutBufferSamples(
             observations=self._gather_observations(batch_inds),
             actions=self.to_torch(self.actions[batch_inds]),

@@ -1270,6 +1270,9 @@ class BombermanGymEnv(gym.Env):
         Set the opponent resampler for the environment. This will reset the environment and apply the new opponent resampler.
         """
         self._opponent_resampler = resampler
+        preload = getattr(resampler, "preload", None)
+        if preload is not None:
+            preload()
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)

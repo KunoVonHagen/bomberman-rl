@@ -785,7 +785,8 @@ def apply_schedule_up_to(
     return target_idx
 
 
-REPLAY_BUFFER_FILE = "replay_buffer.npz"
+REPLAY_BUFFER_FILE = "replay_buffer.bin"
+LEGACY_REPLAY_BUFFER_FILE = "replay_buffer.npz"
 
 
 def _restore_replay_buffer(model: MaskableDQN, cfg: TrainingConfig, ckman: CheckpointManager) -> None:
@@ -795,6 +796,8 @@ def _restore_replay_buffer(model: MaskableDQN, cfg: TrainingConfig, ckman: Check
               "the buffer refills before training resumes.")
         return
     path = ckman.run_dir / REPLAY_BUFFER_FILE
+    if not path.exists():
+        path = ckman.run_dir / LEGACY_REPLAY_BUFFER_FILE
     if not path.exists():
         print("No persisted replay buffer found -- the buffer refills before training resumes.")
         return
@@ -824,6 +827,9 @@ def _persist_replay_buffer(model: MaskableDQN, cfg: TrainingConfig, ckman: Check
     except Exception as exc:
         print(f"Could not save the replay buffer to {path}: {exc!r}")
         return
+    legacy = ckman.run_dir / LEGACY_REPLAY_BUFFER_FILE
+    if legacy.exists():
+        legacy.unlink()
     print(f"Saved {n} replay transitions to {path.name} ({size_gb:.2f} GB) in {time.perf_counter() - t0:.1f}s")
 
 
@@ -918,6 +924,7 @@ def run(
         tensorboard_dir=str(ckman.tensorboard_dir), every_n_timesteps=15_000, verbose=1,
     )
     learn_callbacks = [opponent_callback, schedule_callback, progress_callback]
+    saves_done = 0
 
     while timesteps_done < cfg.total_timesteps:
         chunk = min(cfg.save_every_timesteps, cfg.total_timesteps - timesteps_done)
@@ -949,7 +956,10 @@ def run(
             },
         )
         print(f"Saved checkpoint at {timesteps_done} timesteps -> {ckpt_dir}")
-        _persist_replay_buffer(model, cfg, ckman)
+        saves_done += 1
+        every = max(0, int(cfg.save_replay_buffer_every))
+        if every > 0 and (saves_done % every == 0 or timesteps_done >= cfg.total_timesteps):
+            _persist_replay_buffer(model, cfg, ckman)
 
         if cfg.self_play.enabled:
             pool.maybe_add_checkpoint(ckpt_dir, timesteps_done)

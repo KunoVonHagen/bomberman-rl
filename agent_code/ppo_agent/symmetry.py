@@ -122,6 +122,34 @@ def transform_game_state(state: dict, k: int) -> dict:
     return out
 
 
+_SPATIAL_PERM = torch.from_numpy(np.stack(
+    [transform_array(np.arange(_W * _H).reshape(_W, _H), k).reshape(-1) for k in range(N_SYMMETRIES)]
+).astype(np.int64))
+
+
+def augment_grid(grid_flat: np.ndarray, ks: np.ndarray, chunk_rows: int = 2048) -> None:
+    n, channels = grid_flat.shape[0], grid_flat.shape[1]
+    view = torch.from_numpy(grid_flat).view(n, channels, _W * _H)
+    ks_t = torch.from_numpy(np.ascontiguousarray(ks, dtype=np.int64))
+    scratch = torch.empty((min(chunk_rows, n), channels, _W * _H), dtype=view.dtype)
+    for start in range(0, n, chunk_rows):
+        end = min(n, start + chunk_rows)
+        index = _SPATIAL_PERM[ks_t[start:end]].unsqueeze(1).expand(end - start, channels, _W * _H)
+        out = scratch[:end - start]
+        torch.gather(view[start:end], 2, index, out=out)
+        view[start:end].copy_(out)
+
+
+def augment_flat(features: np.ndarray, actions: np.ndarray, masks: np.ndarray, ks: np.ndarray) -> None:
+    for k in range(1, N_SYMMETRIES):
+        sel = np.flatnonzero(ks == k)
+        if sel.size == 0:
+            continue
+        features[sel] = transform_features(features[sel], k)
+        actions[sel] = transform_actions(actions[sel], k)
+        masks[sel] = transform_masks(masks[sel], k)
+
+
 def augment_arrays(grid: np.ndarray, features: np.ndarray, actions: np.ndarray,
                    masks: np.ndarray, ks: np.ndarray) -> None:
     for k in range(1, N_SYMMETRIES):
@@ -139,15 +167,15 @@ def augment_rollout_buffer(buffer, policy, batch_size: int) -> None:
     features = buffer.observations["features"]
     n_steps, n_envs = buffer.actions.shape[:2]
     ks = np.random.randint(0, N_SYMMETRIES, size=(n_steps, n_envs))
-    for t in range(n_steps):
-        augment_arrays(grid[t], features[t], buffer.actions[t], buffer.action_masks[t], ks[t])
 
     flat_obs = {
         "grid_tensor": grid.reshape(-1, *grid.shape[2:]),
         "features": features.reshape(-1, features.shape[-1]),
     }
-    actions = buffer.actions.reshape(-1).astype(np.int64)
     masks = buffer.action_masks.reshape(-1, buffer.action_masks.shape[-1])
+    augment_grid(flat_obs["grid_tensor"], ks.reshape(-1))
+    augment_flat(flat_obs["features"], buffer.actions.reshape(-1, buffer.actions.shape[-1]), masks, ks.reshape(-1))
+    actions = buffer.actions.reshape(-1).astype(np.int64)
     log_probs = np.empty(actions.shape[0], dtype=np.float32)
     values = np.empty_like(log_probs)
     with torch.no_grad():

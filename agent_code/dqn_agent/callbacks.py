@@ -90,7 +90,7 @@ def _load_config(run_dir: pathlib.Path) -> TrainingConfig:
 
 
 def _load_model(checkpoint_dir: pathlib.Path) -> MaskableDQN:
-    return MaskableDQN.load(checkpoint_dir / "model.zip", device="cpu")
+    return MaskableDQN.load(checkpoint_dir / "model.zip", device="cpu", inference=True)
 
 
 def _get_dummy_env(cfg: TrainingConfig) -> BombermanGymEnv:

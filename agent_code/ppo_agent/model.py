@@ -8,6 +8,24 @@ def _dropout_layer(dropout: float) -> list:
     return [nn.Dropout(dropout)] if dropout > 0 else []
 
 
+class InferenceOptimizer:
+    def __init__(self, params, **kwargs):
+        self.param_groups = [dict(params=list(params), **kwargs)]
+        self.state = {}
+
+    def state_dict(self) -> dict:
+        return {"state": {}, "param_groups": []}
+
+    def load_state_dict(self, state_dict, strict: bool = True) -> None:
+        return None
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        return None
+
+    def step(self, closure=None) -> None:
+        return None
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels: int, groups: int = 8):
         super().__init__()

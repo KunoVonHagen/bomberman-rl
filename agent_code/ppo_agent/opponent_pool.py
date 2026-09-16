@@ -4,15 +4,18 @@ import importlib
 import pathlib
 import random
 import tempfile
+import zipfile
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.buffers import MaskableDictRolloutBuffer
+from stable_baselines3.common.save_util import json_to_data
 
 from .config import EnvConfig, SelfPlayConfig, OpponentArrangement, ScenarioArrangement
 from .checkpoint_manager import CheckpointManager
+from .model import InferenceOptimizer
 from .grouped_forward import (EXTRACTOR_KEYS, EXTRACTOR_PREFIX, grouped_extractor_forward, grouped_linear,
                               model_indices, observation_tensors, stack_state_dicts)
 from .gym_environment import BombermanGymEnv, ACTION_INDICES
@@ -21,6 +24,23 @@ from environment import WorldArgs
 OpponentPair = Tuple[Callable, Callable]
 
 _MODEL_CACHE: Dict[str, "MaskablePPO"] = {}
+
+
+def load_inference_model(model_path: str) -> "MaskablePPO":
+    with zipfile.ZipFile(model_path) as archive:
+        data = json_to_data(archive.read("data").decode(), custom_objects={"rollout_buffer_class": MaskableDictRolloutBuffer})
+    policy_kwargs = dict(data.get("policy_kwargs") or {})
+    policy_kwargs["optimizer_class"] = InferenceOptimizer
+    return MaskablePPO.load(
+        model_path,
+        device="cpu",
+        custom_objects={
+            "n_envs": 1,
+            "n_steps": 1,
+            "rollout_buffer_class": MaskableDictRolloutBuffer,
+            "policy_kwargs": policy_kwargs,
+        },
+    )
 _OBS_ENV_CACHE: Dict[Tuple[Any, int, int], "BombermanGymEnv"] = {}
 
 _BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
@@ -93,11 +113,7 @@ class _CheckpointOpponent:
         if self._model is None:
             self._model = _MODEL_CACHE.get(self.model_path)
             if self._model is None:
-                self._model = MaskablePPO.load(
-                    self.model_path,
-                    device="cpu",
-                    custom_objects={"n_envs": 1, "n_steps": 1, "rollout_buffer_class": MaskableDictRolloutBuffer},
-                )
+                self._model = load_inference_model(self.model_path)
                 _MODEL_CACHE[self.model_path] = self._model
         if self._action_names is None:
             self._action_names = {v: k for k, v in ACTION_INDICES.items() if k is not None}
@@ -407,3 +423,10 @@ class OpponentSampler:
         descriptions = self.pool.last_opponent_descriptions()
         scenario = self.pool.current_scenario()
         return opponents, scenario, descriptions
+
+    def preload(self) -> None:
+        for checkpoint in list(self.pool._checkpoints):
+            _setup_fn, act_fn = self.pool._checkpoint_opponent(checkpoint)
+            owner = getattr(act_fn, "__self__", None)
+            if owner is not None and hasattr(owner, "_ensure_model"):
+                owner._ensure_model()

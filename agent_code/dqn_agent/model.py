@@ -200,7 +200,9 @@ class MaskableDQN:
         dropout: float = 0.0,
         n_envs: int = 1,
         device: str = "cpu",
+        inference: bool = False,
     ):
+        self.inference = bool(inference)
         self.observation_space = observation_space
         self.action_space = action_space
         self.n_actions = int(action_space.n)
@@ -233,14 +235,18 @@ class MaskableDQN:
         self.exploration_rate = exploration_initial_eps
 
         self.q_net = QNetwork(observation_space, self.n_actions, features_dim, self.dropout).to(self.device)
-        self.q_net_target = QNetwork(observation_space, self.n_actions, features_dim, self.dropout).to(self.device)
-        self.q_net_target.load_state_dict(self.q_net.state_dict())
         self.q_net.eval()
-        self.q_net_target.eval()
-
-        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         self._amp_enabled = self.device.type == "cuda"
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self._amp_enabled)
+        if self.inference:
+            self.q_net_target = None
+            self.optimizer = None
+            self.scaler = None
+        else:
+            self.q_net_target = QNetwork(observation_space, self.n_actions, features_dim, self.dropout).to(self.device)
+            self.q_net_target.load_state_dict(self.q_net.state_dict())
+            self.q_net_target.eval()
+            self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self._amp_enabled)
 
         self.replay_buffer: Optional[DictReplayBuffer] = None
 
@@ -481,6 +487,8 @@ class MaskableDQN:
 
     def learn(self, env, total_timesteps: int, callbacks: Optional[list] = None) -> None:
         """Collect experience and train for the next training chunk."""
+        if self.inference:
+            raise RuntimeError("this MaskableDQN was loaded with inference=True and cannot be trained")
         self._ensure_replay_buffer(env.num_envs)
         callbacks = callbacks or []
         target_num_timesteps = self.num_timesteps + int(total_timesteps)
@@ -592,6 +600,8 @@ class MaskableDQN:
 
     def save(self, path) -> None:
         """Save the model checkpoint to disk."""
+        if self.inference:
+            raise RuntimeError("this MaskableDQN was loaded with inference=True and cannot be saved")
         checkpoint = {
             "observation_space": self.observation_space,
             "action_space": self.action_space,
@@ -608,7 +618,7 @@ class MaskableDQN:
         torch.save(checkpoint, path)
 
     @classmethod
-    def load(cls, path, env=None, device: str = "cpu") -> "MaskableDQN":
+    def load(cls, path, env=None, device: str = "cpu", inference: bool = False) -> "MaskableDQN":
         """Load a model from a checkpoint file."""
         checkpoint = torch.load(path, map_location=device, weights_only=False)
         n_envs = env.num_envs if env is not None else checkpoint.get("n_envs", 1)
@@ -618,9 +628,15 @@ class MaskableDQN:
             checkpoint["action_space"],
             n_envs=n_envs,
             device=device,
+            inference=inference,
             **checkpoint["hyperparams"],
         )
         model.q_net.load_state_dict(checkpoint["q_net_state_dict"])
+        if inference:
+            model.num_timesteps = checkpoint.get("num_timesteps", 0)
+            model.exploration_rate = checkpoint.get("exploration_rate", model.exploration_initial_eps)
+            model.n_updates = checkpoint.get("n_updates", 0)
+            return model
         model.q_net_target.load_state_dict(checkpoint["q_net_target_state_dict"])
 
         if env is not None and checkpoint.get("optimizer_state_dict") is not None:

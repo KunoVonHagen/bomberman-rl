@@ -122,35 +122,54 @@ def transform_game_state(state: dict, k: int) -> dict:
     return out
 
 
+def _feature_permutations(width: int) -> np.ndarray:
+    perm = np.tile(np.arange(width, dtype=np.int64), (N_SYMMETRIES, 1))
+    for k in range(N_SYMMETRIES):
+        for group in DIRECTION_FEATURES:
+            if group[-1] < width:
+                g = np.asarray(group, dtype=np.int64)
+                perm[k, g] = g[ACTION_PERM_INV[k, :4]]
+    return perm
+
+
 class TensorAugmenter:
     def __init__(self, device: torch.device):
         self.device = device
         self.perm = torch.as_tensor(ACTION_PERM, device=device)
         self.perm_inv = torch.as_tensor(ACTION_PERM_INV, device=device)
         self.position = torch.as_tensor(POSITION, device=device, dtype=torch.float32)
-        self.groups = [(group[-1], torch.as_tensor(group, device=device)) for group in DIRECTION_FEATURES]
+        grid_map = torch.stack([
+            transform_tensor(torch.arange(_W * _H).view(_W, _H), k).reshape(-1) for k in range(N_SYMMETRIES)
+        ])
+        self.grid_map = grid_map.to(device)
+        self._feature_perms: dict = {}
 
-    def transform_features(self, f: torch.Tensor, k: int) -> torch.Tensor:
-        f = f.clone()
+    def _feature_perm(self, width: int) -> torch.Tensor:
+        perm = self._feature_perms.get(width)
+        if perm is None:
+            perm = torch.as_tensor(_feature_permutations(width), device=self.device)
+            self._feature_perms[width] = perm
+        return perm
+
+    def transform_grid(self, grid: torch.Tensor, ks: torch.Tensor) -> torch.Tensor:
+        n, channels = grid.shape[0], grid.shape[1]
+        index = self.grid_map[ks].unsqueeze(1).expand(n, channels, _W * _H)
+        return torch.gather(grid.reshape(n, channels, _W * _H), 2, index).view_as(grid)
+
+    def transform_features(self, f: torch.Tensor, ks: torch.Tensor) -> torch.Tensor:
+        out = torch.gather(f, 1, self._feature_perm(f.shape[1])[ks])
         xs = torch.round((f[:, FEATURE_SELF_X] + 1.0) * (_W - 1) / 2.0).long()
         ys = torch.round((f[:, FEATURE_SELF_Y] + 1.0) * (_H - 1) / 2.0).long()
-        moved = self.position[k, xs, ys]
-        f[:, FEATURE_SELF_X] = moved[:, 0] * (2.0 / (_W - 1)) - 1.0
-        f[:, FEATURE_SELF_Y] = moved[:, 1] * (2.0 / (_H - 1)) - 1.0
-        for last, group in self.groups:
-            if last < f.shape[1]:
-                f[:, group] = f[:, group][:, self.perm_inv[k, :4]]
-        return f
+        moved = self.position[ks, xs, ys]
+        identity = ks == 0
+        out[:, FEATURE_SELF_X] = torch.where(identity, f[:, FEATURE_SELF_X], moved[:, 0] * (2.0 / (_W - 1)) - 1.0)
+        out[:, FEATURE_SELF_Y] = torch.where(identity, f[:, FEATURE_SELF_Y], moved[:, 1] * (2.0 / (_H - 1)) - 1.0)
+        return out
 
     def augment(self, obs: dict, next_obs: dict, actions: torch.Tensor, next_masks: torch.Tensor) -> None:
-        ks = np.random.randint(0, N_SYMMETRIES, size=actions.shape[0])
-        for k in range(1, N_SYMMETRIES):
-            members = np.flatnonzero(ks == k)
-            if members.size == 0:
-                continue
-            idx = torch.from_numpy(members).to(self.device, non_blocking=True)
-            for d in (obs, next_obs):
-                d["grid_tensor"][idx] = transform_tensor(d["grid_tensor"][idx], k)
-                d["features"][idx] = self.transform_features(d["features"][idx], k)
-            actions[idx] = self.perm[k][actions[idx]]
-            next_masks[idx] = next_masks[idx][:, self.perm_inv[k]]
+        ks = torch.from_numpy(np.random.randint(0, N_SYMMETRIES, size=actions.shape[0])).to(self.device, non_blocking=True)
+        for d in (obs, next_obs):
+            d["grid_tensor"] = self.transform_grid(d["grid_tensor"], ks)
+            d["features"] = self.transform_features(d["features"], ks)
+        actions.copy_(self.perm[ks, actions])
+        next_masks.copy_(torch.gather(next_masks, 1, self.perm_inv[ks]))

@@ -14,6 +14,7 @@ import numpy as np
 
 from ..dqn_agent.config import DEFAULT_CONFIG as DQN_DEFAULT_CONFIG
 from ..dqn_agent.gym_environment import ACTIONS, BombermanGymEnv, WorldArgs
+from ..dqn_agent.replay_buffer import read_replay_file
 from .model import MODEL_FILE, build_model, masked_greedy, masked_max, save_model
 
 MANIFEST_FILE = "run_manifest.json"
@@ -233,12 +234,12 @@ def evaluate(venv, model, fitted: bool) -> dict:
 
 
 def load_replay(path: str, n_features: int, store: TransitionStore) -> int:
-    with np.load(path) as data:
-        n = int(data["n_rows"])
-        features = np.asarray(data["features"][:n], dtype=np.float32)
-        if features.shape[-1] != n_features:
-            raise ValueError(f"replay features have width {features.shape[-1]}, the env produces {n_features}")
-        actions, rewards, dones, masks = data["actions"][:n], data["rewards"][:n], data["dones"][:n], data["action_masks"][:n]
+    data = read_replay_file(path)
+    n = int(data["n_rows"])
+    features = np.asarray(data["features"][:n], dtype=np.float32)
+    if features.shape[-1] != n_features:
+        raise ValueError(f"replay features have width {features.shape[-1]}, the env produces {n_features}")
+    actions, rewards, dones, masks = data["actions"][:n], data["rewards"][:n], data["dones"][:n], data["action_masks"][:n]
     for row in range(n - 1):
         store.add(features[row], actions[row], rewards[row], dones[row], features[row + 1], masks[row + 1])
     return max(0, n - 1) * features.shape[1]
@@ -345,7 +346,7 @@ def parse_args(argv=None) -> FQIConfig:
     p.add_argument("--env-version", type=int, default=defaults.env_version)
     p.add_argument("--eval-every", type=int, default=defaults.eval_every, help="0 disables the greedy evaluation")
     p.add_argument("--seed", type=int, default=defaults.seed)
-    p.add_argument("--replay", default=None, help="replay_buffer.npz of a DQN checkpoint to warm-start the store")
+    p.add_argument("--replay", default=None, help="replay_buffer.bin (or legacy .npz) of a DQN run to warm-start the store")
     args = p.parse_args(argv)
     return FQIConfig(**vars(args))
 
