@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import gymnasium as gym
 
-from .replay_buffer import DictReplayBuffer
+from .replay_buffer import GRID_SENTINEL_CODE, DictReplayBuffer
 from .schedules import LinearSchedule
 from .symmetry import TensorAugmenter
 
@@ -124,7 +124,9 @@ class BombermanFeatureExtractor(nn.Module):
 
     def forward(self, observations: dict) -> torch.Tensor:
         """Convert a Bomberman observation dict into a feature vector."""
-        grid_tensor = observations["grid_tensor"].float()
+        grid_tensor = observations["grid_tensor"]
+        if grid_tensor.dtype != torch.float32 and not torch.is_autocast_enabled(grid_tensor.device.type):
+            grid_tensor = grid_tensor.float()
         features = observations["features"].float()
 
         cnn_out = self._conv_forward(grid_tensor)
@@ -149,7 +151,15 @@ class QNetwork(nn.Module):
         return self.q_head(self.features_extractor(observations))
 
 
-def _obs_to_tensors(observation: dict, device: torch.device, pinned: Optional[dict] = None) -> dict:
+def _decode_grid(codes: torch.Tensor, codec: tuple, dtype: torch.dtype) -> torch.Tensor:
+    den, sentinel = codec
+    grid = codes.to(torch.float32).div_(den)
+    grid.masked_fill_((codes == GRID_SENTINEL_CODE) & sentinel, -1.0)
+    return grid if dtype == torch.float32 else grid.to(dtype)
+
+
+def _obs_to_tensors(observation: dict, device: torch.device, pinned: Optional[dict] = None,
+                    codec: Optional[tuple] = None, dtype: torch.dtype = torch.float32) -> dict:
     """Convert observation arrays to PyTorch tensors on a device."""
     grid = observation["grid_tensor"]
     grid_t = grid if torch.is_tensor(grid) else torch.from_numpy(np.ascontiguousarray(grid))
@@ -163,8 +173,13 @@ def _obs_to_tensors(observation: dict, device: torch.device, pinned: Optional[di
         pinned["features"].copy_(feats_t)
         feats_t = pinned["features"]
 
+    grid_d = grid_t.to(device, non_blocking=non_blocking)
+    if codec is not None and grid_d.dtype == torch.uint8:
+        grid_d = _decode_grid(grid_d, codec, dtype)
+    else:
+        grid_d = grid_d.to(dtype)
     return {
-        "grid_tensor": grid_t.to(device, non_blocking=non_blocking).float(),
+        "grid_tensor": grid_d,
         "features": feats_t.to(device, non_blocking=non_blocking),
     }
 
@@ -202,6 +217,7 @@ class MaskableDQN:
         weight_decay: float = 0.0,
         dropout: float = 0.0,
         amp: str = "fp16",
+        grid_codec=None,
         n_envs: int = 1,
         device: str = "cpu",
         inference: bool = False,
@@ -231,6 +247,15 @@ class MaskableDQN:
         if amp not in AMP_MODES:
             raise ValueError(f"amp must be one of {AMP_MODES}, got {amp!r}")
         self.amp = amp
+        self.grid_codec = None
+        self._codec_tensors = None
+        if grid_codec is not None:
+            den, sentinel = grid_codec
+            self.grid_codec = (np.ascontiguousarray(den, dtype=np.float32), np.ascontiguousarray(sentinel, dtype=np.bool_))
+            self._codec_tensors = (
+                torch.as_tensor(self.grid_codec[0], device=self.device).view(-1, 1, 1),
+                torch.as_tensor(self.grid_codec[1], device=self.device).view(-1, 1, 1),
+            )
 
         self.exploration_initial_eps = exploration_initial_eps
         self.exploration_final_eps = exploration_final_eps
@@ -352,7 +377,7 @@ class MaskableDQN:
         if self.replay_buffer is None or self.n_envs != n_envs:
             self.n_envs = n_envs
             self.replay_buffer = DictReplayBuffer(
-                self.buffer_size, n_envs, self.observation_space, self.n_actions,
+                self.buffer_size, n_envs, self.observation_space, self.n_actions, grid_codec=self.grid_codec,
             )
 
     def save_replay_buffer(self, path, max_transitions: Optional[int] = None) -> int:
@@ -415,8 +440,11 @@ class MaskableDQN:
         if prof: prof.stop("sample")
 
         if prof: prof.start("host_to_device")
-        obs = _obs_to_tensors(batch["obs"], self.device, pinned=self._pinned_obs)
-        next_obs = _obs_to_tensors(batch["next_obs"], self.device, pinned=self._pinned_next_obs)
+        train_dtype = torch.float16 if self._amp_enabled else torch.float32
+        obs = _obs_to_tensors(batch["obs"], self.device, pinned=self._pinned_obs,
+                              codec=self._codec_tensors, dtype=train_dtype)
+        next_obs = _obs_to_tensors(batch["next_obs"], self.device, pinned=self._pinned_next_obs,
+                                   codec=self._codec_tensors, dtype=train_dtype)
         actions = torch.as_tensor(batch["actions"], device=self.device, dtype=torch.int64)
         rewards = torch.as_tensor(batch["rewards"], device=self.device, dtype=torch.float32)
         dones = torch.as_tensor(batch["dones"], device=self.device, dtype=torch.float32)
@@ -629,6 +657,7 @@ class MaskableDQN:
             weight_decay=self.weight_decay,
             dropout=self.dropout,
             amp=self.amp,
+            grid_codec=self.grid_codec,
         )
 
     def save(self, path) -> None:

@@ -252,6 +252,27 @@ def resolve_layer_groups(requested: Optional[Iterable[str]]) -> Set[str]:
     return resolved
 
 
+def grid_layer_codes(layer_config: Optional[Iterable[str]]) -> Tuple[np.ndarray, np.ndarray]:
+    layers = sorted(idx for g in resolve_layer_groups(layer_config) for idx in LAYER_GROUPS[g])
+    horizon = float(s.BOMB_TIMER + s.EXPLOSION_TIMER)
+    crate_potential_max = float(4 * s.BOMB_POWER)
+    dist_max = float(s.COLS * s.ROWS)
+    den = np.ones(len(layers), dtype=np.float32)
+    sentinel = np.zeros(len(layers), dtype=np.bool_)
+    for i, layer in enumerate(layers):
+        if layer in (SELF_DISTANCE_LAYER, OPPONENTS_LEAST_DISTANCE_LAYER, DANGER_ONSET_LAYER, DANGER_CLEAR_LAYER):
+            den[i] = horizon
+            sentinel[i] = True
+        elif layer == CRATE_POTENTIAL_LAYER:
+            den[i] = crate_potential_max
+        elif layer == MOBILITY_LAYER:
+            den[i] = 4.0
+        elif layer in (CRATE_DISTANCE_LAYER, COIN_DISTANCE_LAYER):
+            den[i] = dist_max
+            sentinel[i] = True
+    return den, sentinel
+
+
 def observation_shapes(layer_config: Optional[Iterable[str]], env_version: int) -> Tuple[Tuple[int, int, int], int]:
     groups = resolve_layer_groups(layer_config)
     n_layers = len(sorted(idx for g in groups for idx in LAYER_GROUPS[g]))
@@ -260,12 +281,12 @@ def observation_shapes(layer_config: Optional[Iterable[str]], env_version: int) 
 
 
 @njit(cache=True)
-def _time_aware_bfs_kernel(starts, start_counts, occ, danger, W, H, T, dist, visited, qx, qy, qt, fixes):
+def _time_aware_bfs_kernel(starts, start_counts, occ, danger, W, H, T, dist, visited, qx, qy, qt, fixes, envs):
     """
     Batched time-aware BFS. starts/occ/dist/visited: (n_envs, W, H, T+1).
     """
-    n_envs = starts.shape[0]
-    for env in range(n_envs):
+    for ei in range(envs.shape[0]):
+        env = envs[ei]
         d = dist[env]
         vis = visited[env]
         d[:, :] = -1.0
@@ -337,12 +358,12 @@ def _time_aware_bfs_kernel(starts, start_counts, occ, danger, W, H, T, dist, vis
 
 
 @njit(cache=True)
-def _multi_source_bfs_kernel(targets, occ, W, H, dist, qx, qy):
+def _multi_source_bfs_kernel(targets, occ, W, H, dist, qx, qy, envs):
     """
     Batched multi-source BFS. targets/occ/dist: (n_envs, W, H).
     """
-    n_envs = targets.shape[0]
-    for env in range(n_envs):
+    for ei in range(envs.shape[0]):
+        env = envs[ei]
         d = dist[env]
         d[:, :] = -1.0
         head = 0
@@ -384,10 +405,10 @@ def _multi_source_bfs_kernel(targets, occ, W, H, dist, qx, qy):
 
 
 @njit(cache=True)
-def _own_bomb_escape_kernel(ax, ay, blast_tensor, occ, danger, W, H, T, bomb_timer, ET, visited, qx, qy, qt):
-    n_envs = ax.shape[0]
-    counts = np.zeros(n_envs, dtype=np.int64)
-    for env in range(n_envs):
+def _own_bomb_escape_kernel(ax, ay, blast_tensor, occ, danger, W, H, T, bomb_timer, ET, visited, qx, qy, qt, envs):
+    counts = np.zeros(ax.shape[0], dtype=np.int64)
+    for ei in range(envs.shape[0]):
+        env = envs[ei]
         x0 = ax[env]
         y0 = ay[env]
         if danger[env, 0, x0, y0] > 0:
@@ -442,15 +463,15 @@ def _own_bomb_escape_kernel(ax, ay, blast_tensor, occ, danger, W, H, T, bomb_tim
 @njit(cache=True)
 def _forecast_kernel(bomb_x, bomb_y, bomb_timer, bomb_counts, blast_tensor,
                      exp_x, exp_y, exp_timer, exp_counts,
-                     wall, crate, T, ET, danger_out, occ_out, fixes):
+                     wall, crate, T, ET, danger_out, occ_out, fixes, envs):
     """
     Batched forecast of danger and occupied maps. All inputs/outputs are (n_envs, ...) arrays.
     """
-    n_envs = bomb_counts.shape[0]
     width, height = wall.shape
     exp_offset = 1 if fixes else 0
 
-    for env in range(n_envs):
+    for ei in range(envs.shape[0]):
+        env = envs[ei]
         nb = bomb_counts[env]
         ne = exp_counts[env]
         remaining_crates = crate[env].copy()
@@ -491,8 +512,9 @@ def _forecast_kernel(bomb_x, bomb_y, bomb_timer, bomb_counts, blast_tensor,
 
 @njit(cache=True)
 def _dynamic_layers_kernel(gt, blast_tensor, ax, ay, bombs_left, opp_x, opp_y, opp_alive, opp_bombs_left,
-                           bx, by, bt, bc, exx, exy, ext, exc, timer_channels, fixes, BT, W, H, n_base):
-    for e in range(gt.shape[0]):
+                           bx, by, bt, bc, exx, exy, ext, exc, timer_channels, fixes, BT, W, H, n_base, envs):
+    for ei in range(envs.shape[0]):
+        e = envs[ei]
         g = gt[e]
         for layer in range(4, n_base):
             for i in range(W):
@@ -541,8 +563,9 @@ def _dynamic_layers_kernel(gt, blast_tensor, ax, ay, bombs_left, opp_x, opp_y, o
 
 
 @njit(cache=True)
-def _danger_summary_kernel(gt, D0, T, L_ONSET, L_CLEAR, W, H):
-    for e in range(gt.shape[0]):
+def _danger_summary_kernel(gt, D0, T, L_ONSET, L_CLEAR, W, H, envs):
+    for ei in range(envs.shape[0]):
+        e = envs[ei]
         for i in range(W):
             for j in range(H):
                 best = np.float32(0.0)
@@ -565,8 +588,9 @@ def _danger_summary_kernel(gt, D0, T, L_ONSET, L_CLEAR, W, H):
 
 
 @njit(cache=True)
-def _mobility_kernel(gt, L_OCC_LAST, L_MOB, xw, W, H):
-    for e in range(gt.shape[0]):
+def _mobility_kernel(gt, L_OCC_LAST, L_MOB, xw, W, H, envs):
+    for ei in range(envs.shape[0]):
+        e = envs[ei]
         for i in range(W):
             for j in range(H):
                 m = np.float32(0.0)
@@ -582,8 +606,9 @@ def _mobility_kernel(gt, L_OCC_LAST, L_MOB, xw, W, H):
 
 
 @njit(cache=True)
-def _distance_inputs_kernel(gt, ax, ay, L_OCC0, L_CP, L_COIN, fixes, occ, crate_targets, coin_targets, W, H):
-    for e in range(gt.shape[0]):
+def _distance_inputs_kernel(gt, ax, ay, L_OCC0, L_CP, L_COIN, fixes, occ, crate_targets, coin_targets, W, H, envs):
+    for ei in range(envs.shape[0]):
+        e = envs[ei]
         for i in range(W):
             for j in range(H):
                 blocked = gt[e, L_OCC0, i, j] != 0
@@ -595,11 +620,12 @@ def _distance_inputs_kernel(gt, ax, ay, L_OCC0, L_CP, L_COIN, fixes, occ, crate_
 
 
 @njit(cache=True)
-def _center_normalize_kernel(gt, ax, ay, layers, cx, cy, W, H, T_HORIZON, CP_MAX, DIST_MAX, out):
+def _center_normalize_kernel(gt, ax, ay, layers, envs, cx, cy, W, H, T_HORIZON, CP_MAX, DIST_MAX, out):
     horizon = np.float32(T_HORIZON)
     cp_max = np.float32(CP_MAX)
     dist_max = np.float32(DIST_MAX)
-    for e in range(gt.shape[0]):
+    for ei in range(envs.shape[0]):
+        e = envs[ei]
         dx = cx - ax[e]
         dy = cy - ay[e]
         for li in range(layers.shape[0]):
@@ -623,7 +649,7 @@ def _center_normalize_kernel(gt, ax, ay, layers, cx, cy, W, H, T_HORIZON, CP_MAX
                         value = np.float32(-1.0) if raw < 0 else min(max(raw / dist_max, np.float32(0.0)), np.float32(1.0))
                     else:
                         value = raw
-                    out[e, li, i, j] = value
+                    out[ei, li, i, j] = value
 
 
 @njit(cache=True)
@@ -631,14 +657,14 @@ def _features_masks_kernel(gt, ax, ay, bombs_left, step_counts, opp_x, opp_y, op
                            init_coins, init_crates, arena, blast_tensor, escape,
                            W, H, DIST_MAX, T_HORIZON, CP_MAX, ESC_MAX, MAX_STEPS, MAX_OPP, fixes, extra,
                            L_COIN_D, L_CRATE_D, L_OPP_D, L_ONSET, L_MOB, L_CP, L_SELF_D, L_OCC1, L_DNG1, L_OCC0, L_DNG0,
-                           f, masks, crates_left_out, coins_left_out):
-    E = ax.shape[0]
+                           f, masks, crates_left_out, coins_left_out, envs):
     f32_dist_max = np.float32(DIST_MAX)
     f32_horizon = np.float32(T_HORIZON)
     f32_cp_max = np.float32(CP_MAX)
     f32_esc_max = np.float32(ESC_MAX)
     f32_max_opp = np.float32(MAX_OPP)
-    for e in range(E):
+    for ei in range(envs.shape[0]):
+        e = envs[ei]
         x = ax[e]
         y = ay[e]
         g = gt[e]
@@ -882,7 +908,8 @@ class BombermanGymEnv(gym.Env):
         self._df_crate_targets = np.zeros((E, W, H), dtype=np.bool_)
         self._df_coin_targets = np.zeros((E, W, H), dtype=np.bool_)
         self._coin_index: List[Dict[Tuple[int, int], int]] = [{} for _ in range(E)]
-        self._fc_any_active = False
+        self._fc_active = np.zeros(E, dtype=np.bool_)
+        self._all_envs = np.arange(E, dtype=np.int64)
 
         self.rounds = np.zeros(E, dtype=np.int64)
         self.step_counts = np.zeros(E, dtype=np.int64)
@@ -1148,13 +1175,13 @@ class BombermanGymEnv(gym.Env):
             self._prev_trap_dist[env] = self._trapped_opponent_distance_now(env)
 
 
-    def _pack_bombs_and_explosions(self) -> None:
+    def _pack_bombs_and_explosions(self, envs=None) -> None:
         bx, by, bt, bc = (self._fc_bomb_x, self._fc_bomb_y,
                           self._fc_bomb_timer, self._fc_bomb_counts)
         exx, exy, ext, exc = (self._fc_exp_x, self._fc_exp_y,
                               self._fc_exp_timer, self._fc_exp_counts)
-        any_active = False
-        for env in range(self.n_envs):
+        active = self._fc_active
+        for env in (range(self.n_envs) if envs is None else envs):
             bombs = self.bombs[env]
             nb = len(bombs)
             if nb > self._MAX_BOMBS:
@@ -1180,47 +1207,50 @@ class BombermanGymEnv(gym.Env):
                     ext[env, k] = ex["timer"]
                     k += 1
             exc[env] = k
+            active[env] = bool(nb or k)
 
-            if nb or k:
-                any_active = True
-        self._fc_any_active = any_active
+    def _env_index(self, envs) -> np.ndarray:
+        if envs is None:
+            return self._all_envs
+        return np.asarray(envs, dtype=np.int64)
 
-    def _refresh_dynamic_layers(self):
-        self._pack_agent_state()
-        self._pack_bombs_and_explosions()
+    def _refresh_dynamic_layers(self, envs=None):
+        self._pack_agent_state(envs)
+        self._pack_bombs_and_explosions(envs)
         _dynamic_layers_kernel(
             self.grid_tensor, self._blast_tensor, self._ax, self._ay, self._bombs_left,
             self._opp_x, self._opp_y, self._opp_alive, self._opp_bombs_left,
             self._fc_bomb_x, self._fc_bomb_y, self._fc_bomb_timer, self._fc_bomb_counts,
             self._fc_exp_x, self._fc_exp_y, self._fc_exp_timer, self._fc_exp_counts,
             self._enable_timer_channels, self._fixes, self._BT, self.width, self.height, _BASE_LAYERS,
+            self._env_index(envs),
         )
 
-    def _compute_forecasts(self):
+    def _compute_forecasts(self, envs):
         """Batched fused danger/occupancy forecast for all envs at once."""
         gt = self.grid_tensor
         T = self._BT + self._ET
 
-        if not self._fc_any_active:
-            gt[:, _DANGER_SLICE] = 0.0
-            static = (self._wall_bool[None, :, :] | gt[:, CRATE_LAYER].astype(bool)).astype(np.float32)
-            gt[:, _OCC_SLICE] = static[:, None, :, :]
+        if not self._fc_active[envs].any():
+            gt[envs, _DANGER_SLICE] = 0.0
+            static = (self._wall_bool[None, :, :] | gt[envs, CRATE_LAYER].astype(bool)).astype(np.float32)
+            gt[envs, _OCC_SLICE] = static[:, None, :, :]
             return
 
         _forecast_kernel(
             self._fc_bomb_x, self._fc_bomb_y, self._fc_bomb_timer, self._fc_bomb_counts, self._blast_tensor,
             self._fc_exp_x, self._fc_exp_y, self._fc_exp_timer, self._fc_exp_counts,
             self._wall_bool, gt[:, CRATE_LAYER].astype(bool),
-            T, self._ET, gt[:, _DANGER_SLICE], gt[:, _OCC_SLICE], self._fixes,
+            T, self._ET, gt[:, _DANGER_SLICE], gt[:, _OCC_SLICE], self._fixes, envs,
         )
 
-    def _time_aware_bfs(self, starts_per_env, out_layer):
+    def _time_aware_bfs(self, starts_per_env, out_layer, envs):
         """Batched time-aware BFS. `starts_per_env` is a list (len n_envs) of start lists."""
         T = len(OCCUPIED_MAP_LAYERS) - 1
         W, H = self.width, self.height
         starts = self._ta_starts
         counts = self._ta_start_counts
-        for env, lst in enumerate(starts_per_env):
+        for env, lst in zip(envs, starts_per_env):
             counts[env] = len(lst)
             for i, (x, y) in enumerate(lst):
                 starts[env, i, 0] = x
@@ -1229,74 +1259,76 @@ class BombermanGymEnv(gym.Env):
         _time_aware_bfs_kernel(
             starts, counts, self.grid_tensor[:, _OCC_SLICE], self.grid_tensor[:, _DANGER_SLICE], W, H, T,
             self.grid_tensor[:, out_layer], self._ta_bfs_visited,
-            self._ta_bfs_qx, self._ta_bfs_qy, self._ta_bfs_qt, self._fixes,
+            self._ta_bfs_qx, self._ta_bfs_qy, self._ta_bfs_qt, self._fixes, envs,
         )
 
-    def _compute_danger_summary(self):
+    def _compute_danger_summary(self, envs):
         _danger_summary_kernel(
             self.grid_tensor, DANGER_MAP_LAYERS[0], len(DANGER_MAP_LAYERS),
-            DANGER_ONSET_LAYER, DANGER_CLEAR_LAYER, self.width, self.height,
+            DANGER_ONSET_LAYER, DANGER_CLEAR_LAYER, self.width, self.height, envs,
         )
 
-    def _compute_mobility(self):
+    def _compute_mobility(self, envs):
         _mobility_kernel(
             self.grid_tensor, OCCUPIED_MAP_LAYERS[-1], MOBILITY_LAYER,
-            np.float32(1.0 if self._fixes else 2.0), self.width, self.height,
+            np.float32(1.0 if self._fixes else 2.0), self.width, self.height, envs,
         )
 
-    def _compute_distance_fields(self):
+    def _compute_distance_fields(self, envs):
         if not (self._enable_crate_distance or self._enable_coin_distance):
             return
         gt = self.grid_tensor
         _distance_inputs_kernel(
             gt, self._ax, self._ay, OCCUPIED_MAP_LAYERS[0], CRATE_POTENTIAL_LAYER, COIN_LAYER, self._fixes,
-            self._df_occ, self._df_crate_targets, self._df_coin_targets, self.width, self.height,
+            self._df_occ, self._df_crate_targets, self._df_coin_targets, self.width, self.height, envs,
         )
         if self._enable_crate_distance:
             _multi_source_bfs_kernel(self._df_crate_targets, self._df_occ, self.width, self.height,
-                                     gt[:, CRATE_DISTANCE_LAYER], self._ms_bfs_qx, self._ms_bfs_qy)
+                                     gt[:, CRATE_DISTANCE_LAYER], self._ms_bfs_qx, self._ms_bfs_qy, envs)
         if self._enable_coin_distance:
             _multi_source_bfs_kernel(self._df_coin_targets, self._df_occ, self.width, self.height,
-                                     gt[:, COIN_DISTANCE_LAYER], self._ms_bfs_qx, self._ms_bfs_qy)
+                                     gt[:, COIN_DISTANCE_LAYER], self._ms_bfs_qx, self._ms_bfs_qy, envs)
 
-    def _refresh_forecast_layers(self):
+    def _refresh_forecast_layers(self, envs=None):
         """One batched pass of all forecast-related layers for all envs."""
+        envs = self._env_index(envs)
         if self._enable_forecast:
-            self._compute_forecasts()
+            self._compute_forecasts(envs)
         if self._enable_self_distance:
             self._time_aware_bfs(
-                [[(self.agents[env].x, self.agents[env].y)] for env in range(self.n_envs)],
-                SELF_DISTANCE_LAYER,
+                [[(self.agents[env].x, self.agents[env].y)] for env in envs],
+                SELF_DISTANCE_LAYER, envs,
             )
         if self._enable_opponent_distance:
             opp_starts = [
                 [(h.x, h.y) for h in self.opponent_handles[env] if not h.dead]
-                for env in range(self.n_envs)
+                for env in envs
             ]
-            self._time_aware_bfs(opp_starts, OPPONENTS_LEAST_DISTANCE_LAYER)
+            self._time_aware_bfs(opp_starts, OPPONENTS_LEAST_DISTANCE_LAYER, envs)
         if self._enable_danger_summary:
-            self._compute_danger_summary()
+            self._compute_danger_summary(envs)
         if self._enable_mobility:
-            self._compute_mobility()
-        self._compute_distance_fields()
+            self._compute_mobility(envs)
+        self._compute_distance_fields(envs)
 
-
-    def _centered_observation(self) -> np.ndarray:
-        self._pack_agent_state()
-        out = np.empty((self.n_envs, self.n_output_layers, self.width, self.height), dtype=np.float32)
+    def _centered_observation(self, envs=None) -> np.ndarray:
+        self._pack_agent_state(envs)
+        envs = self._env_index(envs)
+        out = np.empty((envs.shape[0], self.n_output_layers, self.width, self.height), dtype=np.float32)
         _center_normalize_kernel(
-            self.grid_tensor, self._ax, self._ay, self._output_layers, self.center_x, self.center_y,
+            self.grid_tensor, self._ax, self._ay, self._output_layers, envs, self.center_x, self.center_y,
             self.width, self.height, self._T_HORIZON, self._CRATE_POTENTIAL_MAX, self._DIST_MAX, out,
         )
         return out
 
-    def _pack_agent_state(self) -> None:
+    def _pack_agent_state(self, envs=None) -> None:
         if self._state_packed:
             return
         ax, ay, bombs_left = self._ax, self._ay, self._bombs_left
         opp_x, opp_y, opp_alive, opp_bombs_left = self._opp_x, self._opp_y, self._opp_alive, self._opp_bombs_left
         total_coins = self._total_coins
-        for env, agent in enumerate(self.agents):
+        for env in (range(self.n_envs) if envs is None else envs):
+            agent = self.agents[env]
             ax[env] = agent.x
             ay[env] = agent.y
             bombs_left[env] = bool(agent.bombs_left)
@@ -1308,10 +1340,11 @@ class BombermanGymEnv(gym.Env):
             total_coins[env] = s.SCENARIOS[self.env_scenarios[env]]["COIN_COUNT"]
         self._state_packed = True
 
-    def _compute_global_features(self) -> np.ndarray:
-        self._pack_agent_state()
+    def _compute_global_features(self, envs=None) -> np.ndarray:
+        self._pack_agent_state(envs)
+        envs = self._env_index(envs)
         ax, ay = self._ax, self._ay
-        escape = self._own_bomb_escape_tiles(ax, ay) if self._extra_features else self._escape_dummy
+        escape = self._own_bomb_escape_tiles(ax, ay, envs) if self._extra_features else self._escape_dummy
         step_idx = 0 if self._fixes else 1
         _features_masks_kernel(
             self.grid_tensor, ax, ay, self._bombs_left, self.step_counts, self._opp_x, self._opp_y, self._opp_alive,
@@ -1322,17 +1355,17 @@ class BombermanGymEnv(gym.Env):
             COIN_DISTANCE_LAYER, CRATE_DISTANCE_LAYER, OPPONENTS_LEAST_DISTANCE_LAYER, DANGER_ONSET_LAYER, MOBILITY_LAYER,
             CRATE_POTENTIAL_LAYER, SELF_DISTANCE_LAYER,
             OCCUPIED_MAP_LAYERS[step_idx], DANGER_MAP_LAYERS[step_idx], OCCUPIED_MAP_LAYERS[0], DANGER_MAP_LAYERS[0],
-            self._features, self._action_masks, self._crates_left, self._coins_left,
+            self._features, self._action_masks, self._crates_left, self._coins_left, envs,
         )
         self._masks_valid = True
         return self._features
 
-    def _own_bomb_escape_tiles(self, ax: np.ndarray, ay: np.ndarray) -> np.ndarray:
+    def _own_bomb_escape_tiles(self, ax: np.ndarray, ay: np.ndarray, envs) -> np.ndarray:
         gt = self.grid_tensor
         return _own_bomb_escape_kernel(
             ax, ay, self._blast_tensor, gt[:, _OCC_SLICE], gt[:, _DANGER_SLICE],
             self.width, self.height, self._BT + self._ET, self._BT, self._ET,
-            self._escape_visited, self._ta_bfs_qx, self._ta_bfs_qy, self._ta_bfs_qt,
+            self._escape_visited, self._ta_bfs_qx, self._ta_bfs_qy, self._ta_bfs_qt, envs,
         ).astype(np.float32)
 
     def _build_observation(self) -> Dict[str, np.ndarray]:
@@ -1342,6 +1375,12 @@ class BombermanGymEnv(gym.Env):
             "grid_tensor": grid_tensor,
             "features": features.copy(),
         }
+
+    def _rebuild_observation_rows(self, obs: dict, envs) -> None:
+        envs = self._env_index(envs)
+        obs["grid_tensor"][envs] = self._centered_observation(envs)
+        self._compute_global_features(envs)
+        obs["features"][envs] = self._features[envs]
 
     def set_scenario(self, scenario: str) -> None:
         """
@@ -1466,18 +1505,13 @@ class BombermanGymEnv(gym.Env):
 
         if self.auto_reset and done_idx.size:
             for env in done_idx:
-                infos[int(env)]["terminal_observation"] = {
-                    "grid_tensor": obs["grid_tensor"][int(env)].copy(),
-                    "features": obs["features"][int(env)].copy(),
-                }
-            for env in done_idx:
                 self._new_round(int(env))
-            self._refresh_dynamic_layers()
+            self._refresh_dynamic_layers(done_idx)
             if self._enable_crate_potential:
                 self._init_crate_potential(done_idx)
-            self._refresh_forecast_layers()
+            self._refresh_forecast_layers(done_idx)
             self._update_prev_helpers(done_idx)
-            obs = self._build_observation()
+            self._rebuild_observation_rows(obs, done_idx)
 
         return obs, rewards, terminated, truncated, infos
 
@@ -1787,13 +1821,14 @@ class BombermanGymEnv(gym.Env):
             self._load_game_state(game_state, slot)
             book[key] = (int(self.rounds[slot]), int(self._initial_crate_count[slot]), int(self._initial_coin_count[slot]))
             self._rebuild_static_layers(slot)
-        self._refresh_dynamic_layers()
+        slots = self._all_envs[:k]
+        self._refresh_dynamic_layers(slots)
         if self._enable_crate_potential:
             self._init_crate_potential(list(range(k)))
-        self._refresh_forecast_layers()
-        obs = self._build_observation()
-        masks = self.action_masks()
-        return {"grid_tensor": obs["grid_tensor"][:k], "features": obs["features"][:k]}, masks[:k]
+        self._refresh_forecast_layers(slots)
+        grid = self._centered_observation(slots)
+        features = self._compute_global_features(slots)[:k].copy()
+        return {"grid_tensor": grid, "features": features}, self.action_masks()[:k]
 
     def observations_from_game_states(self, game_states: list) -> Tuple[dict, np.ndarray]:
         k = len(game_states)
@@ -1802,13 +1837,14 @@ class BombermanGymEnv(gym.Env):
         for env, game_state in enumerate(game_states):
             self._load_game_state(game_state, env)
             self._rebuild_static_layers(env)
-        self._refresh_dynamic_layers()
+        slots = self._all_envs[:k]
+        self._refresh_dynamic_layers(slots)
         if self._enable_crate_potential:
             self._init_crate_potential(list(range(k)))
-        self._refresh_forecast_layers()
-        obs = self._build_observation()
-        masks = self.action_masks()
-        return {"grid_tensor": obs["grid_tensor"][:k], "features": obs["features"][:k]}, masks[:k]
+        self._refresh_forecast_layers(slots)
+        grid = self._centered_observation(slots)
+        features = self._compute_global_features(slots)[:k].copy()
+        return {"grid_tensor": grid, "features": features}, self.action_masks()[:k]
 
     def observation_from_game_state(self, game_state: dict, env: int = 0) -> dict:
         """Single-env utility: returns the un-batched observation for `env`."""

@@ -18,7 +18,7 @@ from environment import WorldArgs
 
 from .config import DEFAULT_CONFIG, TrainingConfig, DQNConfig, RewardConfig, load_overrides_file
 from .checkpoint_manager import CheckpointManager
-from .gym_environment import ACTIONS, BombermanGymEnv, observation_shapes
+from .gym_environment import ACTIONS, BombermanGymEnv, grid_layer_codes, observation_shapes
 from .model import BombermanFeatureExtractor, MaskableDQN
 from .opponent_pool import OpponentPool, OpponentSampler
 from .schedules import LinearSchedule
@@ -717,6 +717,7 @@ def build_model(env, cfg: TrainingConfig, device: str) -> MaskableDQN:
         weight_decay=cfg.dqn.weight_decay,
         dropout=cfg.dqn.dropout,
         amp=cfg.dqn.amp,
+        grid_codec=grid_layer_codes(cfg.env.layer_config),
     )
 
 

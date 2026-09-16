@@ -9,8 +9,31 @@ from typing import Optional
 
 import numpy as np
 import torch
+from numba import njit
 
 REPLAY_MAGIC = b"BRB1"
+GRID_SENTINEL_CODE = 255
+GRID_MAX_CODE = 254
+
+
+@njit(cache=True)
+def _encode_grid_kernel(src, den, sentinel, out):
+    for e in range(src.shape[0]):
+        for l in range(src.shape[1]):
+            d = den[l]
+            flag = sentinel[l]
+            for i in range(src.shape[2]):
+                for j in range(src.shape[3]):
+                    v = src[e, l, i, j]
+                    if flag and v < 0:
+                        out[e, l, i, j] = GRID_SENTINEL_CODE
+                    else:
+                        code = int(np.rint(v * d))
+                        if code < 0:
+                            code = 0
+                        elif code > GRID_MAX_CODE:
+                            code = GRID_MAX_CODE
+                        out[e, l, i, j] = code
 REPLAY_FIELDS = ("grid", "features", "actions", "rewards", "dones", "action_masks")
 
 
@@ -18,10 +41,15 @@ class DictReplayBuffer:
     """Circular buffer for dict observations with action masks."""
 
     def __init__(self, buffer_size: int, n_envs: int, observation_space, action_dim: int,
-                 grid_dtype=np.float16):
+                 grid_dtype=np.float16, grid_codec=None):
         self.n_envs = max(1, int(n_envs))
         self.rows = max(2, int(buffer_size) // self.n_envs)
         self.action_dim = int(action_dim)
+        self.grid_codec = None
+        if grid_codec is not None:
+            den, sentinel = grid_codec
+            self.grid_codec = (np.ascontiguousarray(den, dtype=np.float32), np.ascontiguousarray(sentinel, dtype=np.bool_))
+            grid_dtype = np.uint8
         self.grid_dtype = grid_dtype
 
         grid_shape = observation_space["grid_tensor"].shape
@@ -62,7 +90,11 @@ class DictReplayBuffer:
     def add(self, obs, next_obs, actions, rewards, dones, action_masks, next_action_masks) -> None:
         """Store one transition for each active environment."""
         i = self._pos
-        torch.from_numpy(self.grid[i]).copy_(torch.from_numpy(np.ascontiguousarray(obs["grid_tensor"])))
+        if self.grid_codec is not None:
+            _encode_grid_kernel(np.ascontiguousarray(obs["grid_tensor"], dtype=np.float32),
+                                self.grid_codec[0], self.grid_codec[1], self.grid[i])
+        else:
+            torch.from_numpy(self.grid[i]).copy_(torch.from_numpy(np.ascontiguousarray(obs["grid_tensor"])))
         self.features[i] = obs["features"]
         self.actions[i] = actions
         self.rewards[i] = rewards
@@ -208,6 +240,8 @@ class DictReplayBuffer:
         with np.load(path) as data:
             n = int(data["n_rows"])
             self._check_layout(int(data["n_envs"]), {k: data[k].shape[1:] for k in ("grid", "features", "action_masks")})
+            if data["grid"].dtype != self.grid.dtype:
+                raise ValueError(f"replay buffer grid was saved as {data['grid'].dtype.str}, expected {self.grid.dtype.str}")
             keep = min(n, self.rows)
             for key in REPLAY_FIELDS:
                 getattr(self, key)[:keep] = data[key][n - keep:n]
