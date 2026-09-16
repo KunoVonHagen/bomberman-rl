@@ -834,7 +834,6 @@ class BombermanGymEnv(gym.Env):
         self.env_scenarios: List[str] = [args.scenario for _ in range(self.n_envs)]
         self._opponent_resampler = None
         self._observers: Dict[int, "BombermanGymEnv"] = {}
-        self._observer_book: Dict[Tuple[int, int], Tuple[int, int, int]] = {}
         self._opponent_model_index: Optional[dict] = None
         self._published_rows: list = []
 
@@ -1787,7 +1786,6 @@ class BombermanGymEnv(gym.Env):
             return 0
         items = []
         for env in range(self.n_envs):
-            shared = None
             for i, (handle, act_fn) in enumerate(zip(self.opponent_handles[env], self.opponent_act_fns[env])):
                 owner = getattr(act_fn, "__self__", None)
                 if handle.dead or getattr(owner, "predict_batch", None) is None:
@@ -1795,22 +1793,19 @@ class BombermanGymEnv(gym.Env):
                 entry = index.get(getattr(owner, "model_path", None))
                 if entry is None:
                     continue
-                if shared is None:
-                    shared = self._build_shared_state(env)
-                items.append((env, handle, (env, i), self._agent_state_dict(env, handle, shared), entry))
+                items.append((env, handle, (env, i), entry))
         n = len(items)
         if n == 0:
             return 0
         if n > grid_out.shape[0]:
             raise RuntimeError(f"{n} opponent observations do not fit into {grid_out.shape[0]} shared rows")
-        obs, masks = self._opponent_observer(n).observations_for_games(
-            [item[3] for item in items], [item[2] for item in items], self._observer_book)
+        obs, masks = self._opponent_observer(n).observations_for_opponents(self, [item[2] for item in items])
         grid_out[:n] = obs["grid_tensor"]
         features_out[:n] = obs["features"]
         masks_out[:n] = masks
         for j, item in enumerate(items):
-            model_out[j] = item[4][0]
-        self._published_rows = [(item[0], item[1], float(item[4][1]), masks[j].copy()) for j, item in enumerate(items)]
+            model_out[j] = item[3][0]
+        self._published_rows = [(item[0], item[1], float(item[3][1]), masks[j].copy()) for j, item in enumerate(items)]
         return n
 
     def set_opponent_actions(self, greedy) -> None:
@@ -1831,19 +1826,15 @@ class BombermanGymEnv(gym.Env):
     def _precompute_batched_opponent_actions(self) -> None:
         items = []
         for env in range(self.n_envs):
-            shared = None
             pending = self._pending_opponent_actions[env]
             for i, (handle, act_fn) in enumerate(zip(self.opponent_handles[env], self.opponent_act_fns[env])):
                 owner = getattr(act_fn, "__self__", None)
                 if handle.dead or handle in pending or getattr(owner, "predict_batch", None) is None:
                     continue
-                if shared is None:
-                    shared = self._build_shared_state(env)
-                items.append((env, handle, (env, i), owner, self._agent_state_dict(env, handle, shared)))
+                items.append((env, handle, (env, i), owner))
         if not items:
             return
-        obs, masks = self._opponent_observer(len(items)).observations_for_games(
-            [item[4] for item in items], [item[2] for item in items], self._observer_book)
+        obs, masks = self._opponent_observer(len(items)).observations_for_opponents(self, [item[2] for item in items])
         owner_type = type(items[0][3])
         predict_grouped = getattr(owner_type, "predict_grouped", None)
         if predict_grouped is not None and all(type(item[3]) is owner_type for item in items):
@@ -1852,7 +1843,7 @@ class BombermanGymEnv(gym.Env):
                 self._pending_opponent_actions[item[0]][item[1]] = name
             return
         groups: Dict[Any, Tuple[Any, list]] = {}
-        for j, (_env, _handle, _slot, owner, _state) in enumerate(items):
+        for j, (_env, _handle, _slot, owner) in enumerate(items):
             groups.setdefault(getattr(owner, "batch_key", id(owner)), (owner, []))[1].append(j)
         for owner, members in groups.values():
             idx = np.asarray(members, dtype=np.int64)
@@ -1861,21 +1852,54 @@ class BombermanGymEnv(gym.Env):
             for j, name in zip(members, names):
                 self._pending_opponent_actions[items[j][0]][items[j][1]] = name
 
-    def observations_for_games(self, game_states: list, keys: list, book: dict) -> Tuple[dict, np.ndarray]:
-        k = len(game_states)
+    def _load_from_env(self, src: "BombermanGymEnv", env: int, handle_idx: int, slot: int) -> None:
+        self._masks_valid = False
+        self._state_packed = False
+        self.rounds[slot] = src.rounds[env]
+        self.step_counts[slot] = src.step_counts[env]
+        self.env_scenarios[slot] = src.env_scenarios[env]
+        self._initial_crate_count[slot] = src._initial_crate_count[env]
+        self._initial_coin_count[slot] = src._initial_coin_count[env]
+        self.arena[slot] = src.arena[env]
+
+        observer = src.opponent_handles[env][handle_idx]
+        agent = self.agents[slot]
+        agent.x, agent.y = observer.x, observer.y
+        agent.bombs_left = observer.bombs_left
+        agent.score = observer.score
+        agent.dead = False
+        others = [h for h in src.active_agents[env] if h is not observer]
+        for h in self.opponent_handles[slot]:
+            h.dead = True
+        for h, o in zip(self.opponent_handles[slot], others):
+            h.x, h.y = o.x, o.y
+            h.bombs_left = o.bombs_left
+            h.score = o.score
+            h.dead = False
+        self.active_agents[slot] = [agent] + [h for h in self.opponent_handles[slot] if not h.dead]
+
+        self.bombs[slot] = src.bombs[env]
+        self.explosions[slot] = src.explosions[env]
+        n = int(src.n_coins[env])
+        self._ensure_coin_capacity(n)
+        self.n_coins[slot] = n
+        self.coins_xy[slot, :n] = src.coins_xy[env, :n]
+        self.coins_collectable[slot, :n] = src.coins_collectable[env, :n]
+        self.coins_collectable[slot, n:] = False
+
+        g = self.grid_tensor[slot]
+        g[:SELF_LAYER] = src.grid_tensor[env, :SELF_LAYER]
+        g[SELF_LAYER] = 0.0
+        g[SELF_LAYER, agent.x, agent.y] = 1.0
+        if self._enable_crate_potential:
+            g[CRATE_POTENTIAL_LAYER] = src.grid_tensor[env, CRATE_POTENTIAL_LAYER]
+
+    def observations_for_opponents(self, src: "BombermanGymEnv", keys: list) -> Tuple[dict, np.ndarray]:
+        k = len(keys)
         if k > self.n_envs:
-            raise ValueError(f"{k} game states do not fit into {self.n_envs} env slots")
-        for slot, (game_state, key) in enumerate(zip(game_states, keys)):
-            entry = book.get(key)
-            if entry is None:
-                self.rounds[slot] = -1
-            else:
-                self.rounds[slot], self._initial_crate_count[slot], self._initial_coin_count[slot] = entry
-            self._load_game_state(game_state, slot)
-            book[key] = (int(self.rounds[slot]), int(self._initial_crate_count[slot]), int(self._initial_coin_count[slot]))
-            self._rebuild_static_layers(slot)
-            if self._enable_crate_potential:
-                self._refresh_crate_potential_cached(slot)
+            raise ValueError(f"{k} opponents do not fit into {self.n_envs} env slots")
+        for slot, (env, handle_idx) in enumerate(keys):
+            self._load_from_env(src, env, handle_idx, slot)
         slots = self._all_envs[:k]
         self._refresh_dynamic_layers(slots)
         self._refresh_forecast_layers(slots)
