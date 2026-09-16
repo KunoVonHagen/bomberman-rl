@@ -1702,18 +1702,9 @@ class BombermanGymEnv(gym.Env):
         agent.dead = False
 
         others = game_state.get("others", [])
-        by_name = {h.name: h for h in self.opponent_handles[env]}
-        unused_handles = [h for h in self.opponent_handles[env]]
         for h in self.opponent_handles[env]:
             h.dead = True
-        for (name, score, bombs_left, (ox, oy)) in others:
-            h = by_name.get(name)
-            if h is None and unused_handles:
-                h = unused_handles[0]
-            if h is None:
-                continue
-            if h in unused_handles:
-                unused_handles.remove(h)
+        for h, (_name, score, bombs_left, (ox, oy)) in zip(self.opponent_handles[env], others):
             h.x, h.y = int(ox), int(oy)
             h.bombs_left = bool(bombs_left)
             h.score = score

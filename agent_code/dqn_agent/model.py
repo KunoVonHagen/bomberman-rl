@@ -318,25 +318,48 @@ class MaskableDQN:
 
 
         self.profile_every: int = 0
+        self._predict_staging: Optional[dict] = None
         self._profiler = StepProfiler()
         self._wall_profiler = StepProfiler(window=200)
         self._rollout_iter = 0
 
     def _sample_masked_actions(self, action_masks: np.ndarray) -> np.ndarray:
         """Sample actions only from valid mask choices."""
-        action_masks = np.asarray(action_masks)
-        actions = np.empty(action_masks.shape[0], dtype=np.int64)
-        for i, mask in enumerate(action_masks):
-            valid = np.flatnonzero(mask)
-            actions[i] = np.random.choice(valid) if len(valid) else np.random.randint(self.n_actions)
+        action_masks = np.asarray(action_masks, dtype=bool)
+        if action_masks.ndim == 1:
+            action_masks = action_masks[None, :]
+        actions = (np.random.rand(*action_masks.shape) * action_masks).argmax(axis=1)
+        empty = ~action_masks.any(axis=1)
+        if empty.any():
+            actions[empty] = np.random.randint(self.n_actions, size=int(empty.sum()))
         return actions
+
+    def _predict_tensors(self, observation: dict) -> dict:
+        if self.device.type != "cuda":
+            return _obs_to_tensors(observation, self.device)
+        grid = observation["grid_tensor"]
+        grid_t = grid if torch.is_tensor(grid) else torch.from_numpy(np.ascontiguousarray(grid))
+        feats_t = torch.as_tensor(np.asarray(observation["features"]), dtype=torch.float32)
+        n = grid_t.shape[0]
+        staging = self._predict_staging
+        if staging is None or staging["grid"].shape[0] < n or staging["grid"].shape[1:] != grid_t.shape[1:]:
+            staging = self._predict_staging = {
+                "grid": torch.empty(tuple(grid_t.shape), dtype=torch.float16, pin_memory=True),
+                "features": torch.empty(tuple(feats_t.shape), dtype=torch.float32, pin_memory=True),
+            }
+        staging["grid"][:n].copy_(grid_t)
+        staging["features"][:n].copy_(feats_t)
+        return {
+            "grid_tensor": staging["grid"][:n].to(self.device, non_blocking=True),
+            "features": staging["features"][:n].to(self.device, non_blocking=True),
+        }
 
     def q_values(self, observation: dict, mc_dropout_samples: int = 0) -> np.ndarray:
         samples = int(mc_dropout_samples) if self.dropout > 0 else 0
         if self.q_net.training != (samples > 0):
             self.q_net.train(samples > 0)
         with torch.no_grad():
-            obs_t = _obs_to_tensors(observation, self.device)
+            obs_t = self._predict_tensors(observation)
             if samples > 0:
                 batch = obs_t["features"].shape[0]
                 tiled = {key: value.repeat(samples, *([1] * (value.dim() - 1))) for key, value in obs_t.items()}

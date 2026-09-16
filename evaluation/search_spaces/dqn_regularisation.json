@@ -48,9 +48,9 @@
       "task2-classic-solo",
       "task4-rule-based-x3"
     ],
-    "n_rounds": 20,
+    "n_rounds": 120,
     "seed": 0,
-    "workers": 4,
+    "workers": 8,
     "criterion": "score"
   }
 }
