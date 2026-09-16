@@ -90,6 +90,7 @@ class DQNConfig:
     symmetry_augmentation: bool = True
     weight_decay: float = 0.0
     dropout: float = 0.0
+    amp: str = "fp16"
 
 
 @dataclass(frozen=True)
@@ -227,6 +228,7 @@ class TrainingConfig:
         "dqn.max_grad_norm",
         "dqn.symmetry_augmentation",
         "dqn.weight_decay",
+        "dqn.amp",
         "self_play.enabled",
         "self_play.static_opponents",
         "self_play.arrangements",

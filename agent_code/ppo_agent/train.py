@@ -287,9 +287,11 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
         elif cmd == "reset":
             seed, options = data
             obs, infos = env.reset(seed=seed, options=options)
-            remote.send((obs, infos))
+            remote.send((obs, infos, env.action_masks()))
         elif cmd == "action_masks":
             remote.send(env.action_masks())
+        elif cmd == "has_attr":
+            remote.send(hasattr(env, data))
         elif cmd == "env_method":
             method_name, args, kwargs = data
             remote.send(getattr(env, method_name)(*args, **kwargs))
@@ -375,9 +377,9 @@ class ShardedNativeBatchedVecEnv(VecEnv):
         for remote in self.remotes:
             remote.send(("reset", (seed, options)))
         results = [remote.recv() for remote in self.remotes]
-        obs_list, info_lists = zip(*results)
+        obs_list, info_lists, mask_list = zip(*results)
         self._last_infos = [info for infos in info_lists for info in infos]
-        self._last_action_masks = None
+        self._last_action_masks = np.concatenate(mask_list, axis=0)
         return _concat_obs(list(obs_list))
 
     def step_async(self, actions: np.ndarray) -> None:
@@ -410,16 +412,22 @@ class ShardedNativeBatchedVecEnv(VecEnv):
             p.join(timeout=5)
 
     def action_masks(self) -> np.ndarray:
-        if self._last_action_masks is not None:
-            return self._last_action_masks
+        if self._last_action_masks is None:
+            for remote in self.remotes:
+                remote.send(("action_masks", None))
+            self._last_action_masks = np.concatenate([remote.recv() for remote in self.remotes], axis=0)
+        return self._last_action_masks
+
+    def has_attr(self, attr_name: str) -> bool:
         for remote in self.remotes:
-            remote.send(("action_masks", None))
-        return np.concatenate([remote.recv() for remote in self.remotes], axis=0)
+            remote.send(("has_attr", attr_name))
+        return all(remote.recv() for remote in self.remotes)
 
     def env_method(self, method_name: str, *args, indices=None, **kwargs) -> list:
-        if method_name == "action_masks" and not args and not kwargs and self._last_action_masks is not None:
-            per_env = list(self._last_action_masks)
+        if method_name == "action_masks" and not args and not kwargs:
+            per_env = list(self.action_masks())
             return [per_env[i] for i in indices] if indices is not None else per_env
+        self._last_action_masks = None
         for remote in self.remotes:
             remote.send(("env_method", (method_name, args, kwargs)))
         results = [remote.recv() for remote in self.remotes]

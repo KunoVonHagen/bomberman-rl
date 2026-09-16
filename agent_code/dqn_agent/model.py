@@ -40,6 +40,9 @@ class StepProfiler:
         return {name: (sum(vals) / len(vals)) for name, vals in self._times.items() if vals}
 
 
+AMP_MODES = ("off", "fp16")
+
+
 def _dropout_layer(dropout: float) -> list:
     return [nn.Dropout(dropout)] if dropout > 0 else []
 
@@ -198,6 +201,7 @@ class MaskableDQN:
         symmetry_augmentation: bool = False,
         weight_decay: float = 0.0,
         dropout: float = 0.0,
+        amp: str = "fp16",
         n_envs: int = 1,
         device: str = "cpu",
         inference: bool = False,
@@ -224,6 +228,9 @@ class MaskableDQN:
         self._augmenter = TensorAugmenter(self.device)
         self.weight_decay = float(weight_decay)
         self.dropout = float(dropout)
+        if amp not in AMP_MODES:
+            raise ValueError(f"amp must be one of {AMP_MODES}, got {amp!r}")
+        self.amp = amp
 
         self.exploration_initial_eps = exploration_initial_eps
         self.exploration_final_eps = exploration_final_eps
@@ -236,7 +243,8 @@ class MaskableDQN:
 
         self.q_net = QNetwork(observation_space, self.n_actions, features_dim, self.dropout).to(self.device)
         self.q_net.eval()
-        self._amp_enabled = self.device.type == "cuda"
+        self._amp_enabled = self.device.type == "cuda" and self.amp == "fp16"
+        self._h2d_event = None
         if self.inference:
             self.q_net_target = None
             self.optimizer = None
@@ -245,8 +253,11 @@ class MaskableDQN:
             self.q_net_target = QNetwork(observation_space, self.n_actions, features_dim, self.dropout).to(self.device)
             self.q_net_target.load_state_dict(self.q_net.state_dict())
             self.q_net_target.eval()
-            self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
-            self.scaler = torch.cuda.amp.GradScaler(enabled=self._amp_enabled)
+            self.optimizer = torch.optim.Adam(
+                self.q_net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay,
+                fused=self.device.type == "cuda",
+            )
+            self.scaler = torch.amp.GradScaler("cuda", enabled=self._amp_enabled)
 
         self.replay_buffer: Optional[DictReplayBuffer] = None
 
@@ -398,6 +409,8 @@ class MaskableDQN:
         staging = None
         if self._pinned_obs is not None:
             staging = {"grid": self._pinned_obs["grid"], "next_grid": self._pinned_next_obs["grid"]}
+        if self._h2d_event is not None:
+            self._h2d_event.synchronize()
         batch = self.replay_buffer.sample(self.batch_size, out=staging)
         if prof: prof.stop("sample")
 
@@ -408,6 +421,10 @@ class MaskableDQN:
         rewards = torch.as_tensor(batch["rewards"], device=self.device, dtype=torch.float32)
         dones = torch.as_tensor(batch["dones"], device=self.device, dtype=torch.float32)
         next_masks = torch.as_tensor(batch["next_action_masks"], device=self.device, dtype=torch.bool)
+        if self.device.type == "cuda":
+            if self._h2d_event is None:
+                self._h2d_event = torch.cuda.Event()
+            self._h2d_event.record()
         if prof: prof.stop("host_to_device", device=dev)
 
         if self.symmetry_augmentation:
@@ -466,8 +483,13 @@ class MaskableDQN:
     def update_target(self) -> None:
         """Blend the target network toward the online network."""
         with torch.no_grad():
-            for target_param, param in zip(self.q_net_target.parameters(), self.q_net.parameters()):
-                target_param.data.mul_(1.0 - self.tau).add_(self.tau * param.data)
+            targets = [p.data for p in self.q_net_target.parameters()]
+            sources = [p.data for p in self.q_net.parameters()]
+            if self.tau >= 1.0:
+                torch._foreach_copy_(targets, sources)
+            else:
+                torch._foreach_mul_(targets, 1.0 - self.tau)
+                torch._foreach_add_(targets, sources, alpha=self.tau)
 
     def refresh_metrics(self) -> None:
         """Materialize rolling metric windows into their cached mean values with a single CPU sync."""
@@ -575,6 +597,16 @@ class MaskableDQN:
             if crossed:
                 self.update_target()
 
+    def set_amp(self, amp: str) -> None:
+        if amp not in AMP_MODES:
+            raise ValueError(f"amp must be one of {AMP_MODES}, got {amp!r}")
+        if amp == self.amp:
+            return
+        self.amp = amp
+        self._amp_enabled = self.device.type == "cuda" and amp == "fp16"
+        if self.scaler is not None:
+            self.scaler = torch.amp.GradScaler("cuda", enabled=self._amp_enabled)
+
     def _hyperparams(self) -> dict:
         """Return the optimizer and training hyperparameters."""
         return dict(
@@ -596,6 +628,7 @@ class MaskableDQN:
             symmetry_augmentation=self.symmetry_augmentation,
             weight_decay=self.weight_decay,
             dropout=self.dropout,
+            amp=self.amp,
         )
 
     def save(self, path) -> None:
@@ -640,8 +673,12 @@ class MaskableDQN:
         model.q_net_target.load_state_dict(checkpoint["q_net_target_state_dict"])
 
         if env is not None and checkpoint.get("optimizer_state_dict") is not None:
+            optimizer_state = checkpoint["optimizer_state_dict"]
+            fused = model.optimizer.param_groups[0].get("fused")
+            for group in optimizer_state.get("param_groups", []):
+                group["fused"] = fused
             try:
-                model.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                model.optimizer.load_state_dict(optimizer_state)
             except ValueError:
                 pass
         if checkpoint.get("scaler_state_dict") is not None:

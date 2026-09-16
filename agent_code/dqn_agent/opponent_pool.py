@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib
 import pathlib
 import random
-import tempfile
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -88,6 +87,8 @@ class _CheckpointOpponent:
                 self._model = MaskableDQN.load(self.model_path, device="cpu", inference=True)
                 self._model.exploration_rate = self._model.exploration_final_eps
                 _MODEL_CACHE[self.model_path] = self._model
+        elif self.model_path not in _MODEL_CACHE:
+            _MODEL_CACHE[self.model_path] = self._model
         if self._action_names is None:
             self._action_names = {v: k for k, v in ACTION_INDICES.items() if k is not None}
 
@@ -96,7 +97,6 @@ class _CheckpointOpponent:
         key = (None if layers is None else tuple(layers), int(self.env_cfg.env_version), capacity)
         env = _OBS_ENV_CACHE.get(key)
         if env is None:
-            log_dir = tempfile.mkdtemp(prefix="checkpoint_opponent_")
             world_args = WorldArgs(
                 scenario=self.env_cfg.scenario,
                 seed=None,
@@ -107,7 +107,7 @@ class _CheckpointOpponent:
                 save_stats=False,
                 turn_based=self.env_cfg.turn_based,
                 update_interval=self.env_cfg.update_interval,
-                log_dir=log_dir,
+                log_dir=None,
                 match_name=None,
                 fps=self.env_cfg.fps,
                 replay=False,
@@ -368,9 +368,18 @@ class OpponentSampler:
         scenario = self.pool.current_scenario()
         return opponents, scenario, descriptions
 
-    def preload(self) -> None:
+    def preload(self, in_use=()) -> None:
+        keep = set()
         for checkpoint in list(self.pool._checkpoints):
             _setup_fn, act_fn = self.pool._checkpoint_opponent(checkpoint)
             owner = getattr(act_fn, "__self__", None)
             if owner is not None and hasattr(owner, "_ensure_model"):
                 owner._ensure_model()
+                keep.add(owner.model_path)
+        for owner in in_use:
+            path = getattr(owner, "model_path", None)
+            if path is not None:
+                keep.add(path)
+        for path in list(_MODEL_CACHE):
+            if path not in keep:
+                del _MODEL_CACHE[path]

@@ -479,6 +479,284 @@ def _forecast_kernel(bomb_x, bomb_y, bomb_timer, bomb_counts, blast_tensor,
                 of[xx, yy] = wall[xx, yy] or remaining_crates[xx, yy]
 
 
+@njit(cache=True)
+def _dynamic_layers_kernel(gt, blast_tensor, ax, ay, bombs_left, opp_x, opp_y, opp_alive, opp_bombs_left,
+                           bx, by, bt, bc, exx, exy, ext, exc, timer_channels, fixes, BT, W, H, n_base):
+    for e in range(gt.shape[0]):
+        g = gt[e]
+        for layer in range(4, n_base):
+            for i in range(W):
+                for j in range(H):
+                    g[layer, i, j] = 0.0
+        x = ax[e]
+        y = ay[e]
+        blast = blast_tensor[x, y]
+        for i in range(W):
+            for j in range(H):
+                g[SELF_BLAST_LAYER, i, j] = blast[i, j]
+        for k in range(opp_x.shape[1]):
+            if not opp_alive[e, k]:
+                continue
+            ox = opp_x[e, k]
+            oy = opp_y[e, k]
+            g[OPPONENT_LAYER, ox, oy] = 1.0
+            ob = blast_tensor[ox, oy]
+            for i in range(W):
+                for j in range(H):
+                    g[OPPONENT_DANGER_LAYER, i, j] += ob[i, j]
+            g[BOMBS_LEFT_LAYER, ox, oy] = 1.0 if opp_bombs_left[e, k] else 0.0
+        for i in range(W):
+            for j in range(H):
+                g[OPPONENT_DANGER_LAYER, i, j] = 1.0 if g[OPPONENT_DANGER_LAYER, i, j] > 0 else 0.0
+        g[BOMBS_LEFT_LAYER, x, y] = 1.0 if bombs_left[e] else 0.0
+        if timer_channels:
+            for b in range(bc[e]):
+                t = bt[e, b]
+                g[8 + t, bx[e, b], by[e, b]] = 1.0
+                danger_ch = 8 + BT + t
+                bb = blast_tensor[bx[e, b], by[e, b]]
+                if fixes:
+                    for i in range(W):
+                        for j in range(H):
+                            g[danger_ch, i, j] = max(g[danger_ch, i, j], bb[i, j])
+                else:
+                    for i in range(W):
+                        for j in range(H):
+                            g[danger_ch, i, j] = bb[i, j]
+            for c in range(exc[e]):
+                t = ext[e, c]
+                if fixes and t <= 1:
+                    continue
+                g[7 + 2 * BT + t, exx[e, c], exy[e, c]] = 1.0
+
+
+@njit(cache=True)
+def _danger_summary_kernel(gt, D0, T, L_ONSET, L_CLEAR, W, H):
+    for e in range(gt.shape[0]):
+        for i in range(W):
+            for j in range(H):
+                best = np.float32(0.0)
+                first = -1
+                last = -1
+                for t in range(T):
+                    v = gt[e, D0 + t, i, j]
+                    if v > best:
+                        best = v
+                        first = t
+                        last = t
+                    elif v == best and first >= 0:
+                        last = t
+                if first < 0:
+                    gt[e, L_ONSET, i, j] = -1.0
+                    gt[e, L_CLEAR, i, j] = -1.0
+                else:
+                    gt[e, L_ONSET, i, j] = first
+                    gt[e, L_CLEAR, i, j] = last + 1
+
+
+@njit(cache=True)
+def _mobility_kernel(gt, L_OCC_LAST, L_MOB, xw, W, H):
+    for e in range(gt.shape[0]):
+        for i in range(W):
+            for j in range(H):
+                m = np.float32(0.0)
+                if i > 0:
+                    m += xw * (np.float32(1.0) - gt[e, L_OCC_LAST, i - 1, j])
+                if i < W - 1:
+                    m += xw * (np.float32(1.0) - gt[e, L_OCC_LAST, i + 1, j])
+                if j > 0:
+                    m += np.float32(1.0) - gt[e, L_OCC_LAST, i, j - 1]
+                if j < H - 1:
+                    m += np.float32(1.0) - gt[e, L_OCC_LAST, i, j + 1]
+                gt[e, L_MOB, i, j] = m
+
+
+@njit(cache=True)
+def _distance_inputs_kernel(gt, ax, ay, L_OCC0, L_CP, L_COIN, fixes, occ, crate_targets, coin_targets, W, H):
+    for e in range(gt.shape[0]):
+        for i in range(W):
+            for j in range(H):
+                blocked = gt[e, L_OCC0, i, j] != 0
+                occ[e, i, j] = blocked
+                crate_targets[e, i, j] = gt[e, L_CP, i, j] > 0 and not blocked
+                coin_targets[e, i, j] = gt[e, L_COIN, i, j] != 0
+        if fixes:
+            occ[e, ax[e], ay[e]] = False
+
+
+@njit(cache=True)
+def _center_normalize_kernel(gt, ax, ay, layers, cx, cy, W, H, T_HORIZON, CP_MAX, DIST_MAX, out):
+    horizon = np.float32(T_HORIZON)
+    cp_max = np.float32(CP_MAX)
+    dist_max = np.float32(DIST_MAX)
+    for e in range(gt.shape[0]):
+        dx = cx - ax[e]
+        dy = cy - ay[e]
+        for li in range(layers.shape[0]):
+            layer = layers[li]
+            for i in range(W):
+                sx = i - dx
+                for j in range(H):
+                    sy = j - dy
+                    if sx >= 0 and sx < W and sy >= 0 and sy < H:
+                        raw = gt[e, layer, sx, sy]
+                    else:
+                        raw = np.float32(0.0)
+                    if layer == SELF_DISTANCE_LAYER or layer == OPPONENTS_LEAST_DISTANCE_LAYER \
+                            or layer == DANGER_ONSET_LAYER or layer == DANGER_CLEAR_LAYER:
+                        value = np.float32(-1.0) if raw < 0 else raw / horizon
+                    elif layer == CRATE_POTENTIAL_LAYER:
+                        value = min(max(raw / cp_max, np.float32(0.0)), np.float32(1.0))
+                    elif layer == MOBILITY_LAYER:
+                        value = raw / np.float32(4.0)
+                    elif layer == CRATE_DISTANCE_LAYER or layer == COIN_DISTANCE_LAYER:
+                        value = np.float32(-1.0) if raw < 0 else min(max(raw / dist_max, np.float32(0.0)), np.float32(1.0))
+                    else:
+                        value = raw
+                    out[e, li, i, j] = value
+
+
+@njit(cache=True)
+def _features_masks_kernel(gt, ax, ay, bombs_left, step_counts, opp_x, opp_y, opp_alive, coins_collectable, total_coins,
+                           init_coins, init_crates, arena, blast_tensor, escape,
+                           W, H, DIST_MAX, T_HORIZON, CP_MAX, ESC_MAX, MAX_STEPS, MAX_OPP, fixes, extra,
+                           L_COIN_D, L_CRATE_D, L_OPP_D, L_ONSET, L_MOB, L_CP, L_SELF_D, L_OCC1, L_DNG1, L_OCC0, L_DNG0,
+                           f, masks, crates_left_out, coins_left_out):
+    E = ax.shape[0]
+    f32_dist_max = np.float32(DIST_MAX)
+    f32_horizon = np.float32(T_HORIZON)
+    f32_cp_max = np.float32(CP_MAX)
+    f32_esc_max = np.float32(ESC_MAX)
+    f32_max_opp = np.float32(MAX_OPP)
+    for e in range(E):
+        x = ax[e]
+        y = ay[e]
+        g = gt[e]
+        f[e, FEATURE_SELF_X] = np.float32(x * (2.0 / max(W - 1, 1)) - 1.0)
+        f[e, FEATURE_SELF_Y] = np.float32(y * (2.0 / max(H - 1, 1)) - 1.0)
+        bl = np.float32(1.0) if bombs_left[e] else np.float32(0.0)
+        f[e, FEATURE_BOMBS_LEFT] = bl
+        f[e, FEATURE_STEP_PROGRESS] = np.float32(step_counts[e] / MAX_STEPS)
+
+        coin_d = g[L_COIN_D, x, y]
+        f[e, FEATURE_COIN_DISTANCE] = np.float32(-1.0) if coin_d < 0 else coin_d / f32_dist_max
+        crate_d = g[L_CRATE_D, x, y]
+        f[e, FEATURE_CRATE_DISTANCE] = np.float32(-1.0) if crate_d < 0 else crate_d / f32_dist_max
+        opp_d = g[L_OPP_D, x, y]
+        f[e, FEATURE_OPPONENT_DISTANCE] = np.float32(-1.0) if opp_d < 0 else opp_d / f32_horizon
+        onset = g[L_ONSET, x, y]
+        if onset < 0:
+            f[e, FEATURE_BOMB_DANGER] = np.float32(0.0)
+        else:
+            f[e, FEATURE_BOMB_DANGER] = np.float32(1.0) / (np.float32(1.0) + max(onset, np.float32(0.0)))
+        f[e, FEATURE_MOBILITY] = g[L_MOB, x, y] / np.float32(4.0)
+
+        alive = 0
+        for k in range(MAX_OPP):
+            if opp_alive[e, k]:
+                alive += 1
+        f[e, FEATURE_OPPONENTS_ALIVE] = np.float32(alive) / f32_max_opp
+
+        coins_left = 0
+        for c in range(coins_collectable.shape[1]):
+            if coins_collectable[e, c]:
+                coins_left += 1
+        if fixes:
+            total = max(np.float64(total_coins[e]), np.float64(init_coins[e]))
+            f[e, FEATURE_COINS_REMAINING] = np.float32(min(coins_left / max(total, 1.0), 1.0))
+        else:
+            f[e, FEATURE_COINS_REMAINING] = np.float32(coins_left / max(init_coins[e], 1))
+        crates = 0
+        a = arena[e]
+        for i in range(W):
+            for j in range(H):
+                if a[i, j] == 1:
+                    crates += 1
+        f[e, FEATURE_CRATES_REMAINING] = np.float32(crates / max(init_crates[e], 1))
+        crates_left_out[e] = crates
+        coins_left_out[e] = coins_left
+
+        safe_any = np.float32(0.0)
+        for d in range(4):
+            dx = 0
+            dy = 0
+            if d == 0:
+                dy = -1
+            elif d == 1:
+                dx = 1
+            elif d == 2:
+                dy = 1
+            else:
+                dx = -1
+            tx = x + dx
+            ty = y + dy
+            valid = tx >= 0 and tx < W and ty >= 0 and ty < H
+            txc = min(max(tx, 0), W - 1)
+            tyc = min(max(ty, 0), H - 1)
+            safe = valid and g[L_OCC1, txc, tyc] <= 0 and g[L_DNG1, txc, tyc] <= 0
+            value = np.float32(1.0) if safe else np.float32(0.0)
+            f[e, FEATURE_SAFE_UP + d] = value
+            if value > safe_any:
+                safe_any = value
+            masks[e, d] = valid and g[L_OCC0, txc, tyc] <= 0 and g[L_DNG0, txc, tyc] <= 0
+        if fixes:
+            f[e, FEATURE_SAFE_WAIT] = np.float32(1.0) if g[L_DNG1, x, y] <= 0 else np.float32(0.0)
+        else:
+            f[e, FEATURE_SAFE_WAIT] = np.float32(1.0) if (g[L_OCC1, x, y] <= 0 and g[L_DNG1, x, y] <= 0) else np.float32(0.0)
+        masks[e, 4] = True
+        masks[e, 5] = bombs_left[e]
+
+        f[e, FEATURE_BOMB_TARGET_VALUE] = min(max(g[L_CP, x, y] / f32_cp_max, np.float32(0.0)), np.float32(1.0))
+        if fixes:
+            trap = np.float32(-1.0)
+            for k in range(MAX_OPP):
+                if not opp_alive[e, k]:
+                    continue
+                hx = opp_x[e, k]
+                hy = opp_y[e, k]
+                if g[L_ONSET, hx, hy] < 0:
+                    continue
+                dist = g[L_SELF_D, hx, hy]
+                if dist >= 0 and (trap < 0 or dist < trap):
+                    trap = dist
+        else:
+            trap = g[L_OPP_D, x, y]
+        f[e, FEATURE_TRAPPED_OPPONENT_DISTANCE] = np.float32(-1.0) if trap < 0 else trap / f32_horizon
+
+        if extra:
+            esc = escape[e]
+            f[e, FEATURE_BOMB_ESCAPE_TILES] = min(esc, f32_esc_max) / f32_esc_max
+            f[e, FEATURE_SAFE_BOMB] = (np.float32(1.0) if esc > 0 else np.float32(0.0)) * bl
+            hits = np.float32(0.0)
+            for k in range(MAX_OPP):
+                if opp_alive[e, k] and blast_tensor[x, y, opp_x[e, k], opp_y[e, k]] > 0:
+                    hits += np.float32(1.0)
+            f[e, FEATURE_BOMB_HITS_OPPONENTS] = hits / f32_max_opp
+            for li in range(2):
+                layer = L_COIN_D if li == 0 else L_CRATE_D
+                base = FEATURE_COIN_DIR_UP if li == 0 else FEATURE_CRATE_DIR_UP
+                here = g[layer, x, y]
+                for d in range(4):
+                    dx = 0
+                    dy = 0
+                    if d == 0:
+                        dy = -1
+                    elif d == 1:
+                        dx = 1
+                    elif d == 2:
+                        dy = 1
+                    else:
+                        dx = -1
+                    tx = x + dx
+                    ty = y + dy
+                    valid = tx >= 0 and tx < W and ty >= 0 and ty < H
+                    there = g[layer, min(max(tx, 0), W - 1), min(max(ty, 0), H - 1)]
+                    toward = valid and here >= 0 and there >= 0 and there < here
+                    f[e, base + d] = np.float32(1.0) if toward else np.float32(0.0)
+        else:
+            f[e, FEATURE_SAFE_BOMB] = safe_any * bl
+
+
 class BombermanGymEnv(gym.Env):
     """
     A Gymnasium environment for the Bomberman game, supporting multiple parallel games and various observation layers.
@@ -561,6 +839,7 @@ class BombermanGymEnv(gym.Env):
         self._output_layer_indices = (
             None if self._full_output else np.array(output_indices, dtype=np.int64)
         )
+        self._output_layers = np.array(output_indices, dtype=np.int64)
 
         self.n_observation_layers = NUM_LAYERS
         self.n_output_layers = len(output_indices)
@@ -576,8 +855,26 @@ class BombermanGymEnv(gym.Env):
         W, H = self.width, self.height
 
         self.grid_tensor = np.zeros((E, self.n_observation_layers, W, H), dtype=np.float32)
-        self._centered_tensor = np.zeros_like(self.grid_tensor)
         self._features = np.zeros((E, self.n_features), dtype=np.float32)
+        self._ax = np.zeros(E, dtype=np.int64)
+        self._ay = np.zeros(E, dtype=np.int64)
+        self._bombs_left = np.zeros(E, dtype=np.bool_)
+        self._opp_x = np.zeros((E, MAX_OPPONENTS), dtype=np.int64)
+        self._opp_y = np.zeros((E, MAX_OPPONENTS), dtype=np.int64)
+        self._opp_alive = np.zeros((E, MAX_OPPONENTS), dtype=np.bool_)
+        self._total_coins = np.zeros(E, dtype=np.float32)
+        self._escape_dummy = np.zeros(E, dtype=np.float32)
+        self._opp_bombs_left = np.zeros((E, MAX_OPPONENTS), dtype=np.bool_)
+        self._action_masks = np.ones((E, len(ACTIONS)), dtype=np.bool_)
+        self._masks_valid = False
+        self._state_packed = False
+        self._crates_left = np.zeros(E, dtype=np.int64)
+        self._coins_left = np.zeros(E, dtype=np.int64)
+        self._df_occ = np.zeros((E, W, H), dtype=np.bool_)
+        self._df_crate_targets = np.zeros((E, W, H), dtype=np.bool_)
+        self._df_coin_targets = np.zeros((E, W, H), dtype=np.bool_)
+        self._coin_index: List[Dict[Tuple[int, int], int]] = [{} for _ in range(E)]
+        self._fc_any_active = False
 
         self.rounds = np.zeros(E, dtype=np.int64)
         self.step_counts = np.zeros(E, dtype=np.int64)
@@ -764,6 +1061,8 @@ class BombermanGymEnv(gym.Env):
 
     def _new_round(self, env: int):
         """Reset one env's game state (per-env, cheap; heavy layers are refreshed batched)."""
+        self._masks_valid = False
+        self._state_packed = False
         self._reroll_opponents_and_scenario(env)
 
         self.rounds[env] += 1
@@ -781,6 +1080,7 @@ class BombermanGymEnv(gym.Env):
             self.coins_collectable[env, :n] = coins_collectable
         self.coins_xy[env, n:] = 0
         self.coins_collectable[env, n:] = False
+        self._coin_index[env] = {(int(x), int(y)): i for i, (x, y) in enumerate(coins_xy)}
 
         self._initial_crate_count[env] = int(np.sum(arena == 1))
         self._initial_coin_count[env] = int(sum(coins_collectable)) if n else 0
@@ -842,56 +1142,11 @@ class BombermanGymEnv(gym.Env):
             self._prev_bomb_danger[env] = self._bomb_danger_now(env)
             self._prev_trap_dist[env] = self._trapped_opponent_distance_now(env)
 
-    def _refresh_dynamic_layers(self):
-        gt = self.grid_tensor
-        BT = self._BT
-        gt[:, 4:_BASE_LAYERS].fill(0)
-
-        for env in range(self.n_envs):
-            g = gt[env]
-            agent = self.agents[env]
-            ax, ay = agent.x, agent.y
-            g[SELF_BLAST_LAYER] = self._blast_tensor[ax, ay]
-
-            for h in self.opponent_handles[env]:
-                if h.dead:
-                    continue
-                ex_, ey_ = h.x, h.y
-                g[OPPONENT_LAYER, ex_, ey_] = 1.0
-                g[OPPONENT_DANGER_LAYER] += self._blast_tensor[ex_, ey_]
-                g[BOMBS_LEFT_LAYER, ex_, ey_] = 1.0 if h.bombs_left else 0.0
-
-            g[OPPONENT_DANGER_LAYER] = np.where(g[OPPONENT_DANGER_LAYER] > 0, 1.0, 0.0)
-            g[BOMBS_LEFT_LAYER, ax, ay] = 1.0 if agent.bombs_left else 0.0
-
-            if self._enable_timer_channels:
-                for b in self.bombs[env]:
-                    pos_ch = 8 + b["timer"]
-                    danger_ch = 8 + BT + b["timer"]
-                    g[pos_ch, b["x"], b["y"]] = 1.0
-                    if self._fixes:
-                        np.maximum(g[danger_ch], self._blast_tensor[b["x"], b["y"]], out=g[danger_ch])
-                    else:
-                        g[danger_ch] = self._blast_tensor[b["x"], b["y"]]
-
-                for ex in self.explosions[env]:
-                    if ex["stage"] == 0:
-                        if self._fixes and ex["timer"] <= 1:
-                            continue
-                        ch = 7 + 2 * BT + ex["timer"]
-                        for (x, y) in ex["coords"]:
-                            g[ch, x, y] = 1.0
-
-    def _compute_forecasts(self):
-        """Batched fused danger/occupancy forecast for all envs at once."""
-        gt = self.grid_tensor
-        T = self._BT + self._ET
-
+    def _pack_bombs_and_explosions(self) -> None:
         bx, by, bt, bc = (self._fc_bomb_x, self._fc_bomb_y,
                           self._fc_bomb_timer, self._fc_bomb_counts)
         exx, exy, ext, exc = (self._fc_exp_x, self._fc_exp_y,
                               self._fc_exp_timer, self._fc_exp_counts)
-
         any_active = False
         for env in range(self.n_envs):
             bombs = self.bombs[env]
@@ -922,16 +1177,33 @@ class BombermanGymEnv(gym.Env):
 
             if nb or k:
                 any_active = True
+        self._fc_any_active = any_active
 
-        if not any_active:
+    def _refresh_dynamic_layers(self):
+        self._pack_agent_state()
+        self._pack_bombs_and_explosions()
+        _dynamic_layers_kernel(
+            self.grid_tensor, self._blast_tensor, self._ax, self._ay, self._bombs_left,
+            self._opp_x, self._opp_y, self._opp_alive, self._opp_bombs_left,
+            self._fc_bomb_x, self._fc_bomb_y, self._fc_bomb_timer, self._fc_bomb_counts,
+            self._fc_exp_x, self._fc_exp_y, self._fc_exp_timer, self._fc_exp_counts,
+            self._enable_timer_channels, self._fixes, self._BT, self.width, self.height, _BASE_LAYERS,
+        )
+
+    def _compute_forecasts(self):
+        """Batched fused danger/occupancy forecast for all envs at once."""
+        gt = self.grid_tensor
+        T = self._BT + self._ET
+
+        if not self._fc_any_active:
             gt[:, _DANGER_SLICE] = 0.0
             static = (self._wall_bool[None, :, :] | gt[:, CRATE_LAYER].astype(bool)).astype(np.float32)
             gt[:, _OCC_SLICE] = static[:, None, :, :]
             return
 
         _forecast_kernel(
-            bx, by, bt, bc, self._blast_tensor,
-            exx, exy, ext, exc,
+            self._fc_bomb_x, self._fc_bomb_y, self._fc_bomb_timer, self._fc_bomb_counts, self._blast_tensor,
+            self._fc_exp_x, self._fc_exp_y, self._fc_exp_timer, self._fc_exp_counts,
             self._wall_bool, gt[:, CRATE_LAYER].astype(bool),
             T, self._ET, gt[:, _DANGER_SLICE], gt[:, _OCC_SLICE], self._fixes,
         )
@@ -955,56 +1227,31 @@ class BombermanGymEnv(gym.Env):
         )
 
     def _compute_danger_summary(self):
-        gt = self.grid_tensor
-        stack = gt[:, _DANGER_SLICE]
-        ever = stack.any(axis=1)
-
-        onset = np.argmax(stack, axis=1)
-        gt[:, DANGER_ONSET_LAYER] = np.where(ever, onset, -1)
-
-        T = stack.shape[1]
-        last_from_end = np.argmax(stack[:, ::-1], axis=1)
-        gt[:, DANGER_CLEAR_LAYER] = np.where(ever, T - last_from_end, -1)
+        _danger_summary_kernel(
+            self.grid_tensor, DANGER_MAP_LAYERS[0], len(DANGER_MAP_LAYERS),
+            DANGER_ONSET_LAYER, DANGER_CLEAR_LAYER, self.width, self.height,
+        )
 
     def _compute_mobility(self):
-        gt = self.grid_tensor
-        free = 1.0 - gt[:, OCCUPIED_MAP_LAYERS[-1]]
-        m = np.zeros_like(free)
-        m[:, 1:, :] += free[:, :-1, :]
-        m[:, :-1, :] += free[:, 1:, :]
-        if not self._fixes:
-            m[:, 1:, :] += free[:, :-1, :]
-            m[:, :-1, :] += free[:, 1:, :]
-        m[:, :, 1:] += free[:, :, :-1]
-        m[:, :, :-1] += free[:, :, 1:]
-        gt[:, MOBILITY_LAYER] = m
-
-    def _multi_source_bfs(self, targets: np.ndarray, occ: np.ndarray, out: np.ndarray) -> None:
-        _multi_source_bfs_kernel(
-            np.ascontiguousarray(targets, dtype=np.bool_),
-            np.ascontiguousarray(occ, dtype=np.bool_),
-            self.width, self.height, out,
-            self._ms_bfs_qx, self._ms_bfs_qy,
+        _mobility_kernel(
+            self.grid_tensor, OCCUPIED_MAP_LAYERS[-1], MOBILITY_LAYER,
+            np.float32(1.0 if self._fixes else 2.0), self.width, self.height,
         )
 
     def _compute_distance_fields(self):
         if not (self._enable_crate_distance or self._enable_coin_distance):
             return
         gt = self.grid_tensor
-        occ_now = gt[:, OCCUPIED_MAP_LAYERS[0]].astype(bool)
-        blocked_targets = occ_now
-        if self._fixes:
-            blocked_targets = occ_now.copy()
-            for env, agent in enumerate(self.agents):
-                occ_now[env, agent.x, agent.y] = False
-
+        _distance_inputs_kernel(
+            gt, self._ax, self._ay, OCCUPIED_MAP_LAYERS[0], CRATE_POTENTIAL_LAYER, COIN_LAYER, self._fixes,
+            self._df_occ, self._df_crate_targets, self._df_coin_targets, self.width, self.height,
+        )
         if self._enable_crate_distance:
-            crate_targets = (gt[:, CRATE_POTENTIAL_LAYER] > 0) & ~blocked_targets
-            self._multi_source_bfs(crate_targets, occ_now, gt[:, CRATE_DISTANCE_LAYER])
-
+            _multi_source_bfs_kernel(self._df_crate_targets, self._df_occ, self.width, self.height,
+                                     gt[:, CRATE_DISTANCE_LAYER], self._ms_bfs_qx, self._ms_bfs_qy)
         if self._enable_coin_distance:
-            coin_targets = gt[:, COIN_LAYER].astype(bool)
-            self._multi_source_bfs(coin_targets, occ_now, gt[:, COIN_DISTANCE_LAYER])
+            _multi_source_bfs_kernel(self._df_coin_targets, self._df_occ, self.width, self.height,
+                                     gt[:, COIN_DISTANCE_LAYER], self._ms_bfs_qx, self._ms_bfs_qy)
 
     def _refresh_forecast_layers(self):
         """One batched pass of all forecast-related layers for all envs."""
@@ -1027,159 +1274,51 @@ class BombermanGymEnv(gym.Env):
             self._compute_mobility()
         self._compute_distance_fields()
 
-    def _get_centered_tensor(self) -> np.ndarray:
-        """Batched centering: (n_envs, L, W, H) with each env centered on its agent."""
-        out = self._centered_tensor
-        out.fill(0)
-        for env, agent in enumerate(self.agents):
-            dx = self.center_x - agent.x
-            dy = self.center_y - agent.y
-
-            src_x0 = max(0, -dx)
-            src_x1 = min(self.width, self.width - dx)
-            src_y0 = max(0, -dy)
-            src_y1 = min(self.height, self.height - dy)
-
-            dst_x0 = max(0, dx)
-            dst_x1 = dst_x0 + (src_x1 - src_x0)
-            dst_y0 = max(0, dy)
-            dst_y1 = dst_y0 + (src_y1 - src_y0)
-
-            out[env, :, dst_x0:dst_x1, dst_y0:dst_y1] = \
-                self.grid_tensor[env, :, src_x0:src_x1, src_y0:src_y1]
+    def _centered_observation(self) -> np.ndarray:
+        self._pack_agent_state()
+        out = np.empty((self.n_envs, self.n_output_layers, self.width, self.height), dtype=np.float32)
+        _center_normalize_kernel(
+            self.grid_tensor, self._ax, self._ay, self._output_layers, self.center_x, self.center_y,
+            self.width, self.height, self._T_HORIZON, self._CRATE_POTENTIAL_MAX, self._DIST_MAX, out,
+        )
         return out
 
-    def _normalize_observation(self, tensor: np.ndarray) -> np.ndarray:
-        T = self._T_HORIZON
-
-        for layer in (SELF_DISTANCE_LAYER, OPPONENTS_LEAST_DISTANCE_LAYER,
-                      DANGER_ONSET_LAYER, DANGER_CLEAR_LAYER):
-            raw = tensor[:, layer]
-            tensor[:, layer] = np.where(raw < 0, -1.0, raw / T)
-
-        tensor[:, CRATE_POTENTIAL_LAYER] = np.clip(
-            tensor[:, CRATE_POTENTIAL_LAYER] / self._CRATE_POTENTIAL_MAX, 0.0, 1.0
-        )
-
-        tensor[:, MOBILITY_LAYER] = tensor[:, MOBILITY_LAYER] / 4.0
-
-        for layer in (CRATE_DISTANCE_LAYER, COIN_DISTANCE_LAYER):
-            raw = tensor[:, layer]
-            tensor[:, layer] = np.where(
-                raw < 0, -1.0, np.clip(raw / self._DIST_MAX, 0.0, 1.0)
-            )
-
-        return tensor
-
-    def _select_output_layers(self, tensor: np.ndarray) -> np.ndarray:
-        if self._output_layer_indices is None:
-            return tensor
-        return tensor[:, self._output_layer_indices]
+    def _pack_agent_state(self) -> None:
+        if self._state_packed:
+            return
+        ax, ay, bombs_left = self._ax, self._ay, self._bombs_left
+        opp_x, opp_y, opp_alive, opp_bombs_left = self._opp_x, self._opp_y, self._opp_alive, self._opp_bombs_left
+        total_coins = self._total_coins
+        for env, agent in enumerate(self.agents):
+            ax[env] = agent.x
+            ay[env] = agent.y
+            bombs_left[env] = bool(agent.bombs_left)
+            for k, handle in enumerate(self.opponent_handles[env]):
+                opp_x[env, k] = handle.x
+                opp_y[env, k] = handle.y
+                opp_alive[env, k] = not handle.dead
+                opp_bombs_left[env, k] = bool(handle.bombs_left)
+            total_coins[env] = s.SCENARIOS[self.env_scenarios[env]]["COIN_COUNT"]
+        self._state_packed = True
 
     def _compute_global_features(self) -> np.ndarray:
-        E = self.n_envs
-        idx = np.arange(E)
-        gt = self.grid_tensor
-        f = self._features
-        W, H = self.width, self.height
-        agents = self.agents
-
-        ax = np.fromiter((a.x for a in agents), dtype=np.int64, count=E)
-        ay = np.fromiter((a.y for a in agents), dtype=np.int64, count=E)
-
-        f[:, FEATURE_SELF_X] = ax * (2.0 / max(W - 1, 1)) - 1.0
-        f[:, FEATURE_SELF_Y] = ay * (2.0 / max(H - 1, 1)) - 1.0
-        f[:, FEATURE_BOMBS_LEFT] = np.fromiter(
-            (1.0 if a.bombs_left else 0.0 for a in agents), np.float32, E)
-        f[:, FEATURE_STEP_PROGRESS] = self.step_counts / float(s.MAX_STEPS)
-
-        coin_d = gt[idx, COIN_DISTANCE_LAYER, ax, ay]
-        f[:, FEATURE_COIN_DISTANCE] = np.where(coin_d < 0, -1.0, coin_d / self._DIST_MAX)
-        crate_d = gt[idx, CRATE_DISTANCE_LAYER, ax, ay]
-        f[:, FEATURE_CRATE_DISTANCE] = np.where(crate_d < 0, -1.0, crate_d / self._DIST_MAX)
-        opp_d = gt[idx, OPPONENTS_LEAST_DISTANCE_LAYER, ax, ay]
-        f[:, FEATURE_OPPONENT_DISTANCE] = np.where(opp_d < 0, -1.0, opp_d / self._T_HORIZON)
-
-        onset = gt[idx, DANGER_ONSET_LAYER, ax, ay]
-        f[:, FEATURE_BOMB_DANGER] = np.where(onset < 0, 0.0, 1.0 / (1.0 + np.maximum(onset, 0.0)))
-        f[:, FEATURE_MOBILITY] = gt[idx, MOBILITY_LAYER, ax, ay] / 4.0
-
-        alive = np.fromiter(
-            (sum(1 for h in self.opponent_handles[env] if not h.dead)
-             for env in range(E)), np.float32, E)
-        f[:, FEATURE_OPPONENTS_ALIVE] = alive / float(MAX_OPPONENTS)
-
-        coins_left = self.coins_collectable.sum(axis=1)
-        if self._fixes:
-            total_coins = np.fromiter(
-                (s.SCENARIOS[self.env_scenarios[env]]["COIN_COUNT"] for env in range(E)), np.float32, E)
-            total_coins = np.maximum(total_coins, self._initial_coin_count)
-            f[:, FEATURE_COINS_REMAINING] = np.minimum(coins_left / np.maximum(total_coins, 1), 1.0)
-        else:
-            f[:, FEATURE_COINS_REMAINING] = coins_left / np.maximum(self._initial_coin_count, 1)
-        crates_left = (self.arena == 1).sum(axis=(1, 2))
-        f[:, FEATURE_CRATES_REMAINING] = crates_left / np.maximum(self._initial_crate_count, 1)
-
+        self._pack_agent_state()
+        ax, ay = self._ax, self._ay
+        escape = self._own_bomb_escape_tiles(ax, ay) if self._extra_features else self._escape_dummy
         step_idx = 0 if self._fixes else 1
-        occ1, dng1 = OCCUPIED_MAP_LAYERS[step_idx], DANGER_MAP_LAYERS[step_idx]
-
-        def _safe_dir(tx, ty):
-            valid = (tx >= 0) & (tx < W) & (ty >= 0) & (ty < H)
-            tx_c = np.clip(tx, 0, W - 1)
-            ty_c = np.clip(ty, 0, H - 1)
-            blocked = gt[idx, occ1, tx_c, ty_c] > 0
-            deadly = gt[idx, dng1, tx_c, ty_c] > 0
-            return (valid & ~blocked & ~deadly).astype(np.float32)
-
-        f[:, FEATURE_SAFE_UP] = _safe_dir(ax, ay - 1)
-        f[:, FEATURE_SAFE_RIGHT] = _safe_dir(ax + 1, ay)
-        f[:, FEATURE_SAFE_DOWN] = _safe_dir(ax, ay + 1)
-        f[:, FEATURE_SAFE_LEFT] = _safe_dir(ax - 1, ay)
-        if self._fixes:
-            f[:, FEATURE_SAFE_WAIT] = (gt[idx, dng1, ax, ay] <= 0).astype(np.float32)
-        else:
-            f[:, FEATURE_SAFE_WAIT] = _safe_dir(ax, ay)
-
-        f[:, FEATURE_SAFE_BOMB] = np.maximum(
-            np.maximum(f[:, FEATURE_SAFE_UP], f[:, FEATURE_SAFE_RIGHT]),
-            np.maximum(f[:, FEATURE_SAFE_DOWN], f[:, FEATURE_SAFE_LEFT]),
-        ) * f[:, FEATURE_BOMBS_LEFT]
-
-        f[:, FEATURE_BOMB_TARGET_VALUE] = np.clip(
-            gt[idx, CRATE_POTENTIAL_LAYER, ax, ay] / self._CRATE_POTENTIAL_MAX, 0.0, 1.0)
-        if self._fixes:
-            trap = np.full(E, -1.0, dtype=np.float32)
-            for env in range(E):
-                for h in self.opponent_handles[env]:
-                    if h.dead or gt[env, DANGER_ONSET_LAYER, h.x, h.y] < 0:
-                        continue
-                    d = gt[env, SELF_DISTANCE_LAYER, h.x, h.y]
-                    if d >= 0 and (trap[env] < 0 or d < trap[env]):
-                        trap[env] = d
-        else:
-            trap = gt[idx, OPPONENTS_LEAST_DISTANCE_LAYER, ax, ay]
-        f[:, FEATURE_TRAPPED_OPPONENT_DISTANCE] = np.where(
-            trap < 0, -1.0, trap / self._T_HORIZON)
-        if self._extra_features:
-            self._compute_extra_features(f, ax, ay)
-        return f
-
-    def _compute_extra_features(self, f: np.ndarray, ax: np.ndarray, ay: np.ndarray) -> None:
-        E = self.n_envs
-        escape = self._own_bomb_escape_tiles(ax, ay)
-        f[:, FEATURE_BOMB_ESCAPE_TILES] = np.minimum(escape, self._ESCAPE_TILES_MAX) / self._ESCAPE_TILES_MAX
-        f[:, FEATURE_SAFE_BOMB] = (escape > 0).astype(np.float32) * f[:, FEATURE_BOMBS_LEFT]
-
-        blast = self._blast_tensor[ax, ay] > 0
-        hits = np.zeros(E, dtype=np.float32)
-        for env in range(E):
-            for h in self.opponent_handles[env]:
-                if not h.dead and blast[env, h.x, h.y]:
-                    hits[env] += 1.0
-        f[:, FEATURE_BOMB_HITS_OPPONENTS] = hits / float(MAX_OPPONENTS)
-
-        self._direction_features(f, COIN_DISTANCE_LAYER, COIN_DIRECTION_FEATURES, ax, ay)
-        self._direction_features(f, CRATE_DISTANCE_LAYER, CRATE_DIRECTION_FEATURES, ax, ay)
+        _features_masks_kernel(
+            self.grid_tensor, ax, ay, self._bombs_left, self.step_counts, self._opp_x, self._opp_y, self._opp_alive,
+            self.coins_collectable, self._total_coins, self._initial_coin_count, self._initial_crate_count,
+            self.arena, self._blast_tensor, escape,
+            self.width, self.height, self._DIST_MAX, self._T_HORIZON, self._CRATE_POTENTIAL_MAX, self._ESCAPE_TILES_MAX,
+            float(s.MAX_STEPS), MAX_OPPONENTS, self._fixes, self._extra_features,
+            COIN_DISTANCE_LAYER, CRATE_DISTANCE_LAYER, OPPONENTS_LEAST_DISTANCE_LAYER, DANGER_ONSET_LAYER, MOBILITY_LAYER,
+            CRATE_POTENTIAL_LAYER, SELF_DISTANCE_LAYER,
+            OCCUPIED_MAP_LAYERS[step_idx], DANGER_MAP_LAYERS[step_idx], OCCUPIED_MAP_LAYERS[0], DANGER_MAP_LAYERS[0],
+            self._features, self._action_masks, self._crates_left, self._coins_left,
+        )
+        self._masks_valid = True
+        return self._features
 
     def _own_bomb_escape_tiles(self, ax: np.ndarray, ay: np.ndarray) -> np.ndarray:
         gt = self.grid_tensor
@@ -1189,23 +1328,11 @@ class BombermanGymEnv(gym.Env):
             self._escape_visited, self._ta_bfs_qx, self._ta_bfs_qy, self._ta_bfs_qt,
         ).astype(np.float32)
 
-    def _direction_features(self, f: np.ndarray, layer: int, features, ax: np.ndarray, ay: np.ndarray) -> None:
-        gt = self.grid_tensor
-        W, H = self.width, self.height
-        idx = np.arange(self.n_envs)
-        here = gt[idx, layer, ax, ay]
-        for feature, (dx, dy) in zip(features, ((0, -1), (1, 0), (0, 1), (-1, 0))):
-            tx, ty = ax + dx, ay + dy
-            valid = (tx >= 0) & (tx < W) & (ty >= 0) & (ty < H)
-            there = gt[idx, layer, np.clip(tx, 0, W - 1), np.clip(ty, 0, H - 1)]
-            f[:, feature] = (valid & (here >= 0) & (there >= 0) & (there < here)).astype(np.float32)
-
     def _build_observation(self) -> Dict[str, np.ndarray]:
-        grid_tensor = self._normalize_observation(self._get_centered_tensor())
-        grid_tensor = self._select_output_layers(grid_tensor)
+        grid_tensor = self._centered_observation()
         features = self._compute_global_features()
         return {
-            "grid_tensor": grid_tensor.copy() if self._full_output else grid_tensor,
+            "grid_tensor": grid_tensor,
             "features": features.copy(),
         }
 
@@ -1265,7 +1392,8 @@ class BombermanGymEnv(gym.Env):
         self._opponent_resampler = resampler
         preload = getattr(resampler, "preload", None)
         if preload is not None:
-            preload()
+            in_use = [getattr(act_fn, "__self__", None) for act_fns in self.opponent_act_fns for act_fn in act_fns]
+            preload([owner for owner in in_use if owner is not None])
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -1363,12 +1491,14 @@ class BombermanGymEnv(gym.Env):
     def _nothing_left_for_sole_survivor(self, env: int) -> bool:
         if self.agents[env].dead or any(not h.dead for h in self.opponent_handles[env]):
             return False
-        if np.any(self.arena[env] == 1) or np.any(self.coins_collectable[env]):
+        if self._crates_left[env] > 0 or self._coins_left[env] > 0:
             return False
         return not self.bombs[env] and not self.explosions[env]
 
     def _advance(self, env: int, action: int):
         """Game logic for one env (the Python-heavy, but cheap, part)."""
+        self._masks_valid = False
+        self._state_packed = False
         self.step_counts[env] += 1
 
         shared = None
@@ -1524,6 +1654,8 @@ class BombermanGymEnv(gym.Env):
         self.coins_collectable = new_collectable
 
     def _load_game_state(self, game_state: dict, env: int = 0) -> None:
+        self._masks_valid = False
+        self._state_packed = False
         prev_round = int(self.rounds[env])
         new_round = int(game_state.get("round", prev_round))
         new_step = int(game_state.get("step", self.step_counts[env]))
@@ -1573,6 +1705,7 @@ class BombermanGymEnv(gym.Env):
             self.coins_xy[env, :len(coins)] = coins
             self.coins_collectable[env, :len(coins)] = True
         self.coins_collectable[env, len(coins):] = False
+        self._coin_index[env] = {(int(x), int(y)): i for i, (x, y) in enumerate(coins)}
 
         is_new_round = (new_round != prev_round) or (new_step <= 1)
         if is_new_round:
@@ -1761,24 +1894,16 @@ class BombermanGymEnv(gym.Env):
             agent.add_event(e.INVALID_ACTION)
 
     def _collect_coins(self, env: int):
-        n = self.n_coins[env]
-        collectable_idx = np.nonzero(self.coins_collectable[env, :n])[0]
-        if len(collectable_idx) == 0 or not self.active_agents[env]:
+        index = self._coin_index[env]
+        if not index:
             return
-        active_pos = np.array([[a.x, a.y] for a in self.active_agents[env]], dtype=np.int64)
-        coin_pos = self.coins_xy[env, collectable_idx]
-        eq = (coin_pos[:, None, :] == active_pos[None, :, :]).all(-1)
-        hit_coin, hit_agent = np.nonzero(eq)
-        seen = set()
-        for ci_local, ai in zip(hit_coin, hit_agent):
-            ci = int(collectable_idx[ci_local])
-            if ci in seen:
+        collectable = self.coins_collectable[env]
+        for handle in self.active_agents[env]:
+            ci = index.get((handle.x, handle.y))
+            if ci is None or not collectable[ci]:
                 continue
-            seen.add(ci)
-            cx, cy = self.coins_xy[env, ci]
-            handle = self.active_agents[env][int(ai)]
-            self.coins_collectable[env, ci] = False
-            self.grid_tensor[env, COIN_LAYER, cx, cy] = 0.0
+            collectable[ci] = False
+            self.grid_tensor[env, COIN_LAYER, handle.x, handle.y] = 0.0
             handle.update_score(s.REWARD_COIN)
             handle.add_event(e.COIN_COLLECTED)
 
@@ -1987,30 +2112,6 @@ class BombermanGymEnv(gym.Env):
         Returns a boolean array of shape (n_envs, 6) indicating which actions
         are valid. the policy will use this to prevent illegal moves.
         """
-        E = self.n_envs
-        W, H = self.width, self.height
-        gt = self.grid_tensor
-
-        masks = np.ones((E, len(ACTIONS)), dtype=np.bool_)
-
-        ax = np.fromiter((a.x for a in self.agents), dtype=np.int64, count=E)
-        ay = np.fromiter((a.y for a in self.agents), dtype=np.int64, count=E)
-
-        occ_layer = gt[:, OCCUPIED_MAP_LAYERS[0]] > 0
-        dng_layer = gt[:, DANGER_MAP_LAYERS[0]] > 0
-
-        def is_blocked(dx, dy):
-            tx = np.clip(ax + dx, 0, W - 1)
-            ty = np.clip(ay + dy, 0, H - 1)
-            oob = (ax + dx < 0) | (ax + dx >= W) | (ay + dy < 0) | (ay + dy >= H)
-            return oob | occ_layer[np.arange(E), tx, ty] | dng_layer[np.arange(E), tx, ty]
-
-        masks[:, ACTION_INDICES["UP"]] = ~is_blocked(0, -1)
-        masks[:, ACTION_INDICES["DOWN"]] = ~is_blocked(0, 1)
-        masks[:, ACTION_INDICES["LEFT"]] = ~is_blocked(-1, 0)
-        masks[:, ACTION_INDICES["RIGHT"]] = ~is_blocked(1, 0)
-
-        bombs_left = np.fromiter((a.bombs_left for a in self.agents), dtype=np.bool_, count=E)
-        masks[:, ACTION_INDICES["BOMB"]] = bombs_left
-
-        return masks
+        if not self._masks_valid:
+            self._compute_global_features()
+        return self._action_masks.copy()
