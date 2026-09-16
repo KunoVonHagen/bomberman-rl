@@ -153,6 +153,8 @@ class RewardConfig:
     opponent_eliminated: float = 0.0
     survived_round: float = 0.0
 
+    rival_killed_opponent: float = -2.0
+
     coin_shaping_coef: float = 0.05
     crate_shaping_coef: float = 0.02
     danger_penalty_coef: float = 0.05
@@ -257,6 +259,7 @@ class TrainingConfig:
         "rewards.got_killed",
         "rewards.opponent_eliminated",
         "rewards.survived_round",
+        "rewards.rival_killed_opponent",
         "rewards.coin_shaping_coef",
         "rewards.crate_shaping_coef",
         "rewards.danger_penalty_coef",

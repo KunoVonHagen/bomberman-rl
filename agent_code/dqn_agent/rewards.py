@@ -1,5 +1,7 @@
 import events as e
 
+RIVAL_KILLED_OPPONENT = "RIVAL_KILLED_OPPONENT"
+
 SIMPLE_EVENT_REWARDS = {
     e.MOVED_LEFT: 0,
     e.MOVED_RIGHT: 0,
@@ -21,6 +23,8 @@ SIMPLE_EVENT_REWARDS = {
     e.GOT_KILLED: 0,
     e.OPPONENT_ELIMINATED: 0,
     e.SURVIVED_ROUND: 0,
+
+    RIVAL_KILLED_OPPONENT: 0,
 }
 
 EVENT_REWARDS = {
@@ -44,6 +48,8 @@ EVENT_REWARDS = {
     e.GOT_KILLED: -5.0,
     e.OPPONENT_ELIMINATED: 0,
     e.SURVIVED_ROUND: 0.0,
+
+    RIVAL_KILLED_OPPONENT: -2.0,
 }
 
 COIN_SHAPING_COEF = 0.05
@@ -76,4 +82,6 @@ def build_event_rewards(cfg) -> dict:
         e.GOT_KILLED: cfg.got_killed,
         e.OPPONENT_ELIMINATED: cfg.opponent_eliminated,
         e.SURVIVED_ROUND: cfg.survived_round,
+
+        RIVAL_KILLED_OPPONENT: cfg.rival_killed_opponent,
     }
