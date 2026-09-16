@@ -247,6 +247,13 @@ def resolve_layer_groups(requested: Optional[Iterable[str]]) -> Set[str]:
     return resolved
 
 
+def observation_shapes(layer_config: Optional[Iterable[str]], env_version: int) -> Tuple[Tuple[int, int, int], int]:
+    groups = resolve_layer_groups(layer_config)
+    n_layers = len(sorted(idx for g in groups for idx in LAYER_GROUPS[g]))
+    n_features = NUM_FEATURES if int(env_version) >= 3 else NUM_FEATURES_V2
+    return (n_layers, s.COLS, s.ROWS), n_features
+
+
 @njit(cache=True)
 def _time_aware_bfs_kernel(starts, start_counts, occ, danger, W, H, T, dist, visited, qx, qy, qt, fixes):
     """Batched time-aware BFS for reachability and danger propagation."""

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import ctypes
 import multiprocessing as mp
 import os
 import pathlib
@@ -17,7 +18,7 @@ from environment import WorldArgs
 
 from .config import DEFAULT_CONFIG, TrainingConfig, DQNConfig, RewardConfig, load_overrides_file
 from .checkpoint_manager import CheckpointManager
-from .gym_environment import BombermanGymEnv
+from .gym_environment import ACTIONS, BombermanGymEnv, observation_shapes
 from .model import BombermanFeatureExtractor, MaskableDQN
 from .opponent_pool import OpponentPool, OpponentSampler
 from .schedules import LinearSchedule
@@ -162,8 +163,62 @@ def _concat_obs(obs_list: list) -> dict:
 _WORKER_THREAD_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMBA_NUM_THREADS")
 
 
+def _start_single_threaded(process) -> None:
+    saved = {name: os.environ.get(name) for name in _WORKER_THREAD_VARS}
+    os.environ.update({name: "1" for name in _WORKER_THREAD_VARS})
+    try:
+        process.start()
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+class SharedStepBuffers:
+    def __init__(self, ctx, n_envs: int, grid_shape: tuple, n_features: int, n_actions: int):
+        self.n_envs = int(n_envs)
+        self.grid_shape = tuple(int(x) for x in grid_shape)
+        self.n_features = int(n_features)
+        self.n_actions = int(n_actions)
+        cells = 2 * self.n_envs
+        self.raw = {
+            "grid": ctx.RawArray(ctypes.c_float, cells * int(np.prod(self.grid_shape))),
+            "features": ctx.RawArray(ctypes.c_float, cells * self.n_features),
+            "rewards": ctx.RawArray(ctypes.c_float, cells),
+            "terminated": ctx.RawArray(ctypes.c_bool, cells),
+            "truncated": ctx.RawArray(ctypes.c_bool, cells),
+            "masks": ctx.RawArray(ctypes.c_bool, cells * self.n_actions),
+        }
+
+    def views(self) -> dict:
+        def view(name, dtype, shape):
+            return np.frombuffer(self.raw[name], dtype=dtype).reshape((2, self.n_envs) + shape)
+
+        return {
+            "grid": view("grid", np.float32, self.grid_shape),
+            "features": view("features", np.float32, (self.n_features,)),
+            "rewards": view("rewards", np.float32, ()),
+            "terminated": view("terminated", np.bool_, ()),
+            "truncated": view("truncated", np.bool_, ()),
+            "masks": view("masks", np.bool_, (self.n_actions,)),
+        }
+
+    def check(self, observation_space, action_space) -> None:
+        grid_shape = tuple(observation_space["grid_tensor"].shape)
+        n_features = int(observation_space["features"].shape[0])
+        if grid_shape != self.grid_shape or n_features != self.n_features or int(action_space.n) != self.n_actions:
+            raise RuntimeError(
+                f"shared step buffers were sized for grid {self.grid_shape}, {self.n_features} features, "
+                f"{self.n_actions} actions but the shard reports grid {grid_shape}, {n_features} features, "
+                f"{int(action_space.n)} actions"
+            )
+
+
 def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, layer_config,
-                   shard_n_envs: int, reward_config: Optional[RewardConfig] = None, env_version: int = 1):
+                   shard_n_envs: int, reward_config: Optional[RewardConfig] = None, env_version: int = 1,
+                   shared: Optional[SharedStepBuffers] = None, shard_index: int = 0):
     """Run a single shard's BombermanGymEnv, serving commands from the parent process."""
     parent_remote.close()
     torch.set_num_threads(1)
@@ -173,6 +228,8 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
         world_args, opponents=opponents, layer_config=layer_config,
         n_envs=shard_n_envs, reward_config=reward_config, env_version=env_version,
     )
+    views = shared.views()
+    lo, hi = shard_index * shard_n_envs, (shard_index + 1) * shard_n_envs
 
     while True:
         try:
@@ -181,8 +238,15 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
             break
 
         if cmd == "step":
-            obs, rewards, terminated, truncated, infos, masks = env.step(data)
-            remote.send((obs, rewards, terminated, truncated, infos, masks))
+            slot, actions = data
+            obs, rewards, terminated, truncated, infos, masks = env.step(actions)
+            views["grid"][slot, lo:hi] = obs["grid_tensor"]
+            views["features"][slot, lo:hi] = obs["features"]
+            views["rewards"][slot, lo:hi] = rewards
+            views["terminated"][slot, lo:hi] = terminated
+            views["truncated"][slot, lo:hi] = truncated
+            views["masks"][slot, lo:hi] = masks
+            remote.send(infos)
         elif cmd == "reset":
             seed, options = data
             obs, infos, masks = env.reset(seed=seed, options=options)
@@ -221,8 +285,10 @@ class ShardedNativeBatchedVecEnv:
         self._cfg = cfg
 
         ctx = mp.get_context("spawn")
-        saved_thread_vars = {name: os.environ.get(name) for name in _WORKER_THREAD_VARS}
-        os.environ.update({name: "1" for name in _WORKER_THREAD_VARS})
+        grid_shape, n_features = observation_shapes(cfg.env.layer_config, cfg.env.env_version)
+        self._shared = SharedStepBuffers(ctx, cfg.n_envs, grid_shape, n_features, len(ACTIONS))
+        self._views = self._shared.views()
+        self._slot = 1
         self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(n_shards)])
         self.processes = []
         for i, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
@@ -246,20 +312,16 @@ class ShardedNativeBatchedVecEnv:
             p = ctx.Process(
                 target=_shard_worker,
                 args=(work_remote, remote, world_args_kwargs, opponents, e.layer_config,
-                      self.shard_size, cfg.rewards, e.env_version),
+                      self.shard_size, cfg.rewards, e.env_version, self._shared, i),
                 daemon=True,
             )
-            p.start()
+            _start_single_threaded(p)
             self.processes.append(p)
             work_remote.close()
-        for name, value in saved_thread_vars.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
 
         self.remotes[0].send(("get_spaces", None))
         self.single_observation_space, self.single_action_space = self.remotes[0].recv()
+        self._shared.check(self.single_observation_space, self.single_action_space)
         self._last_infos: list[dict] = []
         self._last_action_masks: Optional[np.ndarray] = None
 
@@ -273,26 +335,23 @@ class ShardedNativeBatchedVecEnv:
         return _concat_obs(list(obs_list))
 
     def step_async(self, actions: np.ndarray) -> None:
+        self._slot ^= 1
         shards = np.split(np.asarray(actions), self.n_shards)
         for remote, shard_actions in zip(self.remotes, shards):
-            remote.send(("step", shard_actions))
+            remote.send(("step", (self._slot, shard_actions)))
 
     def step(self, actions: np.ndarray):
         self.step_async(actions)
         return self.step_wait()
 
     def step_wait(self):
-        results = [remote.recv() for remote in self.remotes]
-        obs_list, rew_list, term_list, trunc_list, info_lists, mask_list = zip(*results)
-
-        obs = _concat_obs(list(obs_list))
-        rewards = np.concatenate(rew_list, axis=0)
-        terminated = np.concatenate(term_list, axis=0)
-        truncated = np.concatenate(trunc_list, axis=0)
-        dones = terminated | truncated
-        infos = [info for infos in info_lists for info in infos]
+        infos = [info for remote in self.remotes for info in remote.recv()]
+        slot, views = self._slot, self._views
+        obs = {"grid_tensor": views["grid"][slot], "features": views["features"][slot]}
+        rewards = views["rewards"][slot].copy()
+        dones = views["terminated"][slot] | views["truncated"][slot]
         self._last_infos = infos
-        self._last_action_masks = np.concatenate(mask_list, axis=0)
+        self._last_action_masks = views["masks"][slot].copy()
         return obs, rewards, dones, infos
 
     def close(self) -> None:

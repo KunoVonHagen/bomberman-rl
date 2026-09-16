@@ -240,6 +240,10 @@ class TrainingConfig:
     n_demonstration_episodes: int = 50
     save_every_timesteps: int = 1_048_576
     eval_every_save: bool = True
+    eval_suite_episodes: int = 10
+    eval_suite_workers: int = 1
+    eval_suite_background: bool = True
+    eval_suite_replays: bool = False
 
     resume_from: Optional[str] = None
     resume_checkpoint: Optional[str] = None
@@ -253,6 +257,10 @@ class TrainingConfig:
         "total_timesteps",
         "save_every_timesteps",
         "eval_every_save",
+        "eval_suite_episodes",
+        "eval_suite_workers",
+        "eval_suite_background",
+        "eval_suite_replays",
         "device",
         "n_envs",
         "n_shards",

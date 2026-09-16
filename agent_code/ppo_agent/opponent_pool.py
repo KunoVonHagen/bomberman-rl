@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from sb3_contrib import MaskablePPO
+from sb3_contrib.common.maskable.buffers import MaskableDictRolloutBuffer
 
 from .config import EnvConfig, SelfPlayConfig, OpponentArrangement, ScenarioArrangement
 from .checkpoint_manager import CheckpointManager
@@ -58,7 +59,7 @@ class _CheckpointOpponent:
                 self._model = MaskablePPO.load(
                     self.model_path,
                     device="cpu",
-                    custom_objects={"n_envs": 1, "n_steps": 1},
+                    custom_objects={"n_envs": 1, "n_steps": 1, "rollout_buffer_class": MaskableDictRolloutBuffer},
                 )
                 _MODEL_CACHE[self.model_path] = self._model
         if self._action_names is None:

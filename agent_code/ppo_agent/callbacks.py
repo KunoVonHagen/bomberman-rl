@@ -11,6 +11,7 @@ from typing import Optional
 import numpy as np
 import torch
 from sb3_contrib import MaskablePPO
+from sb3_contrib.common.maskable.buffers import MaskableDictRolloutBuffer
 
 import settings as s
 from .config import TrainingConfig
@@ -96,6 +97,7 @@ def _load_model(checkpoint_dir: pathlib.Path, cfg: TrainingConfig) -> MaskablePP
         custom_objects={
             "n_envs": 1,
             "n_steps": 1,
+            "rollout_buffer_class": MaskableDictRolloutBuffer,
             "policy_kwargs": dict(
                 features_extractor_class=BombermanFeatureExtractor,
                 features_extractor_kwargs=dict(dropout=cfg.ppo.dropout),

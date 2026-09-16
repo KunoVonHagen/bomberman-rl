@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import ctypes
 import multiprocessing as mp
 import os
 import pathlib
@@ -12,6 +13,7 @@ from typing import Optional
 import numpy as np
 import torch
 from sb3_contrib import MaskablePPO
+from sb3_contrib.common.maskable.buffers import MaskableDictRolloutBuffer
 from sb3_contrib.common.maskable.utils import get_action_masks
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.utils import get_schedule_fn
@@ -19,7 +21,7 @@ from stable_baselines3.common.vec_env import VecEnv, VecMonitor
 
 from environment import WorldArgs
 
-from .gym_environment import BombermanGymEnv
+from .gym_environment import ACTIONS, BombermanGymEnv, observation_shapes
 from .model import BombermanFeatureExtractor
 from .config import (
     DEFAULT_CONFIG,
@@ -29,6 +31,7 @@ from .config import (
     load_overrides_file,
 )
 from .checkpoint_manager import CheckpointManager
+from .rollout_buffer import PinnedMaskableDictRolloutBuffer
 from .symmetry import augment_rollout_buffer
 from .opponent_pool import OpponentPool, OpponentSampler
 from .training_schedule import DEFAULT_SCHEDULE, load_schedule
@@ -191,8 +194,62 @@ class NativeBatchedVecEnv(VecEnv):
 _WORKER_THREAD_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMBA_NUM_THREADS")
 
 
+def _start_single_threaded(process) -> None:
+    saved = {name: os.environ.get(name) for name in _WORKER_THREAD_VARS}
+    os.environ.update({name: "1" for name in _WORKER_THREAD_VARS})
+    try:
+        process.start()
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+class SharedStepBuffers:
+    def __init__(self, ctx, n_envs: int, grid_shape: tuple, n_features: int, n_actions: int):
+        self.n_envs = int(n_envs)
+        self.grid_shape = tuple(int(x) for x in grid_shape)
+        self.n_features = int(n_features)
+        self.n_actions = int(n_actions)
+        cells = 2 * self.n_envs
+        self.raw = {
+            "grid": ctx.RawArray(ctypes.c_float, cells * int(np.prod(self.grid_shape))),
+            "features": ctx.RawArray(ctypes.c_float, cells * self.n_features),
+            "rewards": ctx.RawArray(ctypes.c_float, cells),
+            "terminated": ctx.RawArray(ctypes.c_bool, cells),
+            "truncated": ctx.RawArray(ctypes.c_bool, cells),
+            "masks": ctx.RawArray(ctypes.c_bool, cells * self.n_actions),
+        }
+
+    def views(self) -> dict:
+        def view(name, dtype, shape):
+            return np.frombuffer(self.raw[name], dtype=dtype).reshape((2, self.n_envs) + shape)
+
+        return {
+            "grid": view("grid", np.float32, self.grid_shape),
+            "features": view("features", np.float32, (self.n_features,)),
+            "rewards": view("rewards", np.float32, ()),
+            "terminated": view("terminated", np.bool_, ()),
+            "truncated": view("truncated", np.bool_, ()),
+            "masks": view("masks", np.bool_, (self.n_actions,)),
+        }
+
+    def check(self, observation_space, action_space) -> None:
+        grid_shape = tuple(observation_space["grid_tensor"].shape)
+        n_features = int(observation_space["features"].shape[0])
+        if grid_shape != self.grid_shape or n_features != self.n_features or int(action_space.n) != self.n_actions:
+            raise RuntimeError(
+                f"shared step buffers were sized for grid {self.grid_shape}, {self.n_features} features, "
+                f"{self.n_actions} actions but the shard reports grid {grid_shape}, {n_features} features, "
+                f"{int(action_space.n)} actions"
+            )
+
+
 def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, layer_config,
-                   shard_n_envs: int, reward_config: Optional[RewardConfig] = None, env_version: int = 1):
+                   shard_n_envs: int, reward_config: Optional[RewardConfig] = None, env_version: int = 1,
+                   shared: Optional[SharedStepBuffers] = None, shard_index: int = 0):
     """
     Worker function for a single shard process.
     It creates a BombermanGymEnv with the given world_args and handles commands from the parent process via the remote pipe.
@@ -209,6 +266,8 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
         world_args, opponents=opponents, layer_config=layer_config,
         n_envs=shard_n_envs, reward_config=reward_config, env_version=env_version,
     )
+    views = shared.views()
+    lo, hi = shard_index * shard_n_envs, (shard_index + 1) * shard_n_envs
 
     while True:
         try:
@@ -217,8 +276,15 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
             break
 
         if cmd == "step":
-            obs, rewards, terminated, truncated, infos = env.step(data)
-            remote.send((obs, rewards, terminated, truncated, infos))
+            slot, actions = data
+            obs, rewards, terminated, truncated, infos = env.step(actions)
+            views["grid"][slot, lo:hi] = obs["grid_tensor"]
+            views["features"][slot, lo:hi] = obs["features"]
+            views["rewards"][slot, lo:hi] = rewards
+            views["terminated"][slot, lo:hi] = terminated
+            views["truncated"][slot, lo:hi] = truncated
+            views["masks"][slot, lo:hi] = env.action_masks()
+            remote.send(infos)
         elif cmd == "reset":
             seed, options = data
             obs, infos = env.reset(seed=seed, options=options)
@@ -264,8 +330,11 @@ class ShardedNativeBatchedVecEnv(VecEnv):
         self._cfg = cfg
 
         ctx = mp.get_context("spawn")
-        saved_thread_vars = {name: os.environ.get(name) for name in _WORKER_THREAD_VARS}
-        os.environ.update({name: "1" for name in _WORKER_THREAD_VARS})
+        grid_shape, n_features = observation_shapes(cfg.env.layer_config, cfg.env.env_version)
+        self._shared = SharedStepBuffers(ctx, cfg.n_envs, grid_shape, n_features, len(ACTIONS))
+        self._views = self._shared.views()
+        self._slot = 1
+        self._last_action_masks: Optional[np.ndarray] = None
         self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(n_shards)])
         self.processes = []
         for i, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
@@ -289,20 +358,16 @@ class ShardedNativeBatchedVecEnv(VecEnv):
             p = ctx.Process(
                 target=_shard_worker,
                 args=(work_remote, remote, world_args_kwargs, opponents, e.layer_config,
-                      self.shard_size, cfg.rewards, e.env_version),
+                      self.shard_size, cfg.rewards, e.env_version, self._shared, i),
                 daemon=True,
             )
-            p.start()
+            _start_single_threaded(p)
             self.processes.append(p)
             work_remote.close()
-        for name, value in saved_thread_vars.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
 
         self.remotes[0].send(("get_spaces", None))
         obs_space, act_space = self.remotes[0].recv()
+        self._shared.check(obs_space, act_space)
 
         super().__init__(num_envs=cfg.n_envs, observation_space=obs_space, action_space=act_space)
         self._actions = None
@@ -313,25 +378,23 @@ class ShardedNativeBatchedVecEnv(VecEnv):
         results = [remote.recv() for remote in self.remotes]
         obs_list, info_lists = zip(*results)
         self._last_infos = [info for infos in info_lists for info in infos]
+        self._last_action_masks = None
         return _concat_obs(list(obs_list))
 
     def step_async(self, actions: np.ndarray) -> None:
-        self._actions = actions
+        self._slot ^= 1
+        shards = np.split(np.asarray(actions), self.n_shards)
+        for remote, shard_actions in zip(self.remotes, shards):
+            remote.send(("step", (self._slot, shard_actions)))
 
     def step_wait(self):
-        shards = np.split(np.asarray(self._actions), self.n_shards)
-        for remote, shard_actions in zip(self.remotes, shards):
-            remote.send(("step", shard_actions))
-        results = [remote.recv() for remote in self.remotes]
-        obs_list, rew_list, term_list, trunc_list, info_lists = zip(*results)
-
-        obs = _concat_obs(list(obs_list))
-        rewards = np.concatenate(rew_list, axis=0)
-        terminated = np.concatenate(term_list, axis=0)
-        truncated = np.concatenate(trunc_list, axis=0)
-        dones = terminated | truncated
-        infos = [info for infos in info_lists for info in infos]
+        infos = [info for remote in self.remotes for info in remote.recv()]
+        slot, views = self._slot, self._views
+        obs = {"grid_tensor": views["grid"][slot], "features": views["features"][slot]}
+        rewards = views["rewards"][slot].copy()
+        dones = views["terminated"][slot] | views["truncated"][slot]
         self._last_infos = infos
+        self._last_action_masks = views["masks"][slot].copy()
         return obs, rewards, dones, infos
 
     def step(self, actions: np.ndarray):
@@ -348,11 +411,16 @@ class ShardedNativeBatchedVecEnv(VecEnv):
             p.join(timeout=5)
 
     def action_masks(self) -> np.ndarray:
+        if self._last_action_masks is not None:
+            return self._last_action_masks
         for remote in self.remotes:
             remote.send(("action_masks", None))
         return np.concatenate([remote.recv() for remote in self.remotes], axis=0)
 
     def env_method(self, method_name: str, *args, indices=None, **kwargs) -> list:
+        if method_name == "action_masks" and not args and not kwargs and self._last_action_masks is not None:
+            per_env = list(self._last_action_masks)
+            return [per_env[i] for i in indices] if indices is not None else per_env
         for remote in self.remotes:
             remote.send(("env_method", (method_name, args, kwargs)))
         results = [remote.recv() for remote in self.remotes]
@@ -421,8 +489,8 @@ def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
     return VecMonitor(vec_env, filename=None)
 
 
-def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str) -> NativeBatchedVecEnv:
-    world_args = build_world_args(cfg, log_dir, save_replay=True, replay_path=replay_path)
+def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str | None) -> NativeBatchedVecEnv:
+    world_args = build_world_args(cfg, log_dir, save_replay=replay_path is not None, replay_path=replay_path)
 
     env = BombermanGymEnv(
         world_args,
@@ -461,6 +529,7 @@ def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str, device: 
         tensorboard_log=tensorboard_log,
         verbose=1,
         device=device,
+        rollout_buffer_class=PinnedMaskableDictRolloutBuffer,
         learning_rate=cfg.ppo.learning_rate,
         n_steps=cfg.ppo.n_steps,
         batch_size=cfg.ppo.batch_size,
@@ -696,13 +765,14 @@ def play_test_game(
     model,
     cfg: TrainingConfig,
     opponents,
-    ckman: CheckpointManager,
+    replays_dir: pathlib.Path,
+    logs_dir: pathlib.Path,
     timesteps_done: int,
 ) -> None:
     match_name = cfg.env.match_name or "match"
-    replay_path = ckman.replays_dir / f"{match_name}_{timesteps_done:010d}.pkl"
+    replay_path = pathlib.Path(replays_dir) / f"{match_name}_{timesteps_done:010d}.pkl"
 
-    test_env = make_test_env(cfg, opponents, str(ckman.logs_dir), str(replay_path))
+    test_env = make_test_env(cfg, opponents, str(logs_dir), str(replay_path))
 
     obs = test_env.reset()
     done = False
@@ -715,8 +785,8 @@ def play_test_game(
         done = dones[0]
     test_env.close()
     print(f"Eval game finished at {timesteps_done} timesteps, score={info[0]['score']}, "
-          f"alive={info[0]['alive']}, total_reward={total_reward}")
-    print(f"Saved eval replay -> {replay_path}")
+          f"alive={info[0]['alive']}, total_reward={total_reward}", flush=True)
+    print(f"Saved eval replay -> {replay_path}", flush=True)
 
 
 EVAL_SUITE_BOTS = [
@@ -733,76 +803,197 @@ EVAL_SUITE_GENERALIZATION_CASES: list[tuple[str, int]] = [
 ]
 
 
-def run_eval_suite(
-    model,
+def eval_suite_cases(
     cfg: TrainingConfig,
-    ckman: CheckpointManager,
-    timesteps_done: int,
-    n_episodes: int = 10,
     bot_paths: list[str] | None = None,
     generalization_cases: list[tuple[str, int]] | None = None,
     generalization_opponent: str = "agent_code.rule_based_agent.callbacks",
+) -> list[dict]:
+    bot_paths = bot_paths if bot_paths is not None else EVAL_SUITE_BOTS
+    generalization_cases = (
+        generalization_cases if generalization_cases is not None else EVAL_SUITE_GENERALIZATION_CASES
+    )
+    cases = []
+    for bot_path in bot_paths:
+        short = bot_path.split(".")[1]
+        cases.append(dict(key=bot_path, opponent=bot_path, n_opponents=3, scenario=cfg.env.scenario, tag=short,
+                          label=f"vs {short} ({cfg.env.scenario}, 3 opp)"))
+    for scenario, n_opponents in generalization_cases:
+        tag = f"gen_{scenario}_{n_opponents}opp"
+        cases.append(dict(key=tag, opponent=generalization_opponent, n_opponents=n_opponents, scenario=scenario,
+                          tag=tag, label=f"generalization [{scenario}, {n_opponents} opp]"))
+    return cases
+
+
+def run_eval_case(
+    model,
+    cfg: TrainingConfig,
+    case: dict,
+    replays_dir: pathlib.Path,
+    logs_dir: pathlib.Path,
+    timesteps_done: int,
+    n_episodes: int,
+    save_replays: bool,
+) -> dict[str, float | None]:
+    case_cfg = cfg
+    if case["scenario"] != cfg.env.scenario:
+        case_cfg = copy.deepcopy(cfg)
+        case_cfg.env.scenario = case["scenario"]
+    opponents = [OpponentPool._resolve_static(case["opponent"])] * case["n_opponents"]
+
+    stats: dict[str, list[float]] = {"score": [], "win": [], "survived": [], "length": [], "reward": []}
+    for i in range(n_episodes):
+        replay_path = None
+        if save_replays:
+            replay_path = str(pathlib.Path(replays_dir) / f"eval_{case['tag']}_{timesteps_done:010d}_{i}.pkl")
+        test_env = make_test_env(case_cfg, opponents, str(logs_dir), replay_path)
+        obs = test_env.reset()
+        done = False
+        total_reward = 0.0
+        while not done:
+            action_masks = get_action_masks(test_env)
+            action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
+            obs, reward, dones, info = test_env.step(action)
+            total_reward += float(reward[0])
+            done = bool(dones[0])
+        test_env.close()
+        final = info[0]
+        stats["score"].append(float(final["score"]))
+        stats["survived"].append(float(final["alive"]))
+        stats["length"].append(float(final["step"]))
+        stats["reward"].append(total_reward)
+        if final["opponent_scores"]:
+            stats["win"].append(float(final["score"] > max(final["opponent_scores"])))
+    return {key: (sum(values) / len(values) if values else None) for key, values in stats.items()}
+
+
+def _format_eval_summary(summary: dict[str, float | None]) -> str:
+    win = "-" if summary["win"] is None else f"{100 * summary['win']:.0f}%"
+    return (f"score {summary['score']:.2f}, win {win}, survived {100 * summary['survived']:.0f}%, "
+            f"length {summary['length']:.0f}, reward {summary['reward']:.2f}")
+
+
+def _print_eval_case(case: dict, summary: dict, timesteps_done: int, n_episodes: int) -> None:
+    print(f"  eval {case['label']}: {_format_eval_summary(summary)} (n={n_episodes})", flush=True)
+
+
+_EVAL_POOL_MODEL = None
+
+
+def _eval_pool_init(model_path: str) -> None:
+    global _EVAL_POOL_MODEL
+    torch.set_num_threads(1)
+    _EVAL_POOL_MODEL = _load_eval_model(model_path)
+
+
+def _eval_pool_case(args) -> tuple[str, dict]:
+    cfg, case, replays_dir, logs_dir, timesteps_done, n_episodes, save_replays = args
+    summary = run_eval_case(_EVAL_POOL_MODEL, cfg, case, replays_dir, logs_dir, timesteps_done, n_episodes, save_replays)
+    _print_eval_case(case, summary, timesteps_done, n_episodes)
+    return case["key"], summary
+
+
+def _load_eval_model(model_path: str):
+    return MaskablePPO.load(
+        model_path, device="cpu",
+        custom_objects={"n_envs": 1, "n_steps": 1, "rollout_buffer_class": MaskableDictRolloutBuffer},
+    )
+
+
+def run_eval_suite(
+    model,
+    cfg: TrainingConfig,
+    replays_dir: pathlib.Path,
+    logs_dir: pathlib.Path,
+    timesteps_done: int,
+    n_episodes: int | None = None,
+    save_replays: bool | None = None,
+    workers: int = 1,
+    model_path: str | None = None,
 ) -> dict[str, dict[str, float | None]]:
     """
     Run a suite of evaluation games against a set of bots (all at the standard 1v3
     "classic" table) plus a set of generalization cases that vary the scenario and/or
     opponent count, and return the average rewards for each.
     """
-    bot_paths = bot_paths if bot_paths is not None else EVAL_SUITE_BOTS
-    generalization_cases = (
-        generalization_cases if generalization_cases is not None else EVAL_SUITE_GENERALIZATION_CASES
-    )
+    n_episodes = cfg.eval_suite_episodes if n_episodes is None else int(n_episodes)
+    save_replays = cfg.eval_suite_replays if save_replays is None else bool(save_replays)
+    cases = eval_suite_cases(cfg)
     results: dict[str, dict[str, float | None]] = {}
 
-    def _play_episodes(opponents, scenario: str, tag: str) -> dict[str, float | None]:
-        case_cfg = cfg
-        if scenario != cfg.env.scenario:
-            case_cfg = copy.deepcopy(cfg)
-            case_cfg.env.scenario = scenario
+    if workers > 1 and model_path is not None:
+        jobs = [(cfg, case, replays_dir, logs_dir, timesteps_done, n_episodes, save_replays) for case in cases]
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(min(workers, len(jobs)), initializer=_eval_pool_init, initargs=(model_path,)) as pool:
+            for key, summary in pool.map(_eval_pool_case, jobs, chunksize=1):
+                results[key] = summary
+        return {case["key"]: results[case["key"]] for case in cases}
 
-        stats: dict[str, list[float]] = {"score": [], "win": [], "survived": [], "length": [], "reward": []}
-        for i in range(n_episodes):
-            replay_path = ckman.replays_dir / f"eval_{tag}_{timesteps_done:010d}_{i}.pkl"
-            test_env = make_test_env(case_cfg, opponents, str(ckman.logs_dir), str(replay_path))
-            obs = test_env.reset()
-            done = False
-            total_reward = 0.0
-            while not done:
-                action_masks = get_action_masks(test_env)
-                action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
-                obs, reward, dones, info = test_env.step(action)
-                total_reward += float(reward[0])
-                done = bool(dones[0])
-            test_env.close()
-            final = info[0]
-            stats["score"].append(float(final["score"]))
-            stats["survived"].append(float(final["alive"]))
-            stats["length"].append(float(final["step"]))
-            stats["reward"].append(total_reward)
-            if final["opponent_scores"]:
-                stats["win"].append(float(final["score"] > max(final["opponent_scores"])))
-        return {key: (sum(values) / len(values) if values else None) for key, values in stats.items()}
-
-    def _format(summary: dict[str, float | None]) -> str:
-        win = "-" if summary["win"] is None else f"{100 * summary['win']:.0f}%"
-        return (f"score {summary['score']:.2f}, win {win}, survived {100 * summary['survived']:.0f}%, "
-                f"length {summary['length']:.0f}, reward {summary['reward']:.2f}")
-
-    for bot_path in bot_paths:
-        opponents = [OpponentPool._resolve_static(bot_path)] * 3
-        bot_short_name = bot_path.split(".")[1]
-        summary = _play_episodes(opponents, cfg.env.scenario, bot_short_name)
-        results[bot_path] = summary
-        print(f"  eval vs {bot_short_name} ({cfg.env.scenario}, 3 opp): {_format(summary)} (n={n_episodes})")
-
-    for scenario, n_opponents in generalization_cases:
-        opponents = [OpponentPool._resolve_static(generalization_opponent)] * n_opponents
-        tag = f"gen_{scenario}_{n_opponents}opp"
-        summary = _play_episodes(opponents, scenario, tag)
-        results[tag] = summary
-        print(f"  eval generalization [{scenario}, {n_opponents} opp]: {_format(summary)} (n={n_episodes})")
-
+    for case in cases:
+        summary = run_eval_case(model, cfg, case, replays_dir, logs_dir, timesteps_done, n_episodes, save_replays)
+        results[case["key"]] = summary
+        _print_eval_case(case, summary, timesteps_done, n_episodes)
     return results
+
+
+def evaluate_checkpoint(
+    cfg: TrainingConfig,
+    run_dir: str,
+    ckpt_dir: str,
+    timesteps_done: int,
+    test_opponents,
+    model=None,
+) -> dict:
+    run_path = pathlib.Path(run_dir)
+    replays_dir, logs_dir = run_path / "replays", run_path / "logs"
+    model_path = str(pathlib.Path(ckpt_dir) / "model.zip")
+    if model is None:
+        model = _load_eval_model(model_path)
+    started = datetime.now()
+    results = run_eval_suite(
+        model, cfg, replays_dir, logs_dir, timesteps_done,
+        workers=cfg.eval_suite_workers, model_path=model_path,
+    )
+    CheckpointManager.update_metadata(pathlib.Path(ckpt_dir), {"eval_suite": results})
+    seconds = (datetime.now() - started).total_seconds()
+    print(f"  eval suite for {timesteps_done} timesteps finished in {seconds:.0f}s "
+          f"-> {pathlib.Path(ckpt_dir).name}/metadata.json", flush=True)
+    play_test_game(model, cfg, test_opponents, replays_dir, logs_dir, timesteps_done)
+    return results
+
+
+def _background_eval(cfg: TrainingConfig, run_dir: str, ckpt_dir: str, timesteps_done: int, test_opponents) -> None:
+    torch.set_num_threads(1)
+    evaluate_checkpoint(cfg, run_dir, ckpt_dir, timesteps_done, test_opponents)
+
+
+class BackgroundEvaluator:
+    def __init__(self, cfg: TrainingConfig, ckman: CheckpointManager):
+        self.cfg = cfg
+        self.ckman = ckman
+        self.process = None
+        self.timesteps = None
+
+    def wait(self) -> None:
+        if self.process is None:
+            return
+        if self.process.is_alive():
+            print(f"  waiting for the background eval of {self.timesteps} timesteps to finish...", flush=True)
+        self.process.join()
+        if self.process.exitcode != 0:
+            print(f"  background eval of {self.timesteps} timesteps exited with code {self.process.exitcode}", flush=True)
+        self.process = None
+
+    def start(self, ckpt_dir: pathlib.Path, timesteps_done: int, test_opponents) -> None:
+        self.wait()
+        ctx = mp.get_context("spawn")
+        self.process = ctx.Process(
+            target=_background_eval,
+            args=(self.cfg, str(self.ckman.run_dir), str(ckpt_dir), timesteps_done, test_opponents),
+        )
+        self.timesteps = timesteps_done
+        _start_single_threaded(self.process)
+        print(f"  eval suite for {timesteps_done} timesteps started in the background (pid {self.process.pid})", flush=True)
 
 
 def run(
@@ -901,6 +1092,7 @@ def run(
     learn_callback = CallbackList([
         opponent_callback, SymmetryAugmentationCallback(cfg), max_rollouts_callback, schedule_callback,
     ])
+    evaluator = BackgroundEvaluator(cfg, ckman)
 
     while timesteps_done < cfg.total_timesteps:
         chunk = min(cfg.save_every_timesteps, cfg.total_timesteps - timesteps_done)
@@ -921,10 +1113,6 @@ def run(
         if ep_len_mean is not None:
             print(f"  ep_len_mean: {ep_len_mean:.1f}")
 
-        eval_suite_results = None
-        if cfg.eval_every_save:
-            eval_suite_results = run_eval_suite(model, cfg, ckman, timesteps_done)
-
         ckpt_dir = ckman.save_checkpoint(
             model,
             timesteps_done,
@@ -932,7 +1120,7 @@ def run(
                 "ep_rew_mean": float(ep_rew_mean) if ep_rew_mean is not None else None,
                 "ep_len_mean": float(ep_len_mean) if ep_len_mean is not None else None,
                 "opponents": pool.last_opponent_descriptions(),
-                "eval_suite": eval_suite_results,
+                "eval_suite": None,
             },
         )
         print(f"Saved checkpoint at {timesteps_done} timesteps -> {ckpt_dir}")
@@ -942,7 +1130,10 @@ def run(
 
         if cfg.eval_every_save:
             test_opponents = pool.current_opponents()
-            play_test_game(model, cfg, test_opponents, ckman, timesteps_done)
+            if cfg.eval_suite_background:
+                evaluator.start(ckpt_dir, timesteps_done, test_opponents)
+            else:
+                evaluate_checkpoint(cfg, str(ckman.run_dir), str(ckpt_dir), timesteps_done, test_opponents, model=model)
 
         if max_rollouts_callback.limit_reached:
             print(f"[max-rollouts] hit the {max_rollouts}-rollout cap for this process "
@@ -950,6 +1141,8 @@ def run(
                   f"cfg.total_timesteps ({cfg.total_timesteps}) not yet reached; "
                   f"resume this run (without --max-rollouts, or with a new one) to continue.")
             break
+
+    evaluator.wait()
 
 
 def parse_args() -> argparse.Namespace:

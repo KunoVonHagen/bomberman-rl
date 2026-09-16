@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import copy
+import os
 import pathlib
 from datetime import datetime
 from typing import Optional, List
@@ -133,6 +134,15 @@ class CheckpointManager:
         (self.checkpoints_dir / "latest.txt").write_text(ckpt_dir.name)
 
         return ckpt_dir
+
+    @staticmethod
+    def update_metadata(ckpt_dir: pathlib.Path, updates: dict) -> None:
+        path = pathlib.Path(ckpt_dir) / "metadata.json"
+        metadata = json.loads(path.read_text()) if path.exists() else {}
+        metadata.update(updates)
+        tmp = path.with_name("metadata.json.tmp")
+        tmp.write_text(json.dumps(metadata, indent=2, default=_json_safe))
+        os.replace(tmp, path)
 
     def list_checkpoints(self) -> List[pathlib.Path]:
         ckpts = [p for p in self.checkpoints_dir.glob("checkpoint_*") if p.is_dir()]
