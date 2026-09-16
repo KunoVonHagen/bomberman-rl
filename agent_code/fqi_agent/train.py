@@ -4,6 +4,7 @@ import argparse
 import copy
 import importlib
 import json
+import os
 import pathlib
 import time
 from dataclasses import asdict, dataclass, field
@@ -28,7 +29,7 @@ class FQIConfig:
     run_name: str | None = None
     runs_dir: str = "runs"
     n_envs: int = 32
-    n_shards: int = 1
+    n_shards: int = 0
     epochs: int = 30
     steps_per_epoch: int = 400
     buffer_size: int = 300_000
@@ -46,7 +47,7 @@ class FQIConfig:
     opponents: list[str] = field(default_factory=lambda: list(DEFAULT_OPPONENTS))
     scenario: str = "classic"
     env_version: int = 3
-    eval_every: int = 1
+    eval_every: int = 5
     seed: int = 0
     replay: str | None = None
 
@@ -129,6 +130,15 @@ def build_world_args(cfg: FQIConfig, log_dir: str) -> WorldArgs:
         log_dir=log_dir, match_name=None, fps=env_cfg.fps, replay=None,
         continue_without_training=env_cfg.continue_without_training,
     )
+
+
+def resolve_n_shards(n_envs: int, n_shards: int) -> int:
+    if n_shards > 0:
+        return n_shards
+    wanted = max(1, min(8, os.cpu_count() or 1, n_envs))
+    while n_envs % wanted:
+        wanted -= 1
+    return wanted
 
 
 def make_env(cfg: FQIConfig, n_envs: int, n_shards: int, log_dir: str):
@@ -234,7 +244,7 @@ def evaluate(venv, model, fitted: bool) -> dict:
 
 
 def load_replay(path: str, n_features: int, store: TransitionStore) -> int:
-    data = read_replay_file(path)
+    data = read_replay_file(path, fields=("features", "actions", "rewards", "dones", "action_masks"))
     n = int(data["n_rows"])
     features = np.asarray(data["features"][:n], dtype=np.float32)
     if features.shape[-1] != n_features:
@@ -265,8 +275,9 @@ def run(cfg: FQIConfig) -> pathlib.Path:
     run_dir = pathlib.Path(cfg.runs_dir) / run_name
     (run_dir / "logs").mkdir(parents=True, exist_ok=True)
 
+    cfg.n_shards = resolve_n_shards(cfg.n_envs, cfg.n_shards)
     venv = make_env(cfg, cfg.n_envs, cfg.n_shards, str(run_dir / "logs"))
-    eval_env = make_env(cfg, cfg.n_envs, 1, str(run_dir / "logs")) if cfg.eval_every > 0 else None
+    eval_env = make_env(cfg, cfg.n_envs, cfg.n_shards, str(run_dir / "logs")) if cfg.eval_every > 0 else None
     n_features = int(venv.single_observation_space["features"].shape[0])
     model = build_model(cfg.model, n_features, len(ACTIONS), ridge=cfg.ridge, n_estimators=cfg.n_estimators,
                         max_depth=cfg.max_depth, min_samples_leaf=cfg.min_samples_leaf, max_features=cfg.max_features)
@@ -326,7 +337,8 @@ def parse_args(argv=None) -> FQIConfig:
     p.add_argument("--run-name", default=None)
     p.add_argument("--runs-dir", default=defaults.runs_dir)
     p.add_argument("--n-envs", type=int, default=defaults.n_envs)
-    p.add_argument("--n-shards", type=int, default=defaults.n_shards)
+    p.add_argument("--n-shards", type=int, default=defaults.n_shards,
+                   help="env worker processes for collection and evaluation (0 = min(8, cores) dividing n_envs)")
     p.add_argument("--epochs", type=int, default=defaults.epochs)
     p.add_argument("--steps-per-epoch", type=int, default=defaults.steps_per_epoch)
     p.add_argument("--buffer-size", type=int, default=defaults.buffer_size)

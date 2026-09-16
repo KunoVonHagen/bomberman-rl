@@ -27,6 +27,58 @@ _BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
 GROUPED_KEYS = [EXTRACTOR_PREFIX + key for key in EXTRACTOR_KEYS] + ["q_head.weight", "q_head.bias"]
 _GROUPED_STACK: Optional[tuple] = None
 GROUPED_MIN_MODELS = 5
+_INFERENCE_DEVICE = torch.device("cpu")
+
+
+def _same_device(a, b) -> bool:
+    a, b = torch.device(a), torch.device(b)
+    return a.type == b.type and (a.index or 0) == (b.index or 0)
+
+
+def set_inference_device(device) -> None:
+    global _INFERENCE_DEVICE, _GROUPED_STACK
+    device = torch.device(device)
+    if not _same_device(device, _INFERENCE_DEVICE):
+        _INFERENCE_DEVICE = device
+        _MODEL_CACHE.clear()
+        _GROUPED_STACK = None
+
+
+class LearnerOpponentInference:
+    def __init__(self, device):
+        self.device = torch.device(device)
+        self.models: Dict[str, MaskableDQN] = {}
+        self.index: Dict[str, int] = {}
+        self.stale: set = set()
+        self.stacked = None
+
+    def update(self, checkpoints) -> Dict[str, Tuple[int, float]]:
+        current = [str((pathlib.Path(c) / "model.zip").resolve()) for c in checkpoints]
+        for path in current:
+            if path not in self.models:
+                model = MaskableDQN.load(path, device=self.device, inference=True)
+                model.exploration_rate = model.exploration_final_eps
+                self.models[path] = model
+        for path in [p for p in self.models if p not in current and p in self.stale]:
+            del self.models[path]
+        self.stale = {p for p in self.models if p not in current}
+        paths = list(self.models)
+        self.index = {path: i for i, path in enumerate(paths)}
+        self.stacked = stack_state_dicts([self.models[p].q_net.state_dict() for p in paths], GROUPED_KEYS) if paths else None
+        return {path: (i, float(self.models[path].exploration_rate)) for path, i in self.index.items()}
+
+    def __call__(self, obs: dict, masks: np.ndarray, model_ids: np.ndarray) -> np.ndarray:
+        if self.stacked is None or len(model_ids) == 0:
+            return np.zeros(len(model_ids), dtype=np.int64)
+        grid, features = observation_tensors(obs)
+        non_blocking = self.device.type == "cuda"
+        grid = grid.to(self.device, non_blocking=non_blocking)
+        features = features.to(self.device, non_blocking=non_blocking)
+        idx = torch.as_tensor(np.asarray(model_ids, dtype=np.int64), device=self.device)
+        with torch.no_grad():
+            latent = grouped_extractor_forward(self.stacked, idx, grid, features)
+            q = grouped_linear(latent, self.stacked["q_head.weight"], self.stacked["q_head.bias"], idx).cpu().numpy()
+        return np.where(np.asarray(masks, dtype=bool), q, -np.inf).argmax(axis=1).astype(np.int64)
 
 
 def _grouped_state_dict(model: "MaskableDQN") -> dict:
@@ -81,10 +133,12 @@ class _CheckpointOpponent:
         self.__dict__.update(state)
 
     def _ensure_model(self):
+        if self._model is not None and not _same_device(self._model.device, _INFERENCE_DEVICE):
+            self._model = None
         if self._model is None:
             self._model = _MODEL_CACHE.get(self.model_path)
             if self._model is None:
-                self._model = MaskableDQN.load(self.model_path, device="cpu", inference=True)
+                self._model = MaskableDQN.load(self.model_path, device=str(_INFERENCE_DEVICE), inference=True)
                 self._model.exploration_rate = self._model.exploration_final_eps
                 _MODEL_CACHE[self.model_path] = self._model
         elif self.model_path not in _MODEL_CACHE:
@@ -156,9 +210,12 @@ class _CheckpointOpponent:
             return _predict_per_model(owners, obs, masks)
         grid, features = observation_tensors(obs)
         idx = model_indices(paths, index)
+        device = _INFERENCE_DEVICE
+        if device.type != "cpu":
+            grid, features, idx = grid.to(device), features.to(device), idx.to(device)
         with torch.no_grad():
             latent = grouped_extractor_forward(stacked, idx, grid, features)
-            q = grouped_linear(latent, stacked["q_head.weight"], stacked["q_head.bias"], idx).numpy()
+            q = grouped_linear(latent, stacked["q_head.weight"], stacked["q_head.bias"], idx).cpu().numpy()
         masks = np.asarray(masks, dtype=bool)
         actions = np.where(masks, q, -np.inf).argmax(axis=1)
         eps = np.fromiter((owner._model.exploration_rate for owner in owners), dtype=np.float64, count=len(owners))

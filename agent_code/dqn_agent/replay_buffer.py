@@ -166,9 +166,9 @@ class DictReplayBuffer:
 
         fields, offset = {}, 0
         for name in REPLAY_FIELDS:
-            arr = getattr(self, name)
-            fields[name] = {"dtype": arr.dtype.str, "shape": list(arr.shape[1:]), "offset": offset}
-            offset += n * arr[0].nbytes
+            dtype_str, row_shape, row_nbytes = self._field_spec(name)
+            fields[name] = {"dtype": dtype_str, "shape": list(row_shape), "offset": offset}
+            offset += n * row_nbytes
         header = json.dumps({"n_rows": n, "n_envs": self.n_envs, "num_timesteps": int(num_timesteps),
                              "fields": fields}).encode("utf-8")
 
@@ -180,9 +180,8 @@ class DictReplayBuffer:
                 f.write(struct.pack("<Q", len(header)))
                 f.write(header)
                 for name in REPLAY_FIELDS:
-                    arr = getattr(self, name)
                     for a, b in chunks:
-                        f.write(memoryview(arr[a:b]))
+                        f.write(self._chunk_bytes(name, a, b))
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, path)
@@ -190,6 +189,22 @@ class DictReplayBuffer:
             if tmp_path.exists():
                 tmp_path.unlink()
         return n
+
+    def _field_spec(self, name: str) -> tuple:
+        arr = getattr(self, name)
+        return arr.dtype.str, tuple(arr.shape[1:]), arr[0].nbytes
+
+    def _chunk_bytes(self, name: str, a: int, b: int):
+        return memoryview(getattr(self, name)[a:b])
+
+    def _read_rows(self, f, name: str, keep: int) -> None:
+        arr = getattr(self, name)
+        target = memoryview(arr[:keep]).cast("B")
+        if f.readinto(target) != len(target):
+            raise ValueError(f"replay buffer file is truncated in field '{name}'")
+
+    def _store_rows(self, name: str, rows: np.ndarray) -> None:
+        getattr(self, name)[:rows.shape[0]] = rows
 
     def _check_layout(self, n_envs: int, shapes: dict) -> None:
         if n_envs != self.n_envs:
@@ -225,38 +240,171 @@ class DictReplayBuffer:
             self._check_layout(int(header["n_envs"]), {k: v["shape"] for k, v in header["fields"].items()})
             keep = min(n, self.rows)
             for name in REPLAY_FIELDS:
-                arr = getattr(self, name)
+                dtype_str, _row_shape, row_bytes = self._field_spec(name)
                 spec = header["fields"][name]
-                if spec["dtype"] != arr.dtype.str:
-                    raise ValueError(f"replay buffer field '{name}' was saved as {spec['dtype']}, expected {arr.dtype.str}")
-                row_bytes = arr[0].nbytes
+                if spec["dtype"] != dtype_str:
+                    raise ValueError(f"replay buffer field '{name}' was saved as {spec['dtype']}, expected {dtype_str}")
                 f.seek(data_start + int(spec["offset"]) + (n - keep) * row_bytes)
-                target = memoryview(arr[:keep]).cast("B")
-                if f.readinto(target) != len(target):
-                    raise ValueError(f"replay buffer file {path} is truncated in field '{name}'")
+                self._read_rows(f, name, keep)
         return self._finish_load(keep, header.get("num_timesteps", 0))
 
     def _load_npz(self, path) -> int:
         with np.load(path) as data:
             n = int(data["n_rows"])
             self._check_layout(int(data["n_envs"]), {k: data[k].shape[1:] for k in ("grid", "features", "action_masks")})
-            if data["grid"].dtype != self.grid.dtype:
-                raise ValueError(f"replay buffer grid was saved as {data['grid'].dtype.str}, expected {self.grid.dtype.str}")
+            grid_dtype = self._field_spec("grid")[0]
+            if data["grid"].dtype.str != grid_dtype:
+                raise ValueError(f"replay buffer grid was saved as {data['grid'].dtype.str}, expected {grid_dtype}")
             keep = min(n, self.rows)
             for key in REPLAY_FIELDS:
-                getattr(self, key)[:keep] = data[key][n - keep:n]
+                self._store_rows(key, data[key][n - keep:n])
             num_timesteps = int(data["num_timesteps"]) if "num_timesteps" in data else 0
         return self._finish_load(keep, num_timesteps)
 
 
-def read_replay_file(path) -> dict:
+class DeviceReplayBuffer(DictReplayBuffer):
+    def __init__(self, buffer_size: int, n_envs: int, observation_space, action_dim: int, device,
+                 grid_codec=None):
+        self.device = torch.device(device)
+        self.n_envs = max(1, int(n_envs))
+        self.rows = max(2, int(buffer_size) // self.n_envs)
+        self.action_dim = int(action_dim)
+        self.grid_codec = None
+        grid_dtype = torch.float16
+        if grid_codec is not None:
+            den, sentinel = grid_codec
+            self.grid_codec = (np.ascontiguousarray(den, dtype=np.float32), np.ascontiguousarray(sentinel, dtype=np.bool_))
+            grid_dtype = torch.uint8
+        self.grid_dtype = np.uint8 if grid_dtype == torch.uint8 else np.float16
+        grid_shape = tuple(observation_space["grid_tensor"].shape)
+        feat_shape = tuple(observation_space["features"].shape)
+        self.grid_shape = grid_shape
+        self.feat_shape = feat_shape
+
+        shape = (self.rows, self.n_envs)
+        dev = self.device
+        self.grid = torch.zeros(shape + grid_shape, dtype=grid_dtype, device=dev)
+        self._grid_flat = self.grid.view((self.rows * self.n_envs,) + grid_shape)
+        self.features = torch.zeros(shape + feat_shape, dtype=torch.float32, device=dev)
+        self.actions = torch.zeros(shape, dtype=torch.int64, device=dev)
+        self.rewards = torch.zeros(shape, dtype=torch.float32, device=dev)
+        self.dones = torch.zeros(shape, dtype=torch.float32, device=dev)
+        self.action_masks = torch.ones(shape + (self.action_dim,), dtype=torch.bool, device=dev)
+        self._has_next = np.zeros(self.rows, dtype=bool)
+
+        pin = dev.type == "cuda"
+        self._stage = {
+            "grid": torch.empty((self.n_envs,) + grid_shape, dtype=grid_dtype, pin_memory=pin),
+            "features": torch.empty((self.n_envs,) + feat_shape, dtype=torch.float32, pin_memory=pin),
+            "actions": torch.empty((self.n_envs,), dtype=torch.int64, pin_memory=pin),
+            "rewards": torch.empty((self.n_envs,), dtype=torch.float32, pin_memory=pin),
+            "dones": torch.empty((self.n_envs,), dtype=torch.float32, pin_memory=pin),
+            "action_masks": torch.empty((self.n_envs, self.action_dim), dtype=torch.bool, pin_memory=pin),
+        }
+        self._stage_np = {name: tensor.numpy() for name, tensor in self._stage.items()}
+        self._stage_event = torch.cuda.Event() if pin else None
+
+        self._pos = 0
+        self._full = False
+        self._seam_row: Optional[int] = None
+        self.last_sample_time_s: Optional[float] = None
+        self.num_timesteps: int = 0
+
+    def add(self, obs, next_obs, actions, rewards, dones, action_masks, next_action_masks) -> None:
+        i = self._pos
+        if self._stage_event is not None:
+            self._stage_event.synchronize()
+        stage = self._stage_np
+        if self.grid_codec is not None:
+            _encode_grid_kernel(np.ascontiguousarray(obs["grid_tensor"], dtype=np.float32),
+                                self.grid_codec[0], self.grid_codec[1], stage["grid"])
+        else:
+            self._stage["grid"].copy_(torch.from_numpy(np.ascontiguousarray(obs["grid_tensor"])))
+        stage["features"][:] = obs["features"]
+        stage["actions"][:] = actions
+        stage["rewards"][:] = rewards
+        stage["dones"][:] = dones
+        stage["action_masks"][:] = action_masks
+        non_blocking = self._stage_event is not None
+        for name, tensor in self._stage.items():
+            getattr(self, name)[i].copy_(tensor, non_blocking=non_blocking)
+        if self._stage_event is not None:
+            self._stage_event.record()
+
+        self._has_next[i] = False
+        if i == self._seam_row:
+            self._seam_row = None
+        prev = (i - 1) % self.rows
+        if (i > 0 or self._full) and prev != self._seam_row:
+            self._has_next[prev] = True
+
+        self._pos += 1
+        if self._pos == self.rows:
+            self._pos = 0
+            self._full = True
+
+    def sample(self, batch_size: int, out: Optional[dict] = None) -> dict:
+        t0 = time.perf_counter()
+        rows = np.flatnonzero(self._has_next)
+        if len(rows) == 0:
+            raise ValueError("replay buffer holds no transition with a stored successor yet")
+        row_idx = rows[np.random.randint(0, len(rows), size=batch_size)]
+        env_idx = np.random.randint(0, self.n_envs, size=batch_size)
+        next_row_idx = (row_idx + 1) % self.rows
+        non_blocking = self.device.type == "cuda"
+        flat = torch.from_numpy(row_idx * self.n_envs + env_idx).to(self.device, non_blocking=non_blocking)
+        next_flat = torch.from_numpy(next_row_idx * self.n_envs + env_idx).to(self.device, non_blocking=non_blocking)
+        total = self.rows * self.n_envs
+        features = self.features.view(total, -1)
+        masks = self.action_masks.view(total, -1)
+        batch = dict(
+            obs={
+                "grid_tensor": torch.index_select(self._grid_flat, 0, flat),
+                "features": torch.index_select(features, 0, flat),
+            },
+            next_obs={
+                "grid_tensor": torch.index_select(self._grid_flat, 0, next_flat),
+                "features": torch.index_select(features, 0, next_flat),
+            },
+            actions=torch.index_select(self.actions.view(total), 0, flat),
+            rewards=torch.index_select(self.rewards.view(total), 0, flat),
+            dones=torch.index_select(self.dones.view(total), 0, flat),
+            action_masks=torch.index_select(masks, 0, flat),
+            next_action_masks=torch.index_select(masks, 0, next_flat),
+        )
+        self.last_sample_time_s = time.perf_counter() - t0
+        return batch
+
+    def _field_spec(self, name: str) -> tuple:
+        arr = getattr(self, name)
+        dtype_str = arr[:0].cpu().numpy().dtype.str
+        return dtype_str, tuple(arr.shape[1:]), arr[0].numel() * arr.element_size()
+
+    def _chunk_bytes(self, name: str, a: int, b: int):
+        return memoryview(np.ascontiguousarray(getattr(self, name)[a:b].cpu().numpy()))
+
+    def _read_rows(self, f, name: str, keep: int) -> None:
+        arr = getattr(self, name)
+        host = np.empty((keep,) + tuple(arr.shape[1:]), dtype=np.dtype(self._field_spec(name)[0]))
+        target = memoryview(host).cast("B")
+        if f.readinto(target) != len(target):
+            raise ValueError(f"replay buffer file is truncated in field '{name}'")
+        self._store_rows(name, host)
+
+    def _store_rows(self, name: str, rows: np.ndarray) -> None:
+        arr = getattr(self, name)
+        arr[:rows.shape[0]].copy_(torch.from_numpy(np.ascontiguousarray(rows)).to(arr.dtype))
+
+
+def read_replay_file(path, fields=None) -> dict:
     path = pathlib.Path(path)
+    fields = list(REPLAY_FIELDS) if fields is None else [name for name in REPLAY_FIELDS if name in set(fields)]
     with open(path, "rb") as f:
         if f.read(len(REPLAY_MAGIC)) != REPLAY_MAGIC:
             with np.load(path) as data:
                 out = {"n_rows": int(data["n_rows"]), "n_envs": int(data["n_envs"]),
                        "num_timesteps": int(data["num_timesteps"]) if "num_timesteps" in data else 0}
-                for name in REPLAY_FIELDS:
+                for name in fields:
                     out[name] = np.array(data[name])
                 return out
         (header_len,) = struct.unpack("<Q", f.read(8))
@@ -264,7 +412,7 @@ def read_replay_file(path) -> dict:
         data_start = f.tell()
         n = int(header["n_rows"])
         out = {"n_rows": n, "n_envs": int(header["n_envs"]), "num_timesteps": int(header.get("num_timesteps", 0))}
-        for name in REPLAY_FIELDS:
+        for name in fields:
             spec = header["fields"][name]
             f.seek(data_start + int(spec["offset"]))
             shape = (n,) + tuple(spec["shape"])

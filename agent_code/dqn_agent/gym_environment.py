@@ -835,6 +835,8 @@ class BombermanGymEnv(gym.Env):
         self._opponent_resampler = None
         self._observers: Dict[int, "BombermanGymEnv"] = {}
         self._observer_book: Dict[Tuple[int, int], Tuple[int, int, int]] = {}
+        self._opponent_model_index: Optional[dict] = None
+        self._published_rows: list = []
 
         for handles in self.opponent_handles:
             for handle, (setup_fn, _act_fn) in zip(handles, opponents):
@@ -1784,13 +1786,65 @@ class BombermanGymEnv(gym.Env):
             self._observers[capacity] = observer
         return observer
 
-    def _precompute_batched_opponent_actions(self) -> None:
+    def set_opponent_model_index(self, index) -> None:
+        self._opponent_model_index = dict(index) if index else None
+
+    def publish_opponent_observations(self, grid_out, features_out, masks_out, model_out) -> int:
+        index = self._opponent_model_index
+        self._published_rows = []
+        if not index:
+            return 0
         items = []
         for env in range(self.n_envs):
             shared = None
             for i, (handle, act_fn) in enumerate(zip(self.opponent_handles[env], self.opponent_act_fns[env])):
                 owner = getattr(act_fn, "__self__", None)
                 if handle.dead or getattr(owner, "predict_batch", None) is None:
+                    continue
+                entry = index.get(getattr(owner, "model_path", None))
+                if entry is None:
+                    continue
+                if shared is None:
+                    shared = self._build_shared_state(env)
+                items.append((env, handle, (env, i), self._agent_state_dict(env, handle, shared), entry))
+        n = len(items)
+        if n == 0:
+            return 0
+        if n > grid_out.shape[0]:
+            raise RuntimeError(f"{n} opponent observations do not fit into {grid_out.shape[0]} shared rows")
+        obs, masks = self._opponent_observer(n).observations_for_games(
+            [item[3] for item in items], [item[2] for item in items], self._observer_book)
+        grid_out[:n] = obs["grid_tensor"]
+        features_out[:n] = obs["features"]
+        masks_out[:n] = masks
+        for j, item in enumerate(items):
+            model_out[j] = item[4][0]
+        self._published_rows = [(item[0], item[1], float(item[4][1]), masks[j].copy()) for j, item in enumerate(items)]
+        return n
+
+    def set_opponent_actions(self, greedy) -> None:
+        rows = self._published_rows
+        self._published_rows = []
+        if not rows:
+            return
+        draws = np.random.rand(len(rows))
+        for j, (env, handle, eps, mask) in enumerate(rows):
+            if handle.dead:
+                continue
+            action = int(greedy[j])
+            if eps > 0.0 and draws[j] < eps:
+                valid = np.flatnonzero(mask)
+                action = int(np.random.choice(valid)) if len(valid) else int(np.random.randint(len(ACTIONS)))
+            self._pending_opponent_actions[env][handle] = ACTIONS[action]
+
+    def _precompute_batched_opponent_actions(self) -> None:
+        items = []
+        for env in range(self.n_envs):
+            shared = None
+            pending = self._pending_opponent_actions[env]
+            for i, (handle, act_fn) in enumerate(zip(self.opponent_handles[env], self.opponent_act_fns[env])):
+                owner = getattr(act_fn, "__self__", None)
+                if handle.dead or handle in pending or getattr(owner, "predict_batch", None) is None:
                     continue
                 if shared is None:
                     shared = self._build_shared_state(env)

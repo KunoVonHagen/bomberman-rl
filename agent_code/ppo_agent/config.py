@@ -224,6 +224,7 @@ class SelfPlayConfig:
 
     pool_size: int = 8
     add_checkpoint_every_epochs: int = 1
+    opponent_inference: str = "shard"
     sample_strategy: Literal["uniform", "latest_biased"] = "latest_biased"
     latest_bias: float = 0.5
 
@@ -287,6 +288,7 @@ class TrainingConfig:
         "self_play.resample_every_n_rollouts",
         "self_play.pool_size",
         "self_play.add_checkpoint_every_epochs",
+        "self_play.opponent_inference",
         "self_play.sample_strategy",
         "self_play.latest_bias",
         "rewards.waited",

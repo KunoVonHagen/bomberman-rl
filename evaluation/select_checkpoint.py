@@ -16,7 +16,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from evaluation.evaluate import (
-    LOG_DIR, MATCHUPS, STATS_DIR, _git_commit, play_parallel, resolve_matchup, summarize_records,
+    LOG_DIR, MATCHUPS, STATS_DIR, _git_commit, default_workers, play_parallel, resolve_matchup, shutdown_pool,
+    summarize_records,
 )
 
 VALIDATION_MATCHUPS = ["task2-classic-solo", "task3-hunt", "task4-rule-based-x3"]
@@ -212,7 +213,7 @@ def main(argv=None) -> None:
     p.add_argument("--criterion", choices=sorted(CRITERIA), default="score")
     p.add_argument("--n-rounds", type=int, default=30)
     p.add_argument("--seed", type=int, default=0, help="same seed = same boards for every checkpoint")
-    p.add_argument("--workers", type=int, default=1)
+    p.add_argument("--workers", type=int, default=default_workers(), help="evaluation processes (default: cores - 1)")
     p.add_argument("--silence-errors", action="store_true")
     p.add_argument("--env-prefix", help="environment-variable prefix the agent's callbacks read (default AGENT upper-cased)")
     p.add_argument("--ensemble", action="store_true",
@@ -281,4 +282,7 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        shutdown_pool()

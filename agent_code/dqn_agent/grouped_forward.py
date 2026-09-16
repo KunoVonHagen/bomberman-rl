@@ -36,7 +36,12 @@ def stack_state_dicts(state_dicts: Sequence[Dict[str, torch.Tensor]], keys: Sequ
         return None
 
 
+UNFOLD_ROW_CHUNK = 128
+
+
 def grouped_conv3x3(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    if x.device.type == "cuda":
+        return _grouped_conv3x3_unfold(x, weight, bias, idx)
     n, c_in, h, w = x.shape
     weights = weight.index_select(0, idx)
     c_out = weights.shape[1]
@@ -48,6 +53,20 @@ def grouped_conv3x3(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, i
         groups=n,
     )
     return out.reshape(n, c_out, h, w)
+
+
+def _grouped_conv3x3_unfold(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    n, c_in, h, w = x.shape
+    c_out = weight.shape[1]
+    out = x.new_empty((n, c_out, h * w))
+    for start in range(0, n, UNFOLD_ROW_CHUNK):
+        stop = min(n, start + UNFOLD_ROW_CHUNK)
+        rows = idx[start:stop]
+        cols = F.unfold(x[start:stop], 3, padding=1)
+        weights = weight.index_select(0, rows).reshape(stop - start, c_out, c_in * 9)
+        biases = bias.index_select(0, rows).unsqueeze(2)
+        torch.baddbmm(biases, weights, cols, out=out[start:stop])
+    return out.view(n, c_out, h, w)
 
 
 def grouped_group_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:

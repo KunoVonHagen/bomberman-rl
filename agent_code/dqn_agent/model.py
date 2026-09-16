@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import contextlib
 from collections import deque
 from typing import Optional, Tuple
 
@@ -10,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import gymnasium as gym
 
-from .replay_buffer import GRID_SENTINEL_CODE, DictReplayBuffer
+from .replay_buffer import GRID_SENTINEL_CODE, DeviceReplayBuffer, DictReplayBuffer
 from .schedules import LinearSchedule
 from .symmetry import TensorAugmenter
 
@@ -31,7 +32,9 @@ class StepProfiler:
     def stop(self, name: str, device: Optional[torch.device] = None) -> None:
         if device is not None and device.type == "cuda":
             torch.cuda.synchronize(device)
-        dt_ms = (time.perf_counter() - self._t0[name]) * 1000.0
+        self.add(name, (time.perf_counter() - self._t0[name]) * 1000.0)
+
+    def add(self, name: str, dt_ms: float) -> None:
         bucket = self._times.setdefault(name, deque(maxlen=self.window))
         bucket.append(dt_ms)
 
@@ -41,6 +44,7 @@ class StepProfiler:
 
 
 AMP_MODES = ("off", "fp16")
+REPLAY_DEVICES = ("host", "device")
 
 
 def _dropout_layer(dropout: float) -> list:
@@ -163,10 +167,11 @@ def _obs_to_tensors(observation: dict, device: torch.device, pinned: Optional[di
     """Convert observation arrays to PyTorch tensors on a device."""
     grid = observation["grid_tensor"]
     grid_t = grid if torch.is_tensor(grid) else torch.from_numpy(np.ascontiguousarray(grid))
-    feats_t = torch.as_tensor(np.asarray(observation["features"]), dtype=torch.float32)
+    feats = observation["features"]
+    feats_t = feats.to(torch.float32) if torch.is_tensor(feats) else torch.as_tensor(np.asarray(feats), dtype=torch.float32)
     non_blocking = device.type == "cuda"
 
-    if non_blocking and pinned is not None:
+    if non_blocking and pinned is not None and feats_t.device.type == "cpu":
         if pinned["grid"].dtype == grid_t.dtype and pinned["grid"].data_ptr() != grid_t.data_ptr():
             pinned["grid"].copy_(grid_t)
             grid_t = pinned["grid"]
@@ -218,6 +223,8 @@ class MaskableDQN:
         dropout: float = 0.0,
         amp: str = "fp16",
         grid_codec=None,
+        replay_prefetch: bool = True,
+        replay_device: str = "host",
         n_envs: int = 1,
         device: str = "cpu",
         inference: bool = False,
@@ -269,7 +276,16 @@ class MaskableDQN:
         self.q_net = QNetwork(observation_space, self.n_actions, features_dim, self.dropout).to(self.device)
         self.q_net.eval()
         self._amp_enabled = self.device.type == "cuda" and self.amp == "fp16"
-        self._h2d_event = None
+        self.replay_prefetch = bool(replay_prefetch)
+        if replay_device not in REPLAY_DEVICES:
+            raise ValueError(f"replay_device must be one of {REPLAY_DEVICES}, got {replay_device!r}")
+        self.replay_device = replay_device
+        self._pinned_pairs: Optional[list] = None
+        self._pair_events: list = [None, None]
+        self._next_pair = 0
+        self._side_stream = None
+        self._prefetched: Optional[dict] = None
+        self._prefetched_from = None
         if self.inference:
             self.q_net_target = None
             self.optimizer = None
@@ -300,11 +316,10 @@ class MaskableDQN:
         self._mean_q_window: deque = deque(maxlen=100)
         self._td_error_window: deque = deque(maxlen=100)
 
-        self._pinned_obs: Optional[dict] = None
-        self._pinned_next_obs: Optional[dict] = None
 
         self.profile_every: int = 0
         self._profiler = StepProfiler()
+        self._wall_profiler = StepProfiler(window=200)
         self._rollout_iter = 0
 
     def _sample_masked_actions(self, action_masks: np.ndarray) -> np.ndarray:
@@ -323,7 +338,9 @@ class MaskableDQN:
         with torch.no_grad():
             obs_t = _obs_to_tensors(observation, self.device)
             if samples > 0:
-                q = torch.stack([self.q_net(obs_t) for _ in range(samples)]).mean(dim=0)
+                batch = obs_t["features"].shape[0]
+                tiled = {key: value.repeat(samples, *([1] * (value.dim() - 1))) for key, value in obs_t.items()}
+                q = self.q_net(tiled).view(samples, batch, -1).mean(dim=0)
                 self.q_net.eval()
             else:
                 q = self.q_net(obs_t)
@@ -376,9 +393,16 @@ class MaskableDQN:
         """Create or resize the replay buffer to match the active env count."""
         if self.replay_buffer is None or self.n_envs != n_envs:
             self.n_envs = n_envs
-            self.replay_buffer = DictReplayBuffer(
-                self.buffer_size, n_envs, self.observation_space, self.n_actions, grid_codec=self.grid_codec,
-            )
+            self._prefetched = None
+            if self.replay_device == "device":
+                self.replay_buffer = DeviceReplayBuffer(
+                    self.buffer_size, n_envs, self.observation_space, self.n_actions, self.device,
+                    grid_codec=self.grid_codec,
+                )
+            else:
+                self.replay_buffer = DictReplayBuffer(
+                    self.buffer_size, n_envs, self.observation_space, self.n_actions, grid_codec=self.grid_codec,
+                )
 
     def save_replay_buffer(self, path, max_transitions: Optional[int] = None) -> int:
         """
@@ -400,22 +424,85 @@ class MaskableDQN:
 
     def _ensure_pinned_buffers(self, batch_size: int) -> None:
         """Lazily allocate persistent pinned CPU staging buffers."""
-        if self.device.type != "cuda":
+        if self.device.type != "cuda" or isinstance(self.replay_buffer, DeviceReplayBuffer):
+            return
+        n_pairs = 2 if self.replay_prefetch else 1
+        if self._pinned_pairs is not None and len(self._pinned_pairs) == n_pairs \
+                and self._pinned_pairs[0][0]["grid"].shape[0] == batch_size:
             return
         grid_shape = tuple(self.observation_space["grid_tensor"].shape)
         feat_shape = tuple(self.observation_space["features"].shape)
+        grid_dtype = torch.float16 if self.replay_buffer is None else torch.from_numpy(self.replay_buffer.grid[:1, :1]).dtype
 
-        need_alloc = (
-            self._pinned_obs is None
-            or self._pinned_obs["grid"].shape[0] != batch_size
-        )
-        if need_alloc:
-            def make(shape, dtype):
-                return torch.empty((batch_size, *shape), dtype=dtype, pin_memory=True)
+        def make(shape, dtype):
+            return torch.empty((batch_size, *shape), dtype=dtype, pin_memory=True)
 
-            grid_dtype = torch.float16 if self.replay_buffer is None else torch.from_numpy(self.replay_buffer.grid[:1, :1]).dtype
-            self._pinned_obs = {"grid": make(grid_shape, grid_dtype), "features": make(feat_shape, torch.float32)}
-            self._pinned_next_obs = {"grid": make(grid_shape, grid_dtype), "features": make(feat_shape, torch.float32)}
+        self._pinned_pairs = [
+            ({"grid": make(grid_shape, grid_dtype), "features": make(feat_shape, torch.float32)},
+             {"grid": make(grid_shape, grid_dtype), "features": make(feat_shape, torch.float32)})
+            for _ in range(n_pairs)
+        ]
+        self._pair_events = [None] * n_pairs
+        self._next_pair = 0
+        self._prefetched = None
+
+    def _fetch_batch(self, pair: int, stream=None) -> dict:
+        cuda = self.device.type == "cuda"
+        pinned_obs = pinned_next = None
+        staging = None
+        if self._pinned_pairs is not None:
+            pinned_obs, pinned_next = self._pinned_pairs[pair]
+            event = self._pair_events[pair]
+            if event is not None:
+                event.synchronize()
+            staging = {"grid": pinned_obs["grid"], "next_grid": pinned_next["grid"]}
+        train_dtype = torch.float16 if self._amp_enabled else torch.float32
+        context = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+        with context:
+            batch = self.replay_buffer.sample(self.batch_size, out=staging)
+            fetched = dict(
+                obs=_obs_to_tensors(batch["obs"], self.device, pinned=pinned_obs, codec=self._codec_tensors, dtype=train_dtype),
+                next_obs=_obs_to_tensors(batch["next_obs"], self.device, pinned=pinned_next, codec=self._codec_tensors, dtype=train_dtype),
+                actions=torch.as_tensor(batch["actions"], device=self.device, dtype=torch.int64),
+                rewards=torch.as_tensor(batch["rewards"], device=self.device, dtype=torch.float32),
+                dones=torch.as_tensor(batch["dones"], device=self.device, dtype=torch.float32),
+                next_masks=torch.as_tensor(batch["next_action_masks"], device=self.device, dtype=torch.bool),
+            )
+            if cuda:
+                event = torch.cuda.Event()
+                event.record(stream if stream is not None else torch.cuda.current_stream(self.device))
+                if self._pinned_pairs is not None:
+                    self._pair_events[pair] = event
+                fetched["event"] = event
+        return fetched
+
+    def _prefetch_next_batch(self) -> None:
+        if self.replay_buffer.n_sampleable_rows() == 0:
+            return
+        if self._side_stream is None:
+            self._side_stream = torch.cuda.Stream(self.device)
+        pair = self._next_pair
+        self._next_pair = (pair + 1) % (len(self._pinned_pairs) if self._pinned_pairs is not None else 2)
+        self._prefetched = self._fetch_batch(pair, stream=self._side_stream)
+        self._prefetched_from = self.replay_buffer
+        torch.cuda.current_stream(self.device).wait_event(self._prefetched["event"])
+
+    def _take_batch(self) -> dict:
+        fetched = self._prefetched
+        self._prefetched = None
+        if fetched is not None and self._prefetched_from is self.replay_buffer:
+            current = torch.cuda.current_stream(self.device)
+            current.wait_event(fetched["event"])
+            for value in fetched.values():
+                if torch.is_tensor(value):
+                    value.record_stream(current)
+                elif isinstance(value, dict):
+                    for tensor in value.values():
+                        tensor.record_stream(current)
+            return fetched
+        pair = self._next_pair
+        self._next_pair = (pair + 1) % (len(self._pinned_pairs) if self._pinned_pairs is not None else 2)
+        return self._fetch_batch(pair)
 
     def train_step(self) -> Optional[dict]:
         """Run one gradient step on a minibatch from the replay buffer."""
@@ -424,36 +511,17 @@ class MaskableDQN:
         if self.replay_buffer.n_sampleable_rows() == 0:
             return None
 
-        do_profile = self.profile_every > 0 and (self.n_updates % self.profile_every == 0)
+        do_profile = self.profile_every > 0 and (self.n_updates % self.profile_every == self.profile_every // 2)
         prof = self._profiler if do_profile else None
         dev = self.device if do_profile else None
 
         self._ensure_pinned_buffers(self.batch_size)
 
         if prof: prof.start("sample")
-        staging = None
-        if self._pinned_obs is not None:
-            staging = {"grid": self._pinned_obs["grid"], "next_grid": self._pinned_next_obs["grid"]}
-        if self._h2d_event is not None:
-            self._h2d_event.synchronize()
-        batch = self.replay_buffer.sample(self.batch_size, out=staging)
-        if prof: prof.stop("sample")
-
-        if prof: prof.start("host_to_device")
-        train_dtype = torch.float16 if self._amp_enabled else torch.float32
-        obs = _obs_to_tensors(batch["obs"], self.device, pinned=self._pinned_obs,
-                              codec=self._codec_tensors, dtype=train_dtype)
-        next_obs = _obs_to_tensors(batch["next_obs"], self.device, pinned=self._pinned_next_obs,
-                                   codec=self._codec_tensors, dtype=train_dtype)
-        actions = torch.as_tensor(batch["actions"], device=self.device, dtype=torch.int64)
-        rewards = torch.as_tensor(batch["rewards"], device=self.device, dtype=torch.float32)
-        dones = torch.as_tensor(batch["dones"], device=self.device, dtype=torch.float32)
-        next_masks = torch.as_tensor(batch["next_action_masks"], device=self.device, dtype=torch.bool)
-        if self.device.type == "cuda":
-            if self._h2d_event is None:
-                self._h2d_event = torch.cuda.Event()
-            self._h2d_event.record()
-        if prof: prof.stop("host_to_device", device=dev)
+        fetched = self._take_batch()
+        obs, next_obs = fetched["obs"], fetched["next_obs"]
+        actions, rewards, dones, next_masks = fetched["actions"], fetched["rewards"], fetched["dones"], fetched["next_masks"]
+        if prof: prof.stop("sample", device=dev)
 
         if self.symmetry_augmentation:
             if prof: prof.start("augment")
@@ -487,6 +555,11 @@ class MaskableDQN:
             self.q_net.eval()
         if prof: prof.stop("online_forward_backward", device=dev)
 
+        if self.replay_prefetch and self.device.type == "cuda":
+            if prof: prof.start("prefetch")
+            self._prefetch_next_batch()
+            if prof: prof.stop("prefetch")
+
         with torch.no_grad():
             td_error = (target - q_values).abs().mean()
             mean_q = q_values_all.mean()
@@ -506,7 +579,10 @@ class MaskableDQN:
 
     def get_profile_stats(self) -> Optional[dict]:
         """Return the most recent profiled train-step breakdown in milliseconds, or None if unavailable."""
-        return getattr(self, "_last_profile", None)
+        stats = dict(getattr(self, "_last_profile", None) or {})
+        if self.profile_every > 0:
+            stats.update({f"wall_{name}": ms for name, ms in self._wall_profiler.summary().items()})
+        return stats or None
 
     def update_target(self) -> None:
         """Blend the target network toward the online network."""
@@ -551,9 +627,11 @@ class MaskableDQN:
             cb.on_training_start(self, env)
 
         while self.num_timesteps < target_num_timesteps:
-            do_profile = self.profile_every > 0 and (self._rollout_iter % self.profile_every == 0)
+            do_profile = self.profile_every > 0 and (self._rollout_iter % self.profile_every == self.profile_every // 2)
             prof = self._profiler if do_profile else None
             dev = self.device if do_profile else None
+            wall = self._wall_profiler if self.profile_every > 0 else None
+            if wall: wall.start("iteration")
 
             for cb in callbacks:
                 cb.on_rollout_start(self, env)
@@ -561,17 +639,20 @@ class MaskableDQN:
             self.exploration_rate = self.exploration_schedule.value(self.num_timesteps)
 
             if prof: prof.start("action_select")
+            if wall: wall.start("action_select")
             if self.num_timesteps < self.learning_starts:
                 actions = self._sample_masked_actions(self._last_action_masks)
             else:
                 actions, _ = self.predict(
                     self._last_obs, deterministic=False, action_masks=self._last_action_masks,
                 )
+            if wall: wall.stop("action_select")
             if prof: prof.stop("action_select", device=dev)
 
             if prof: prof.start("env_step")
             env.step_async(actions)
             if prof: prof.stop("env_step")
+            if wall: wall.start("train")
 
             buffer_ready = len(self.replay_buffer) >= min(self.learning_starts, self.replay_buffer.capacity)
             if not buffer_ready:
@@ -589,9 +670,14 @@ class MaskableDQN:
                         self.n_updates += 1
                 self._steps_since_train = 0
                 if prof: prof.stop("train", device=dev)
+            if wall: wall.stop("train")
 
             if prof: prof.start("env_wait")
+            if wall: wall.start("env_wait")
             next_obs, rewards, dones, infos = env.step_wait()
+            if wall:
+                wall.stop("env_wait")
+                wall.add("opponent_infer", getattr(getattr(env, "venv", env), "opponent_eval_ms", 0.0))
             if prof: prof.stop("env_wait")
 
             if prof: prof.start("action_masks")
@@ -599,10 +685,12 @@ class MaskableDQN:
             if prof: prof.stop("action_masks")
 
             if prof: prof.start("buffer_add")
+            if wall: wall.start("buffer_add")
             self.replay_buffer.add(
                 self._last_obs, next_obs, actions, rewards, dones,
                 self._last_action_masks, next_action_masks,
             )
+            if wall: wall.stop("buffer_add")
             if prof: prof.stop("buffer_add")
 
             self._rollout_iter += 1
@@ -614,9 +702,12 @@ class MaskableDQN:
             self._steps_since_train += 1
 
             if prof: prof.start("callbacks_on_step")
+            if wall: wall.start("callbacks_on_step")
             for cb in callbacks:
                 cb.on_step(self, env)
+            if wall: wall.stop("callbacks_on_step")
             if prof: prof.stop("callbacks_on_step")
+            if wall: wall.stop("iteration")
 
             crossed = (
                 self.num_timesteps // self.target_update_interval
@@ -624,6 +715,16 @@ class MaskableDQN:
             )
             if crossed:
                 self.update_target()
+
+    def set_replay_options(self, prefetch: bool, replay_device: str) -> None:
+        if replay_device not in REPLAY_DEVICES:
+            raise ValueError(f"replay_device must be one of {REPLAY_DEVICES}, got {replay_device!r}")
+        self.replay_prefetch = bool(prefetch)
+        self._prefetched = None
+        if replay_device != self.replay_device:
+            if self.replay_buffer is not None:
+                raise RuntimeError("replay_device cannot change after the replay buffer was created")
+            self.replay_device = replay_device
 
     def set_amp(self, amp: str) -> None:
         if amp not in AMP_MODES:

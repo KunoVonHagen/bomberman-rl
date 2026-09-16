@@ -25,14 +25,14 @@ OpponentPair = Tuple[Callable, Callable]
 _MODEL_CACHE: Dict[str, "MaskablePPO"] = {}
 
 
-def load_inference_model(model_path: str) -> "MaskablePPO":
+def load_inference_model(model_path: str, device="cpu") -> "MaskablePPO":
     with zipfile.ZipFile(model_path) as archive:
         data = json_to_data(archive.read("data").decode(), custom_objects={"rollout_buffer_class": MaskableDictRolloutBuffer})
     policy_kwargs = dict(data.get("policy_kwargs") or {})
     policy_kwargs["optimizer_class"] = InferenceOptimizer
     return MaskablePPO.load(
         model_path,
-        device="cpu",
+        device=str(device),
         custom_objects={
             "n_envs": 1,
             "n_steps": 1,
@@ -52,6 +52,70 @@ POLICY_KEYS = [
 GROUPED_KEYS = [EXTRACTOR_PREFIX + key for key in EXTRACTOR_KEYS] + POLICY_KEYS
 _GROUPED_STACK: Optional[tuple] = None
 GROUPED_MIN_MODELS = 4
+_INFERENCE_DEVICE = torch.device("cpu")
+
+
+def _same_device(a, b) -> bool:
+    a, b = torch.device(a), torch.device(b)
+    return a.type == b.type and (a.index or 0) == (b.index or 0)
+
+
+def set_inference_device(device) -> None:
+    global _INFERENCE_DEVICE, _GROUPED_STACK
+    device = torch.device(device)
+    if not _same_device(device, _INFERENCE_DEVICE):
+        _INFERENCE_DEVICE = device
+        _MODEL_CACHE.clear()
+        _GROUPED_STACK = None
+
+
+def _grouped_policy_logits(stacked: dict, idx: torch.Tensor, grid: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+    latent = grouped_extractor_forward(stacked, idx, grid, features)
+    hidden = torch.tanh(grouped_linear(
+        latent, stacked["mlp_extractor.policy_net.0.weight"], stacked["mlp_extractor.policy_net.0.bias"], idx))
+    hidden = torch.tanh(grouped_linear(
+        hidden, stacked["mlp_extractor.policy_net.2.weight"], stacked["mlp_extractor.policy_net.2.bias"], idx))
+    return grouped_linear(hidden, stacked["action_net.weight"], stacked["action_net.bias"], idx)
+
+
+def _sample_masked(logits: torch.Tensor, masks: np.ndarray) -> torch.Tensor:
+    mask_t = torch.as_tensor(np.asarray(masks, dtype=bool), device=logits.device).reshape(logits.shape)
+    logits = torch.where(mask_t, logits, torch.tensor(-1e8, dtype=logits.dtype, device=logits.device))
+    return torch.distributions.Categorical(logits=logits).sample()
+
+
+class LearnerOpponentInference:
+    def __init__(self, device):
+        self.device = torch.device(device)
+        self.models: Dict[str, "MaskablePPO"] = {}
+        self.index: Dict[str, int] = {}
+        self.stale: set = set()
+        self.stacked = None
+
+    def update(self, checkpoints) -> Dict[str, Tuple[int, float]]:
+        current = [str((pathlib.Path(c) / "model.zip").resolve()) for c in checkpoints]
+        for path in current:
+            if path not in self.models:
+                self.models[path] = load_inference_model(path, device=self.device)
+        for path in [p for p in self.models if p not in current and p in self.stale]:
+            del self.models[path]
+        self.stale = {p for p in self.models if p not in current}
+        paths = list(self.models)
+        self.index = {path: i for i, path in enumerate(paths)}
+        self.stacked = stack_state_dicts([_grouped_state_dict(self.models[p]) for p in paths], GROUPED_KEYS) if paths else None
+        return {path: (i, 0.0) for path, i in self.index.items()}
+
+    def __call__(self, obs: dict, masks: np.ndarray, model_ids: np.ndarray) -> np.ndarray:
+        if self.stacked is None or len(model_ids) == 0:
+            return np.zeros(len(model_ids), dtype=np.int64)
+        grid, features = observation_tensors(obs)
+        non_blocking = self.device.type == "cuda"
+        grid = grid.to(self.device, non_blocking=non_blocking)
+        features = features.to(self.device, non_blocking=non_blocking)
+        idx = torch.as_tensor(np.asarray(model_ids, dtype=np.int64), device=self.device)
+        with torch.no_grad():
+            actions = _sample_masked(_grouped_policy_logits(self.stacked, idx, grid, features), masks)
+        return actions.cpu().numpy().astype(np.int64)
 
 
 def _grouped_state_dict(model: "MaskablePPO") -> dict:
@@ -109,10 +173,12 @@ class _CheckpointOpponent:
         self.__dict__.update(state)
 
     def _ensure_model(self):
+        if self._model is not None and not _same_device(self._model.device, _INFERENCE_DEVICE):
+            self._model = None
         if self._model is None:
             self._model = _MODEL_CACHE.get(self.model_path)
             if self._model is None:
-                self._model = load_inference_model(self.model_path)
+                self._model = load_inference_model(self.model_path, device=_INFERENCE_DEVICE)
                 _MODEL_CACHE[self.model_path] = self._model
         elif self.model_path not in _MODEL_CACHE:
             _MODEL_CACHE[self.model_path] = self._model
@@ -186,18 +252,13 @@ class _CheckpointOpponent:
             return _predict_per_model(owners, obs, masks)
         grid, features = observation_tensors(obs)
         idx = model_indices(paths, index)
+        device = _INFERENCE_DEVICE
+        if device.type != "cpu":
+            grid, features, idx = grid.to(device), features.to(device), idx.to(device)
         with torch.no_grad():
-            latent = grouped_extractor_forward(stacked, idx, grid, features)
-            hidden = torch.tanh(grouped_linear(
-                latent, stacked["mlp_extractor.policy_net.0.weight"], stacked["mlp_extractor.policy_net.0.bias"], idx))
-            hidden = torch.tanh(grouped_linear(
-                hidden, stacked["mlp_extractor.policy_net.2.weight"], stacked["mlp_extractor.policy_net.2.bias"], idx))
-            logits = grouped_linear(hidden, stacked["action_net.weight"], stacked["action_net.bias"], idx)
-            mask_t = torch.as_tensor(np.asarray(masks, dtype=bool)).reshape(logits.shape)
-            logits = torch.where(mask_t, logits, torch.tensor(-1e8, dtype=logits.dtype))
-            actions = torch.distributions.Categorical(logits=logits).sample()
+            actions = _sample_masked(_grouped_policy_logits(stacked, idx, grid, features), masks)
         names = owners[0]._action_names
-        return [names[int(a)] for a in actions.numpy()]
+        return [names[int(a)] for a in actions.cpu().numpy()]
 
     def batch_act(self, agents, game_states) -> List[str]:
         names: List[str] = []

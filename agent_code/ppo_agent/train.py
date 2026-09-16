@@ -20,7 +20,7 @@ from stable_baselines3.common.vec_env import VecEnv, VecMonitor
 
 from environment import WorldArgs
 
-from .gym_environment import ACTIONS, BombermanGymEnv, observation_shapes
+from .gym_environment import ACTIONS, MAX_OPPONENTS, BombermanGymEnv, observation_shapes
 from .model import BombermanFeatureExtractor
 from .config import (
     DEFAULT_CONFIG,
@@ -32,7 +32,8 @@ from .config import (
 from .checkpoint_manager import CheckpointManager
 from .rollout_buffer import PinnedMaskableDictRolloutBuffer
 from .symmetry import augment_rollout_buffer
-from .opponent_pool import OpponentPool, OpponentSampler, load_inference_model
+from .opponent_pool import (LearnerOpponentInference, OpponentPool, OpponentSampler, load_inference_model,
+                            set_inference_device)
 from .training_schedule import DEFAULT_SCHEDULE, load_schedule
 
 
@@ -207,12 +208,16 @@ def _start_single_threaded(process) -> None:
 
 
 class SharedStepBuffers:
-    def __init__(self, ctx, n_envs: int, grid_shape: tuple, n_features: int, n_actions: int):
+    def __init__(self, ctx, n_envs: int, grid_shape: tuple, n_features: int, n_actions: int,
+                 n_shards: int = 1, opponent_rows: int = 0):
         self.n_envs = int(n_envs)
         self.grid_shape = tuple(int(x) for x in grid_shape)
         self.n_features = int(n_features)
         self.n_actions = int(n_actions)
+        self.n_shards = int(n_shards)
+        self.opponent_rows = int(opponent_rows)
         cells = 2 * self.n_envs
+        rows = 2 * max(1, self.opponent_rows)
         self.raw = {
             "grid": ctx.RawArray(ctypes.c_float, cells * int(np.prod(self.grid_shape))),
             "features": ctx.RawArray(ctypes.c_float, cells * self.n_features),
@@ -220,20 +225,33 @@ class SharedStepBuffers:
             "terminated": ctx.RawArray(ctypes.c_bool, cells),
             "truncated": ctx.RawArray(ctypes.c_bool, cells),
             "masks": ctx.RawArray(ctypes.c_bool, cells * self.n_actions),
+            "opp_grid": ctx.RawArray(ctypes.c_float, rows * int(np.prod(self.grid_shape)) if self.opponent_rows else 1),
+            "opp_features": ctx.RawArray(ctypes.c_float, rows * self.n_features if self.opponent_rows else 1),
+            "opp_masks": ctx.RawArray(ctypes.c_bool, rows * self.n_actions if self.opponent_rows else 1),
+            "opp_model": ctx.RawArray(ctypes.c_int64, rows if self.opponent_rows else 1),
+            "opp_count": ctx.RawArray(ctypes.c_int64, 2 * self.n_shards),
         }
 
     def views(self) -> dict:
         def view(name, dtype, shape):
             return np.frombuffer(self.raw[name], dtype=dtype).reshape((2, self.n_envs) + shape)
 
-        return {
+        out = {
             "grid": view("grid", np.float32, self.grid_shape),
             "features": view("features", np.float32, (self.n_features,)),
             "rewards": view("rewards", np.float32, ()),
             "terminated": view("terminated", np.bool_, ()),
             "truncated": view("truncated", np.bool_, ()),
             "masks": view("masks", np.bool_, (self.n_actions,)),
+            "opp_count": np.frombuffer(self.raw["opp_count"], dtype=np.int64).reshape(2, self.n_shards),
         }
+        if self.opponent_rows:
+            rows = self.opponent_rows
+            out["opp_grid"] = np.frombuffer(self.raw["opp_grid"], dtype=np.float32).reshape((2, rows) + self.grid_shape)
+            out["opp_features"] = np.frombuffer(self.raw["opp_features"], dtype=np.float32).reshape(2, rows, self.n_features)
+            out["opp_masks"] = np.frombuffer(self.raw["opp_masks"], dtype=np.bool_).reshape(2, rows, self.n_actions)
+            out["opp_model"] = np.frombuffer(self.raw["opp_model"], dtype=np.int64).reshape(2, rows)
+        return out
 
     def check(self, observation_space, action_space) -> None:
         grid_shape = tuple(observation_space["grid_tensor"].shape)
@@ -267,6 +285,14 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
     )
     views = shared.views()
     lo, hi = shard_index * shard_n_envs, (shard_index + 1) * shard_n_envs
+    opp_rows = shared.opponent_rows // max(1, shared.n_shards)
+    olo, ohi = shard_index * opp_rows, (shard_index + 1) * opp_rows
+
+    def publish(slot):
+        if opp_rows:
+            views["opp_count"][slot, shard_index] = env.publish_opponent_observations(
+                views["opp_grid"][slot, olo:ohi], views["opp_features"][slot, olo:ohi],
+                views["opp_masks"][slot, olo:ohi], views["opp_model"][slot, olo:ohi])
 
     while True:
         try:
@@ -275,7 +301,9 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
             break
 
         if cmd == "step":
-            slot, actions = data
+            slot, actions, opponent_actions = data
+            if opponent_actions is not None:
+                env.set_opponent_actions(opponent_actions)
             obs, rewards, terminated, truncated, infos = env.step(actions)
             views["grid"][slot, lo:hi] = obs["grid_tensor"]
             views["features"][slot, lo:hi] = obs["features"]
@@ -283,10 +311,12 @@ def _shard_worker(remote, parent_remote, world_args_kwargs: dict, opponents, lay
             views["terminated"][slot, lo:hi] = terminated
             views["truncated"][slot, lo:hi] = truncated
             views["masks"][slot, lo:hi] = env.action_masks()
+            publish(slot)
             remote.send(infos)
         elif cmd == "reset":
-            seed, options = data
+            seed, options, slot = data
             obs, infos = env.reset(seed=seed, options=options)
+            publish(slot)
             remote.send((obs, infos, env.action_masks()))
         elif cmd == "action_masks":
             remote.send(env.action_masks())
@@ -332,10 +362,14 @@ class ShardedNativeBatchedVecEnv(VecEnv):
 
         ctx = mp.get_context("spawn")
         grid_shape, n_features = observation_shapes(cfg.env.layer_config, cfg.env.env_version)
-        self._shared = SharedStepBuffers(ctx, cfg.n_envs, grid_shape, n_features, len(ACTIONS))
+        opponent_rows = cfg.n_envs * MAX_OPPONENTS if cfg.self_play.opponent_inference == "learner" else 0
+        self._shared = SharedStepBuffers(ctx, cfg.n_envs, grid_shape, n_features, len(ACTIONS),
+                                         n_shards=n_shards, opponent_rows=opponent_rows)
         self._views = self._shared.views()
         self._slot = 1
         self._last_action_masks: Optional[np.ndarray] = None
+        self._opponent_evaluator = None
+        self._opponent_actions: Optional[list] = None
         self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(n_shards)])
         self.processes = []
         for i, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
@@ -373,20 +407,39 @@ class ShardedNativeBatchedVecEnv(VecEnv):
         super().__init__(num_envs=cfg.n_envs, observation_space=obs_space, action_space=act_space)
         self._actions = None
 
+    def set_opponent_evaluator(self, evaluator) -> None:
+        self._opponent_evaluator = evaluator
+
+    def _evaluate_opponents(self, slot: int) -> Optional[list]:
+        if self._opponent_evaluator is None or not self._shared.opponent_rows:
+            return None
+        views = self._views
+        counts = views["opp_count"][slot].copy()
+        if counts.sum() == 0:
+            return [np.zeros(0, dtype=np.int64) for _ in range(self.n_shards)]
+        per_shard = self._shared.opponent_rows // self.n_shards
+        sel = np.concatenate([np.arange(s * per_shard, s * per_shard + int(counts[s])) for s in range(self.n_shards)])
+        obs = {"grid_tensor": views["opp_grid"][slot][sel], "features": views["opp_features"][slot][sel]}
+        greedy = self._opponent_evaluator(obs, views["opp_masks"][slot][sel], views["opp_model"][slot][sel])
+        return list(np.split(np.asarray(greedy, dtype=np.int64), np.cumsum(counts)[:-1]))
+
     def reset(self, seed=None, options=None):
         for remote in self.remotes:
-            remote.send(("reset", (seed, options)))
+            remote.send(("reset", (seed, options, self._slot)))
         results = [remote.recv() for remote in self.remotes]
         obs_list, info_lists, mask_list = zip(*results)
         self._last_infos = [info for infos in info_lists for info in infos]
         self._last_action_masks = np.concatenate(mask_list, axis=0)
+        self._opponent_actions = self._evaluate_opponents(self._slot)
         return _concat_obs(list(obs_list))
 
     def step_async(self, actions: np.ndarray) -> None:
+        opponent_actions = self._opponent_actions
+        self._opponent_actions = None
         self._slot ^= 1
         shards = np.split(np.asarray(actions), self.n_shards)
-        for remote, shard_actions in zip(self.remotes, shards):
-            remote.send(("step", (self._slot, shard_actions)))
+        for i, (remote, shard_actions) in enumerate(zip(self.remotes, shards)):
+            remote.send(("step", (self._slot, shard_actions, None if opponent_actions is None else opponent_actions[i])))
 
     def step_wait(self):
         infos = [info for remote in self.remotes for info in remote.recv()]
@@ -396,6 +449,7 @@ class ShardedNativeBatchedVecEnv(VecEnv):
         dones = views["terminated"][slot] | views["truncated"][slot]
         self._last_infos = infos
         self._last_action_masks = views["masks"][slot].copy()
+        self._opponent_actions = self._evaluate_opponents(slot)
         return obs, rewards, dones, infos
 
     def step(self, actions: np.ndarray):
@@ -476,6 +530,13 @@ class ShardedNativeBatchedVecEnv(VecEnv):
 
     def get_images(self) -> list:
         return [None] * self.num_envs
+
+
+def _sync_learner_inference(env, pool: OpponentPool) -> None:
+    inference = getattr(getattr(env, "venv", env), "_opponent_evaluator", None)
+    if inference is None:
+        return
+    env.env_method("set_opponent_model_index", inference.update(pool._checkpoints))
 
 
 def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
@@ -637,6 +698,7 @@ class OpponentResampleCallback(BaseCallback):
             return
 
         self.training_env.env_method("set_opponent_resampler", OpponentSampler(self.pool))
+        _sync_learner_inference(self.training_env, self.pool)
 
         if self.verbose:
             arrangement_str = ", ".join(
@@ -1050,12 +1112,17 @@ def run(
         )
 
     device = resolve_device(cfg.device)
+    if cfg.self_play.opponent_inference == "learner" and cfg.n_shards <= 1:
+        set_inference_device(device)
 
     pool = OpponentPool(ckman, cfg.self_play)
     opponents = pool.current_opponents()
 
     env = make_train_env(cfg, opponents, str(ckman.logs_dir))
+    if cfg.self_play.opponent_inference == "learner" and cfg.n_shards > 1:
+        env.venv.set_opponent_evaluator(LearnerOpponentInference(device))
     env.env_method("set_opponent_resampler", OpponentSampler(pool))
+    _sync_learner_inference(env, pool)
 
     model = build_model(env, cfg, str(ckman.tensorboard_dir), device)
 
@@ -1075,7 +1142,8 @@ def run(
             else ckman.latest_checkpoint()
         )
         if checkpoint_dir is not None:
-            loaded_model = ckman.load_model(MaskablePPO, checkpoint_dir, env=env, device=device)
+            loaded_model = ckman.load_model(MaskablePPO, checkpoint_dir, env=env, device=device,
+                                            custom_objects={"rollout_buffer_class": PinnedMaskableDictRolloutBuffer})
             model = loaded_model
             timesteps_done = ckman.resolved_timesteps(checkpoint_dir)
             apply_ppo_hyperparams(model, cfg.ppo)

@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import concurrent.futures
 import hashlib
+import importlib
 import inspect
 import json
 import logging
 import math
 import multiprocessing as mp
+import os
 import pathlib
 import platform
-import queue
 import random
 import re
 import subprocess
 import sys
-import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -121,9 +123,32 @@ def _round_seed(seed: int, round_index: int) -> int:
     return int(np.random.SeedSequence([seed, round_index]).generate_state(1)[0])
 
 
+AGENT_LOG_LEVEL = logging.WARNING
+MAX_POOL_WORKERS = 61 if sys.platform == "win32" else 512
+_APPLIED_ENV_KEYS: set = set()
+
+
+def default_workers() -> int:
+    return max(1, min(MAX_POOL_WORKERS, (os.cpu_count() or 2) - 1))
+
+
+def _agent_env_snapshot() -> Dict[str, str]:
+    return dict(os.environ)
+
+
+def _apply_agent_env(snapshot: Dict[str, str]) -> None:
+    global _APPLIED_ENV_KEYS
+    for key in _APPLIED_ENV_KEYS - set(snapshot):
+        os.environ.pop(key, None)
+    os.environ.update(snapshot)
+    _APPLIED_ENV_KEYS = set(snapshot)
+
+
 def _make_world(agents: List[str], scenario: str, seed: Optional[int], log_dir: pathlib.Path,
                 silence_errors: bool) -> BombeRLeWorld:
     log_dir.mkdir(parents=True, exist_ok=True)
+    s.LOG_AGENT_CODE = AGENT_LOG_LEVEL
+    s.LOG_AGENT_WRAPPER = AGENT_LOG_LEVEL
     args = WorldArgs(
         no_gui=True,
         fps=0,
@@ -252,18 +277,53 @@ def play_rounds(agents: List[str], scenario: str, n_rounds: int, seed: Optional[
         _close_world_loggers(world)
 
 
-def _worker(worker_id: int, agents: List[str], scenario: str, n_rounds: int, seed: Optional[int],
-            round_offset: int, log_dir: str, silence_errors: bool, results: mp.Queue) -> None:
-    try:
-        records = play_rounds(agents, scenario, n_rounds, seed, pathlib.Path(log_dir), silence_errors,
-                              round_offset=round_offset,
-                              progress=lambda: results.put(("round", worker_id)))
-        for r in records:
-            r["worker"] = worker_id
-        results.put(("done", worker_id, records))
-    except BaseException:
-        results.put(("error", worker_id, traceback.format_exc()))
-        raise
+def _pool_init(agents: List[str], agent_log_level: int) -> None:
+    global AGENT_LOG_LEVEL
+    AGENT_LOG_LEVEL = agent_log_level
+    import torch
+    torch.set_num_threads(1)
+    for name in set(agents):
+        try:
+            importlib.import_module(f"agent_code.{name}.callbacks")
+        except Exception:
+            pass
+
+
+def _pool_task(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    _apply_agent_env(task["env"])
+    records = play_rounds(task["agents"], task["scenario"], task["n_rounds"], task["seed"],
+                          pathlib.Path(task["log_dir"]), task["silence_errors"], round_offset=task["round_offset"])
+    for r in records:
+        r["worker"] = task["worker_id"]
+    return records
+
+
+_POOL: Optional[concurrent.futures.ProcessPoolExecutor] = None
+_POOL_SIZE = 0
+
+
+def worker_pool(workers: int, agents: List[str]) -> concurrent.futures.ProcessPoolExecutor:
+    global _POOL, _POOL_SIZE
+    workers = max(1, min(int(workers), MAX_POOL_WORKERS))
+    if _POOL is None or _POOL_SIZE != workers:
+        shutdown_pool()
+        _POOL = concurrent.futures.ProcessPoolExecutor(
+            max_workers=workers, mp_context=mp.get_context("spawn"),
+            initializer=_pool_init, initargs=(list(agents), AGENT_LOG_LEVEL),
+        )
+        _POOL_SIZE = workers
+    return _POOL
+
+
+def shutdown_pool() -> None:
+    global _POOL, _POOL_SIZE
+    if _POOL is not None:
+        _POOL.shutdown(wait=True, cancel_futures=True)
+        _POOL = None
+        _POOL_SIZE = 0
+
+
+atexit.register(shutdown_pool)
 
 
 def _prepare_agent_log_dirs(agents: List[str]) -> None:
@@ -294,49 +354,24 @@ def play_parallel(agents: List[str], scenario: str, n_rounds: int, seed: Optiona
         return records
 
     _prepare_agent_log_dirs(agents)
-    results: mp.Queue = mp.Queue()
-    processes = []
-    for worker_id, (n, offset) in enumerate(zip(chunks, offsets)):
-        p = mp.Process(
-            target=_worker,
-            args=(worker_id, agents, scenario, n, seed, offset, str(log_dir / f"worker_{worker_id}"),
-                  silence_errors, results),
-        )
-        p.start()
-        processes.append(p)
-
+    env_snapshot = _agent_env_snapshot()
+    tasks = [
+        dict(worker_id=worker_id, agents=list(agents), scenario=scenario, n_rounds=n, seed=seed, round_offset=offset,
+             log_dir=str(log_dir / f"worker_{worker_id}"), silence_errors=silence_errors, env=env_snapshot)
+        for worker_id, (n, offset) in enumerate(zip(chunks, offsets))
+    ]
+    pool = worker_pool(workers, agents)
+    futures = {pool.submit(_pool_task, task): task["worker_id"] for task in tasks}
     collected: Dict[int, List[Dict[str, Any]]] = {}
-    errors: List[Any] = []
-
-    def _handle(message) -> None:
-        if message[0] == "round":
-            bar.update(1)
-        elif message[0] == "done":
-            collected[message[1]] = message[2]
-        else:
-            errors.append(message)
-
     with tqdm(total=n_rounds, desc="rounds") as bar:
-        while len(collected) + len(errors) < workers:
-            try:
-                _handle(results.get(timeout=1))
-            except queue.Empty:
-                if all(not p.is_alive() for p in processes):
-                    break
-        for p in processes:
-            p.join()
-        while True:
-            try:
-                _handle(results.get_nowait())
-            except queue.Empty:
-                break
-
-    if errors:
-        raise RuntimeError("worker failures: " + "; ".join(f"worker {w}: {msg}" for _, w, msg in errors))
-    dead = [i for i, p in enumerate(processes) if i not in collected]
-    if dead:
-        raise RuntimeError("workers died without reporting: " +
-                           ", ".join(f"worker {i} (exit code {processes[i].exitcode})" for i in dead))
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                worker_id = futures[future]
+                collected[worker_id] = future.result()
+                bar.update(len(collected[worker_id]))
+        except concurrent.futures.process.BrokenProcessPool as exc:
+            shutdown_pool()
+            raise RuntimeError(f"an evaluation worker died: {exc}") from exc
 
     records = [r for worker_id in sorted(collected) for r in collected[worker_id]]
     if len(records) != n_rounds:
@@ -509,7 +544,11 @@ def main(argv=None) -> None:
         p.add_argument("--n-rounds", type=int, default=100)
         p.add_argument("--seed", type=int, default=0,
                        help="run seed; every round is seeded from it and its index (-1: unseeded)")
-        p.add_argument("--workers", type=int, default=1, help="processes to split the rounds over")
+        p.add_argument("--workers", type=int, default=default_workers(),
+                       help="processes to split the rounds over (default: cores - 1)")
+        p.add_argument("--agent-log-level", default="WARNING", type=str.upper,
+                       choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                       help="log level of the agents' code/wrapper loggers during evaluation (default WARNING)")
         p.add_argument("--silence-errors", action="store_true",
                        help="keep playing when an agent throws (default: abort, as the tournament would)")
         p.add_argument("--note", help="free text stored in the result file, e.g. which checkpoint was evaluated")
@@ -541,6 +580,8 @@ def main(argv=None) -> None:
         return
 
     seed = None if args.seed < 0 else args.seed
+    global AGENT_LOG_LEVEL
+    AGENT_LOG_LEVEL = logging.getLevelName(args.agent_log_level)
     if args.command == "run":
         if args.matchup:
             if not args.agent:

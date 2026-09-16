@@ -91,6 +91,8 @@ class DQNConfig:
     weight_decay: float = 0.0
     dropout: float = 0.0
     amp: str = "fp16"
+    replay_prefetch: bool = True
+    replay_device: str = "host"
 
 
 @dataclass(frozen=True)
@@ -181,6 +183,7 @@ class SelfPlayConfig:
 
     pool_size: int = 8
     add_checkpoint_every_epochs: int = 1
+    opponent_inference: str = "shard"
     sample_strategy: Literal["uniform", "latest_biased"] = "latest_biased"
     latest_bias: float = 0.5
 
@@ -229,6 +232,8 @@ class TrainingConfig:
         "dqn.symmetry_augmentation",
         "dqn.weight_decay",
         "dqn.amp",
+        "dqn.replay_prefetch",
+        "dqn.replay_device",
         "self_play.enabled",
         "self_play.static_opponents",
         "self_play.arrangements",
@@ -237,6 +242,7 @@ class TrainingConfig:
         "self_play.resample_every_n_timesteps",
         "self_play.pool_size",
         "self_play.add_checkpoint_every_epochs",
+        "self_play.opponent_inference",
         "self_play.sample_strategy",
         "self_play.latest_bias",
         "rewards.waited",
