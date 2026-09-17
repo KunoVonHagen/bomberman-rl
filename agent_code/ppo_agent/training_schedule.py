@@ -16,10 +16,9 @@ DEFAULT_SCHEDULE = [
         "overrides": {
             "total_timesteps": 150_000_000,
             "self_play.static_opponents": STATIC_OPPONENT_POOL,
-            "self_play.arrangements": "0,0,1.0;0,1,1.5;1,0,1.0;0,2,1.5;1,1,1.5;0,3,2.0;1,2,1.5;2,1,1.0",
+            "self_play.arrangements": "0,1,1.0;1,0,0.75;0,2,1.25;1,1,1.25;0,3,3.0;1,2,2.25;2,1,1.5",
             "env.scenario_mix": "classic,0.85;coin-heaven,0.15",
             "ppo.learning_rate": 3e-5,
-            "ppo.ent_coef": 0.01,
             "ppo.n_steps": 1024,
             "ppo.batch_size": 4096,
             "rewards.bomb_dropped": 0.01,
@@ -28,7 +27,7 @@ DEFAULT_SCHEDULE = [
             "rewards.killed_opponent": 5.0,
             "rewards.killed_self": -1.0,
             "rewards.got_killed": -5.0,
-            "rewards.rival_killed_opponent": -0.5,
+            "rewards.rival_killed_opponent": 0.0,
             "rewards.waited": -0.01,
             "rewards.invalid_action": -0.2,
             "rewards.crate_destroyed": 0.3,
@@ -45,17 +44,14 @@ DEFAULT_SCHEDULE = [
         "overrides": {
             "rewards.bomb_dropped": 0.0,
             "rewards.coin_found": 0.01,
-            "ppo.ent_coef": 0.008,
         },
     },
     {
         "at_timesteps": 40_000_000,
         "overrides": {
             "rewards.coin_found": 0.0,
-            "self_play.arrangements": "0,0,0.75;0,1,1.25;1,0,0.5;0,2,1.75;1,1,1.25;0,3,3.0;1,2,2.25;2,1,1.5",
-            "env.scenario_mix": "classic,0.90;coin-heaven,0.10",
-            "rewards.rival_killed_opponent": -1.0,
-            "ppo.ent_coef": 0.007,
+            "self_play.arrangements": "0,1,1.25;1,0,0.5;0,2,1.75;1,1,1.25;0,3,3.5;1,2,2.75;2,1,2.0",
+            "env.scenario_mix": "classic,1.0;coin-heaven,0.0",
         },
     },
     {
@@ -72,15 +68,12 @@ DEFAULT_SCHEDULE = [
             "rewards.danger_penalty_coef": 0.03,
             "rewards.escape_bonus_coef": 0.03,
             "rewards.trap_shaping_coef": 0.06,
-            "ppo.ent_coef": 0.006,
         },
     },
     {
         "at_timesteps": 70_000_000,
         "overrides": {
-            "self_play.arrangements": "0,0,0.5;0,1,0.75;0,2,1.5;1,2,1.25;2,1,2.25;3,0,0.75",
-            "rewards.rival_killed_opponent": -1.5,
-            "ppo.ent_coef": 0.005,
+            "self_play.arrangements": "0,1,0.5;0,2,1.25;1,2,1.75;2,1,2.75;3,0,1.25",
         },
     },
     {
@@ -97,15 +90,12 @@ DEFAULT_SCHEDULE = [
             "rewards.danger_penalty_coef": 0.015,
             "rewards.escape_bonus_coef": 0.015,
             "rewards.trap_shaping_coef": 0.03,
-            "ppo.ent_coef": 0.004,
         },
     },
     {
         "at_timesteps": 100_000_000,
         "overrides": {
-            "self_play.arrangements": "0,0,0.4;0,2,1.0;2,1,1.5;3,0,2.0",
-            "rewards.rival_killed_opponent": -2.0,
-            "ppo.ent_coef": 0.003,
+            "self_play.arrangements": "0,2,0.75;2,1,2.0;3,0,2.5",
         },
     },
     {
@@ -122,22 +112,19 @@ DEFAULT_SCHEDULE = [
             "rewards.danger_penalty_coef": 0.005,
             "rewards.escape_bonus_coef": 0.005,
             "rewards.trap_shaping_coef": 0.01,
-            "ppo.ent_coef": 0.002,
         },
     },
     {
         "at_timesteps": 130_000_000,
         "overrides": {
-            "self_play.arrangements": "0,0,0.25;0,1,0.4;0,2,0.6;3,0,1.0",
-            "env.scenario_mix": "classic,0.95;coin-heaven,0.05",
-            "ppo.ent_coef": 0.0015,
+            "self_play.arrangements": "0,1,0.25;0,2,0.4;3,0,1.5",
         },
     },
     {
         "at_timesteps": 142_000_000,
         "overrides": {
+            "self_play.arrangements": "0,3,1.0;1,2,1.0;2,1,1.0;3,0,1.0",
             "ppo.learning_rate": 3e-6,
-            "ppo.ent_coef": 0.001,
             "rewards.waited": 0.0,
             "rewards.invalid_action": 0.0,
             "rewards.crate_destroyed": 0.0,
@@ -145,8 +132,8 @@ DEFAULT_SCHEDULE = [
             "rewards.danger_penalty_coef": 0.0,
             "rewards.escape_bonus_coef": 0.0,
             "rewards.trap_shaping_coef": 0.0,
-            "rewards.killed_self": -0.05,
-            "rewards.got_killed": -0.25,
+            "rewards.killed_self": 0.0,
+            "rewards.got_killed": 0.0,
         },
     },
 ]
