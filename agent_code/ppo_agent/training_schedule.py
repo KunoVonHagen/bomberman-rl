@@ -19,7 +19,7 @@ DEFAULT_SCHEDULE = [
             "self_play.arrangements": "0,0,1.0;0,1,1.5;1,0,1.0;0,2,1.5;1,1,1.5;0,3,2.0;1,2,1.5;2,1,1.0",
             "env.scenario_mix": "classic,0.85;coin-heaven,0.15",
             "ppo.learning_rate": 3e-5,
-            "ppo.ent_coef": 0.02,
+            "ppo.ent_coef": 0.01,
             "ppo.n_steps": 1024,
             "ppo.batch_size": 4096,
             "rewards.bomb_dropped": 0.01,
@@ -45,7 +45,7 @@ DEFAULT_SCHEDULE = [
         "overrides": {
             "rewards.bomb_dropped": 0.0,
             "rewards.coin_found": 0.01,
-            "ppo.ent_coef": 0.015,
+            "ppo.ent_coef": 0.008,
         },
     },
     {
@@ -55,6 +55,7 @@ DEFAULT_SCHEDULE = [
             "self_play.arrangements": "0,0,0.75;0,1,1.25;1,0,0.5;0,2,1.75;1,1,1.25;0,3,3.0;1,2,2.25;2,1,1.5",
             "env.scenario_mix": "classic,0.90;coin-heaven,0.10",
             "rewards.rival_killed_opponent": -1.0,
+            "ppo.ent_coef": 0.007,
         },
     },
     {
@@ -71,14 +72,15 @@ DEFAULT_SCHEDULE = [
             "rewards.danger_penalty_coef": 0.03,
             "rewards.escape_bonus_coef": 0.03,
             "rewards.trap_shaping_coef": 0.06,
+            "ppo.ent_coef": 0.006,
         },
     },
     {
         "at_timesteps": 70_000_000,
         "overrides": {
             "self_play.arrangements": "0,0,0.5;0,1,0.75;0,2,1.5;1,2,1.25;2,1,2.25;3,0,0.75",
-            "ppo.ent_coef": 0.01,
             "rewards.rival_killed_opponent": -1.5,
+            "ppo.ent_coef": 0.005,
         },
     },
     {
@@ -95,14 +97,15 @@ DEFAULT_SCHEDULE = [
             "rewards.danger_penalty_coef": 0.015,
             "rewards.escape_bonus_coef": 0.015,
             "rewards.trap_shaping_coef": 0.03,
+            "ppo.ent_coef": 0.004,
         },
     },
     {
         "at_timesteps": 100_000_000,
         "overrides": {
             "self_play.arrangements": "0,0,0.4;0,2,1.0;2,1,1.5;3,0,2.0",
-            "ppo.ent_coef": 0.006,
             "rewards.rival_killed_opponent": -2.0,
+            "ppo.ent_coef": 0.003,
         },
     },
     {
@@ -119,6 +122,7 @@ DEFAULT_SCHEDULE = [
             "rewards.danger_penalty_coef": 0.005,
             "rewards.escape_bonus_coef": 0.005,
             "rewards.trap_shaping_coef": 0.01,
+            "ppo.ent_coef": 0.002,
         },
     },
     {
@@ -126,14 +130,14 @@ DEFAULT_SCHEDULE = [
         "overrides": {
             "self_play.arrangements": "0,0,0.25;0,1,0.4;0,2,0.6;3,0,1.0",
             "env.scenario_mix": "classic,0.95;coin-heaven,0.05",
-            "ppo.ent_coef": 0.003,
+            "ppo.ent_coef": 0.0015,
         },
     },
     {
         "at_timesteps": 142_000_000,
         "overrides": {
             "ppo.learning_rate": 3e-6,
-            "ppo.ent_coef": 0.0015,
+            "ppo.ent_coef": 0.001,
             "rewards.waited": 0.0,
             "rewards.invalid_action": 0.0,
             "rewards.crate_destroyed": 0.0,
