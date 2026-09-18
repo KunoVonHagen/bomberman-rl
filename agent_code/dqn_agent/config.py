@@ -140,8 +140,8 @@ class EnvConfig:
 @dataclass
 class RewardConfig:
     """Configuration for reward shaping in the Bomberman environment."""
-    waited: float = -0.01
-    invalid_action: float = -0.2
+    waited: float = 0.0
+    invalid_action: float = -0.05
     bomb_dropped: float = 0.0
     bomb_exploded: float = 0.0
     crate_destroyed: float = 0.3
@@ -153,13 +153,13 @@ class RewardConfig:
     opponent_eliminated: float = 0.0
     survived_round: float = 0.0
 
-    rival_killed_opponent: float = -2.0
+    rival_killed_opponent: float = 0.0
 
     coin_shaping_coef: float = 0.05
     crate_shaping_coef: float = 0.02
     danger_penalty_coef: float = 0.05
     escape_bonus_coef: float = 0.05
-    trap_shaping_coef: float = 0.1
+    trap_shaping_coef: float = 0.03
 
 
 @dataclass(frozen=True)

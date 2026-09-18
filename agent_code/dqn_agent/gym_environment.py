@@ -103,6 +103,7 @@ ACTION_INDICES = {
 _EXPLOSION_STAGE1_TICKS = 2
 
 MAX_OPPONENTS = 3
+COIN_SHAPING_DISTANCE_CAP = 10.0
 
 WALL_LAYER, CRATE_LAYER, COIN_LAYER, SELF_LAYER, SELF_BLAST_LAYER, OPPONENT_LAYER, OPPONENT_DANGER_LAYER, BOMBS_LEFT_LAYER = range(
     8)
@@ -2169,7 +2170,7 @@ class BombermanGymEnv(gym.Env):
     def _coin_distance_now(self, env: int) -> float:
         a = self.agents[env]
         d = self.grid_tensor[env, COIN_DISTANCE_LAYER, a.x, a.y]
-        return 0.0 if d < 0 else float(d)
+        return COIN_SHAPING_DISTANCE_CAP if d < 0 else min(float(d), COIN_SHAPING_DISTANCE_CAP)
 
     def _crate_distance_now(self, env: int) -> float:
         a = self.agents[env]

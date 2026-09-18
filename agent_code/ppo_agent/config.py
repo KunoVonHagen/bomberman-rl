@@ -174,8 +174,8 @@ class RewardConfig:
     Configuration for the reward shaping in the Bomberman environment.
     These are passed to the BombermanGymEnv constructor.
     """
-    waited: float = -0.01
-    invalid_action: float = -0.2
+    waited: float = 0.0
+    invalid_action: float = -0.05
     bomb_dropped: float = 0.0
     bomb_exploded: float = 0.0
     crate_destroyed: float = 0.3
@@ -193,7 +193,7 @@ class RewardConfig:
     crate_shaping_coef: float = 0.02
     danger_penalty_coef: float = 0.05
     escape_bonus_coef: float = 0.05
-    trap_shaping_coef: float = 0.1
+    trap_shaping_coef: float = 0.03
 
 
 @dataclass(frozen=True)

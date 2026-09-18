@@ -211,7 +211,7 @@ def main(argv=None) -> None:
                    help="rank by the evaluation stored in each checkpoint's metadata.json instead of playing")
     p.add_argument("--matchups", nargs="+", default=VALIDATION_MATCHUPS, choices=sorted(MATCHUPS))
     p.add_argument("--criterion", choices=sorted(CRITERIA), default="score")
-    p.add_argument("--n-rounds", type=int, default=30)
+    p.add_argument("--n-rounds", type=int, default=100)
     p.add_argument("--seed", type=int, default=0, help="same seed = same boards for every checkpoint")
     p.add_argument("--workers", type=int, default=default_workers(), help="evaluation processes (default: cores - 1)")
     p.add_argument("--silence-errors", action="store_true")
