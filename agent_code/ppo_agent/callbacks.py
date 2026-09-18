@@ -18,8 +18,8 @@ from .config import TrainingConfig
 from .gym_environment import ACTION_INDICES, BombermanGymEnv, WorldArgs
 from .model import BombermanFeatureExtractor, InferenceOptimizer
 
-RUN: str = "bomberman_ppo_20260914_182311"
-CHECKPOINT: Optional[str] = "checkpoint_0137363456"
+RUN: str = "bomberman_ppo_20260917_173456"
+CHECKPOINT: Optional[str] = "checkpoint_0065011712"
 ENSEMBLE: list = []
 DETERMINISTIC: bool = True
 
