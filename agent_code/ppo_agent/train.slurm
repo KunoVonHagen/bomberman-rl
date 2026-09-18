@@ -30,6 +30,9 @@ if [ -d "$RUN_DIR" ]; then
 else
     echo "No existing run dir -- starting a new run."
     TRAIN_ARGS=(--set "run_name=$RUN_NAME")
+    if [ -n "${SEED:-}" ]; then
+        TRAIN_ARGS+=("seed=$SEED" "env.seed=$SEED")
+    fi
 fi
 
 srun python -m agent_code.ppo_agent.train "${TRAIN_ARGS[@]}" --device cuda

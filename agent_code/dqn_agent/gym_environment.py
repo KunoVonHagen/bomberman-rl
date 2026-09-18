@@ -48,6 +48,12 @@ class _NullLogger:
 _NULL_LOGGER = _NullLogger()
 
 
+def _setup_opponent(setup_fn: Callable, handle: "AgentHandle") -> None:
+    state = np.random.get_state()
+    setup_fn(handle)
+    np.random.set_state(state)
+
+
 class AgentHandle:
     """Tracks one agent's gameplay state and basic bookkeeping."""
 
@@ -893,7 +899,7 @@ class BombermanGymEnv(gym.Env):
 
         for handles in self.opponent_handles:
             for handle, (setup_fn, _act_fn) in zip(handles, opponents):
-                setup_fn(handle)
+                _setup_opponent(setup_fn, handle)
 
         self.reward_fn = reward_fn or self.shaped_reward
 
@@ -1142,7 +1148,7 @@ class BombermanGymEnv(gym.Env):
         self.n_real_opponents[env] = len(opponents)
         self.opponent_act_fns[env] = [act_fn for (_setup_fn, act_fn) in opponents]
         for handle, (setup_fn, _act_fn) in zip(self.opponent_handles[env], opponents):
-            setup_fn(handle)
+            _setup_opponent(setup_fn, handle)
 
     def _new_round(self, env: int):
         """Reset one env's game state (per-env, cheap; heavy layers are refreshed batched)."""
@@ -1485,7 +1491,7 @@ class BombermanGymEnv(gym.Env):
         self.n_real_opponents = [len(opponents) for _ in range(self.n_envs)]
         for handles in self.opponent_handles:
             for handle, (setup_fn, _act_fn) in zip(handles, opponents):
-                setup_fn(handle)
+                _setup_opponent(setup_fn, handle)
 
     def set_opponent_resampler(self, resampler) -> None:
         """

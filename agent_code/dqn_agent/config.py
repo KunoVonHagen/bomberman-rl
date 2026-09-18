@@ -197,6 +197,7 @@ class SelfPlayConfig:
 class TrainingConfig:
     """Top-level training configuration for a DQN run."""
     run_name: Optional[str] = None
+    seed: Optional[int] = None
     runs_dir: str = "runs"
     n_envs: int = 32
     n_shards: int = 1

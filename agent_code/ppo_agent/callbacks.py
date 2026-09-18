@@ -16,12 +16,15 @@ from sb3_contrib.common.maskable.buffers import MaskableDictRolloutBuffer
 import settings as s
 from .config import TrainingConfig
 from .gym_environment import ACTION_INDICES, BombermanGymEnv, WorldArgs
+from .symmetry import ACTION_PERM, N_SYMMETRIES, transform_masks, transform_observation
 from .model import BombermanFeatureExtractor, InferenceOptimizer
 
 RUN: str = "bomberman_ppo_20260917_173456"
 CHECKPOINT: Optional[str] = "checkpoint_0065011712"
 ENSEMBLE: list = []
+TTA_SYMMETRIES: int = N_SYMMETRIES
 DETERMINISTIC: bool = True
+ENSEMBLE_FILE = "ensemble.txt"
 
 AGENT_DIR = pathlib.Path(__file__).resolve().parent
 ENV_PREFIX = "PPO_AGENT"
@@ -58,6 +61,24 @@ def _resolve_run_dir(run: str) -> pathlib.Path:
         f"ppo_agent: no run '{run}' with a run_manifest.json in any of "
         f"{[str(c) for c in candidates]} -- set RUN at the top of callbacks.py"
     )
+
+
+def _read_ensemble_file(run_dir: pathlib.Path) -> list:
+    pointer = run_dir / "checkpoints" / ENSEMBLE_FILE
+    if not pointer.exists():
+        raise FileNotFoundError(f"{pointer} not found (run evaluation.select_checkpoint --write-ensemble)")
+    return [line.strip() for line in pointer.read_text().splitlines() if line.strip()]
+
+
+def _symmetry_batch(obs: dict, masks: np.ndarray, n: int) -> tuple:
+    views = [transform_observation(obs, k) for k in range(n)]
+    batch = {"grid_tensor": np.stack([v["grid_tensor"] for v in views]), "features": np.stack([v["features"] for v in views])}
+    return batch, np.stack([transform_masks(masks, k) for k in range(n)])
+
+
+def _average_symmetries(values: np.ndarray) -> np.ndarray:
+    n = values.shape[0]
+    return np.mean([values[k, ACTION_PERM[k]] for k in range(n)], axis=0)
 
 
 def _resolve_checkpoint_dir(run_dir: pathlib.Path, checkpoint: Optional[str]) -> pathlib.Path:
@@ -166,16 +187,22 @@ def _choose(self, game_state: dict) -> str:
     obs_env = self._ppo_obs_env
     obs = obs_env.observation_from_game_state(game_state)
     action_masks = obs_env.action_masks()
-    if len(self._ppo_models) == 1:
+    if len(self._ppo_models) == 1 and self._ppo_tta <= 1:
         action_idx, _ = self._ppo_model.predict(obs, deterministic=DETERMINISTIC, action_masks=action_masks)
         return _ACTION_NAMES[int(action_idx)]
+    if self._ppo_tta > 1:
+        batch, masks = _symmetry_batch(obs, np.asarray(action_masks[0]), self._ppo_tta)
+    else:
+        batch, masks = obs, action_masks
     probs = []
     with torch.no_grad():
         for policy in self._ppo_models:
-            obs_t, _ = policy.obs_to_tensor(obs)
-            probs.append(policy.get_distribution(obs_t, action_masks=action_masks).distribution.probs[0])
-    mean = torch.stack(probs).mean(dim=0)
-    action_idx = int(mean.argmax()) if DETERMINISTIC else int(torch.multinomial(mean, 1))
+            obs_t, _ = policy.obs_to_tensor(batch)
+            p = policy.get_distribution(obs_t, action_masks=masks).distribution.probs.cpu().numpy()
+            probs.append(_average_symmetries(p) if self._ppo_tta > 1 else p[0])
+    mean = np.mean(probs, axis=0)
+    mean = np.where(np.asarray(action_masks[0]).astype(bool), mean, 0.0)
+    action_idx = int(np.argmax(mean)) if DETERMINISTIC else int(np.random.choice(len(mean), p=mean / mean.sum()))
     return _ACTION_NAMES[action_idx]
 
 
@@ -201,11 +228,13 @@ def setup(self):
     self._ppo_model = None
     self._ppo_models = []
     self._ppo_obs_env = None
-
+    self._ppo_tta = max(1, min(N_SYMMETRIES, int(_setting("TTA_SYMMETRIES", TTA_SYMMETRIES))))
     try:
         run = _setting("RUN", RUN)
         members = _member_specs(_setting("ENSEMBLE", ENSEMBLE)) or [_setting("CHECKPOINT", CHECKPOINT) or "latest"]
         run_dir = _resolve_run_dir(run)
+        if members == ["ensemble"]:
+            members = _read_ensemble_file(run_dir)
         cfg = _load_config(run_dir)
         loaded = []
         for entry in members:

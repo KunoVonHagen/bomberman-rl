@@ -24,6 +24,7 @@ VALIDATION_MATCHUPS = ["task2-classic-solo", "task3-hunt", "task4-rule-based-x3"
 CRITERIA = {"score": ("score_mean", "score_sem"), "win": ("win_rate", "win_rate_sem"),
             "survival": ("survival_rate", "survival_rate_sem")}
 BEST_FILE = "best.txt"
+ENSEMBLE_FILE = "ensemble.txt"
 
 
 def relative_path(path: pathlib.Path) -> str:
@@ -98,16 +99,16 @@ def metadata_scores(meta: Dict[str, Any]) -> Dict[str, Optional[float]]:
     return out
 
 
-def rank_by_metadata(candidates: List[pathlib.Path]) -> Dict[str, Any]:
+def rank_by_metadata(owner: Dict[str, tuple]) -> Dict[str, Any]:
     rows, cases = [], []
-    for ckpt in candidates:
+    for label, (_run_dir, ckpt) in owner.items():
         meta = read_metadata(ckpt)
         scores = metadata_scores(meta)
         for case in scores:
             if case not in cases:
                 cases.append(case)
         valid = [v for v in scores.values() if v is not None]
-        rows.append(dict(checkpoint=ckpt.name, timesteps=timesteps_of(ckpt), train_reward=meta.get("ep_rew_mean"),
+        rows.append(dict(checkpoint=label, timesteps=timesteps_of(ckpt), train_reward=meta.get("ep_rew_mean"),
                          cases=scores, overall=float(np.mean(valid)) if valid else None))
     scored = [r for r in rows if r["overall"] is not None]
     best = max(scored, key=lambda r: (r["overall"], r["timesteps"])) if scored else None
@@ -148,12 +149,6 @@ def play_run(agent: str, prefix: str, run: str, checkpoint: Optional[str], label
         out[name] = dict(summary=summary, score=[float(a["score"]) for a in rounds],
                          win=[float(a["win"]) for a in rounds], alive=[float(a["alive"]) for a in rounds])
     return out
-
-
-def play_candidate(agent: str, prefix: str, run: str, checkpoint: pathlib.Path, matchups: List[str],
-                   n_rounds: int, seed: int, workers: int, silence_errors: bool, log_dir: pathlib.Path) -> Dict[str, Any]:
-    return play_run(agent, prefix, run, checkpoint.name, checkpoint.name, matchups, n_rounds, seed, workers,
-                    silence_errors, log_dir)
 
 
 def score_run(results: Dict[str, Any], criterion: str) -> float:
@@ -201,10 +196,32 @@ def write_best(run_dir: pathlib.Path, checkpoint: str) -> pathlib.Path:
     return pointer
 
 
+def write_ensemble(run_dir: pathlib.Path, members: List[str]) -> pathlib.Path:
+    pointer = run_dir / "checkpoints" / ENSEMBLE_FILE
+    pointer.write_text("\n".join(members) + "\n")
+    return pointer
+
+
+def member_spec(agent: str, run_dir: pathlib.Path, primary: pathlib.Path, checkpoint: str) -> str:
+    if run_dir == primary:
+        return checkpoint
+    runs_dir = (REPO_ROOT / "agent_code" / agent / "runs").resolve()
+    run = run_dir.name if run_dir.resolve().parent == runs_dir else run_dir.resolve().as_posix()
+    return f"{run}/{checkpoint}"
+
+
+def top_checkpoints(ranking: Dict[str, Any], owner: Dict[str, tuple], n: int) -> List[str]:
+    rows = [r for r in ranking["rows"] if r["checkpoint"] in owner]
+    rows.sort(key=lambda r: (-r["overall"], -timesteps_of(owner[r["checkpoint"]][1]), r["checkpoint"]))
+    return [r["checkpoint"] for r in rows[:n]]
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="Pick a run's checkpoint by validation score instead of 'latest'")
     p.add_argument("--agent", required=True, help="agent folder, e.g. ppo_agent")
-    p.add_argument("--run", required=True, help="run name (or path) whose checkpoints are compared")
+    p.add_argument("--run", required=True, nargs="+",
+                   help="run name(s) or path(s) whose checkpoints are compared; with several runs the candidates "
+                        "are labelled run/checkpoint and the winner may come from any of them")
     p.add_argument("--checkpoints", nargs="+", default=["last:10"],
                    help="all | last:N | every:K | explicit checkpoint names (default last:10)")
     p.add_argument("--metadata", action="store_true",
@@ -218,41 +235,63 @@ def main(argv=None) -> None:
     p.add_argument("--env-prefix", help="environment-variable prefix the agent's callbacks read (default AGENT upper-cased)")
     p.add_argument("--ensemble", action="store_true",
                    help="also play the ensemble that averages all candidates (needs play mode)")
+    p.add_argument("--ensemble-top", type=int, default=0,
+                   help="after ranking the candidates, also play the ensemble of the N best (needs play mode)")
+    p.add_argument("--write-ensemble", action="store_true",
+                   help="write the members of the best played ensemble to <run>/checkpoints/ensemble.txt "
+                        "(use CHECKPOINT = \"ensemble\" in callbacks.py)")
+    p.add_argument("--tta", type=int, default=None,
+                   help="symmetries averaged per prediction (1 = off; default: the callbacks' setting)")
     p.add_argument("--mc-dropout", type=int, default=0,
                    help="dropout samples averaged per prediction for every candidate (dqn_agent with dropout > 0)")
     p.add_argument("--write-best", action="store_true", help="write the winner to <run>/checkpoints/best.txt")
     p.add_argument("--tag", help="result file name (default select__<agent>__<run>__<timestamp>)")
     args = p.parse_args(argv)
 
-    run_dir = find_run_dir(args.agent, args.run)
-    checkpoints = list_checkpoints(run_dir)
-    if not checkpoints:
-        raise FileNotFoundError(f"no checkpoints with a model.zip in {run_dir / 'checkpoints'}")
-    candidates = select_candidates(checkpoints, args.checkpoints)
-    metadata = {c.name: read_metadata(c) for c in candidates}
+    run_dirs = [find_run_dir(args.agent, run) for run in args.run]
+    run_dir = run_dirs[0]
+    owner = {}
+    for rd in run_dirs:
+        checkpoints = list_checkpoints(rd)
+        if not checkpoints:
+            raise FileNotFoundError(f"no checkpoints with a model.zip in {rd / 'checkpoints'}")
+        chosen = select_candidates(checkpoints, args.checkpoints)
+        for c in chosen:
+            owner[member_spec(args.agent, rd, run_dir, c.name)] = (rd, c)
+        print(f"{args.agent} run {rd.name}: {len(chosen)} of {len(checkpoints)} checkpoints")
+    labels = list(owner)
+    metadata = {label: read_metadata(c) for label, (_rd, c) in owner.items()}
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     tag = args.tag or f"select__{args.agent}__{run_dir.name}__{timestamp}"
-    print(f"[{tag}] {args.agent} run {run_dir.name}: {len(candidates)} of {len(checkpoints)} checkpoints")
+    print(f"[{tag}] {len(labels)} candidates")
 
+    ensembles: Dict[str, List[str]] = {}
     if args.metadata:
-        ranking = rank_by_metadata(candidates)
+        ranking = rank_by_metadata(owner)
         print_metadata_table(ranking)
         best = ranking["best"]
     else:
         prefix = args.env_prefix or args.agent.upper()
         if args.mc_dropout > 0:
             os.environ[f"{prefix}_MC_DROPOUT_SAMPLES"] = str(args.mc_dropout)
+        if args.tta is not None:
+            os.environ[f"{prefix}_TTA_SYMMETRIES"] = str(args.tta)
         results = {}
-        for ckpt in candidates:
-            results[ckpt.name] = play_candidate(args.agent, prefix, str(run_dir), ckpt,
-                                                args.matchups, args.n_rounds, args.seed, args.workers,
-                                                args.silence_errors, LOG_DIR / tag)
-        if args.ensemble and len(candidates) > 1:
-            label = f"ensemble({len(candidates)})"
-            results[label] = play_run(args.agent, prefix, str(run_dir), None, label, args.matchups, args.n_rounds,
-                                      args.seed, args.workers, args.silence_errors, LOG_DIR / tag,
-                                      ensemble=[c.name for c in candidates])
-        for name in ("RUN", "CHECKPOINT", "ENSEMBLE", "MC_DROPOUT_SAMPLES"):
+        for label, (rd, ckpt) in owner.items():
+            results[label] = play_run(args.agent, prefix, rd.as_posix(), ckpt.name, label, args.matchups,
+                                      args.n_rounds, args.seed, args.workers, args.silence_errors, LOG_DIR / tag)
+        if args.ensemble and len(labels) > 1:
+            label = f"ensemble({len(labels)})"
+            ensembles[label] = labels
+            results[label] = play_run(args.agent, prefix, run_dir.as_posix(), None, label, args.matchups, args.n_rounds,
+                                      args.seed, args.workers, args.silence_errors, LOG_DIR / tag, ensemble=labels)
+        if args.ensemble_top > 1 and len(labels) > 1:
+            top = top_checkpoints(rank_by_play(results, args.matchups, args.criterion), owner, args.ensemble_top)
+            label = f"ensemble(top{len(top)})"
+            ensembles[label] = top
+            results[label] = play_run(args.agent, prefix, run_dir.as_posix(), None, label, args.matchups, args.n_rounds,
+                                      args.seed, args.workers, args.silence_errors, LOG_DIR / tag, ensemble=top)
+        for name in ("RUN", "CHECKPOINT", "ENSEMBLE", "MC_DROPOUT_SAMPLES", "TTA_SYMMETRIES"):
             os.environ.pop(f"{prefix}_{name}", None)
         ranking = rank_by_play(results, args.matchups, args.criterion)
         print_play_table(ranking, args.matchups, metadata)
@@ -264,8 +303,9 @@ def main(argv=None) -> None:
         meta=dict(created=timestamp, git_commit=_git_commit(), agent=args.agent,
                   run=relative_path(run_dir), mode="metadata" if args.metadata else "play", matchups=args.matchups,
                   n_rounds=args.n_rounds, seed=args.seed, criterion=args.criterion),
-        candidates={c.name: dict(timesteps=timesteps_of(c), ep_rew_mean=metadata[c.name].get("ep_rew_mean"),
-                                 eval_suite=metadata[c.name].get("eval_suite")) for c in candidates},
+        candidates={label: dict(run=relative_path(rd), timesteps=timesteps_of(c), ep_rew_mean=metadata[label].get("ep_rew_mean"),
+                                eval_suite=metadata[label].get("eval_suite")) for label, (rd, c) in owner.items()},
+        ensembles=ensembles,
         ranking=ranking,
     ), indent=2, default=float))
     print(f"written {out_path.relative_to(REPO_ROOT)}")
@@ -273,12 +313,21 @@ def main(argv=None) -> None:
     if best is None:
         print("no candidate has a validation score")
         return
-    print(f"best checkpoint by {args.criterion}: {best}")
-    if args.write_best and best.startswith("ensemble("):
-        print(f"the ensemble wins; set ENSEMBLE = {[c.name for c in candidates]} in {args.agent}/callbacks.py instead of best.txt")
-    elif args.write_best:
-        pointer = write_best(run_dir, best)
-        print(f"wrote {pointer} -- set CHECKPOINT = \"best\" in {args.agent}/callbacks.py to use it")
+    print(f"best candidate by {args.criterion}: {best}")
+    if best in ensembles:
+        print(f"  members: {ensembles[best]}")
+        if args.write_ensemble or args.write_best:
+            pointer = write_ensemble(run_dir, ensembles[best])
+            print(f"wrote {pointer} -- set RUN = \"{run_dir.name}\" and CHECKPOINT = \"ensemble\" in {args.agent}/callbacks.py")
+    else:
+        best_dir, best_ckpt = owner.get(best, (run_dir, None))
+        if args.write_best and best_ckpt is not None:
+            pointer = write_best(best_dir, best_ckpt.name)
+            print(f"wrote {pointer} -- set RUN = \"{best_dir.name}\" and CHECKPOINT = \"best\" in {args.agent}/callbacks.py")
+        if args.write_ensemble and ensembles:
+            top_label = max(ensembles, key=lambda name: next(r["overall"] for r in ranking["rows"] if r["checkpoint"] == name))
+            pointer = write_ensemble(run_dir, ensembles[top_label])
+            print(f"wrote {pointer} ({top_label}: {ensembles[top_label]}) -- set CHECKPOINT = \"ensemble\" to use it")
 
 
 if __name__ == "__main__":

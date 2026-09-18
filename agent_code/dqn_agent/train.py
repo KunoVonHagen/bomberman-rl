@@ -12,6 +12,7 @@ from multiprocessing import freeze_support
 from typing import Optional
 
 import numpy as np
+import random
 
 import events as e
 import torch
@@ -66,7 +67,7 @@ def build_world_args(
     env_cfg = cfg.env
     return WorldArgs(
         scenario=env_cfg.scenario,
-        seed=env_cfg.seed,
+        seed=None if env_cfg.seed is None else int(env_cfg.seed),
         silence_errors=env_cfg.silence_errors,
         no_gui=env_cfg.no_gui,
         make_video=env_cfg.make_video,
@@ -331,7 +332,7 @@ class ShardedNativeBatchedVecEnv:
             e = cfg.env
             world_args_kwargs = dict(
                 scenario=e.scenario,
-                seed=e.seed,
+                seed=None if e.seed is None else int(e.seed) + i,
                 silence_errors=e.silence_errors,
                 no_gui=e.no_gui,
                 make_video=e.make_video,
@@ -990,6 +991,10 @@ def run(
         print(f"Starting new run '{cfg.run_name}' in {ckman.run_dir}")
 
     device = resolve_device(cfg.device)
+    if cfg.seed is not None:
+        random.seed(int(cfg.seed))
+        np.random.seed(int(cfg.seed) % (2 ** 32))
+        torch.manual_seed(int(cfg.seed))
     if cfg.self_play.opponent_inference == "learner" and cfg.n_shards <= 1:
         set_inference_device(device)
 

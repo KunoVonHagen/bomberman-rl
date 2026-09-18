@@ -15,12 +15,15 @@ import settings as s
 from .config import TrainingConfig
 from .gym_environment import ACTION_INDICES, BombermanGymEnv, WorldArgs
 from .model import MaskableDQN
+from .symmetry import ACTION_PERM, N_SYMMETRIES, transform_observation
 
 RUN: str = "run_20260901-120000"
 CHECKPOINT: Optional[str] = None
 ENSEMBLE: list = []
 MC_DROPOUT_SAMPLES: int = 0
+TTA_SYMMETRIES: int = N_SYMMETRIES
 DETERMINISTIC: bool = True
+ENSEMBLE_FILE = "ensemble.txt"
 
 AGENT_DIR = pathlib.Path(__file__).resolve().parent
 ENV_PREFIX = "DQN_AGENT"
@@ -57,6 +60,23 @@ def _resolve_run_dir(run: str) -> pathlib.Path:
         f"dqn_agent: no run '{run}' with a run_manifest.json in any of "
         f"{[str(c) for c in candidates]} -- set RUN at the top of callbacks.py"
     )
+
+
+def _read_ensemble_file(run_dir: pathlib.Path) -> list:
+    pointer = run_dir / "checkpoints" / ENSEMBLE_FILE
+    if not pointer.exists():
+        raise FileNotFoundError(f"{pointer} not found (run evaluation.select_checkpoint --write-ensemble)")
+    return [line.strip() for line in pointer.read_text().splitlines() if line.strip()]
+
+
+def _symmetry_batch(obs: dict, n: int) -> dict:
+    views = [transform_observation(obs, k) for k in range(n)]
+    return {"grid_tensor": np.stack([v["grid_tensor"] for v in views]), "features": np.stack([v["features"] for v in views])}
+
+
+def _average_symmetries(values: np.ndarray) -> np.ndarray:
+    n = values.shape[0]
+    return np.mean([values[k, ACTION_PERM[k]] for k in range(n)], axis=0)
 
 
 def _resolve_checkpoint_dir(run_dir: pathlib.Path, checkpoint: Optional[str]) -> pathlib.Path:
@@ -152,11 +172,15 @@ def _choose(self, game_state: dict) -> str:
     obs_env = self._dqn_obs_env
     obs = obs_env.observation_from_game_state(game_state)
     action_masks = obs_env.action_masks()
-    if not DETERMINISTIC and len(self._dqn_models) == 1 and self._dqn_mc_samples == 0:
+    if not DETERMINISTIC and len(self._dqn_models) == 1 and self._dqn_mc_samples == 0 and self._dqn_tta <= 1:
         action_idx, _ = self._dqn_model.predict(obs, deterministic=False, action_masks=action_masks)
         return _ACTION_NAMES[int(action_idx)]
-    batch = {"grid_tensor": obs["grid_tensor"][None], "features": obs["features"][None]}
-    q = np.mean([model.q_values(batch, self._dqn_mc_samples)[0] for model in self._dqn_models], axis=0)
+    if self._dqn_tta > 1:
+        batch = _symmetry_batch(obs, self._dqn_tta)
+        q = np.mean([_average_symmetries(model.q_values(batch, self._dqn_mc_samples)) for model in self._dqn_models], axis=0)
+    else:
+        batch = {"grid_tensor": obs["grid_tensor"][None], "features": obs["features"][None]}
+        q = np.mean([model.q_values(batch, self._dqn_mc_samples)[0] for model in self._dqn_models], axis=0)
     q = np.where(np.asarray(action_masks[0]).astype(bool), q, -np.inf)
     return _ACTION_NAMES[int(np.argmax(q))]
 
@@ -184,11 +208,14 @@ def setup(self):
     self._dqn_models = []
     self._dqn_obs_env = None
     self._dqn_mc_samples = int(_setting("MC_DROPOUT_SAMPLES", MC_DROPOUT_SAMPLES))
+    self._dqn_tta = max(1, min(N_SYMMETRIES, int(_setting("TTA_SYMMETRIES", TTA_SYMMETRIES))))
 
     try:
         run = _setting("RUN", RUN)
         members = _member_specs(_setting("ENSEMBLE", ENSEMBLE)) or [_setting("CHECKPOINT", CHECKPOINT) or "latest"]
         run_dir = _resolve_run_dir(run)
+        if members == ["ensemble"]:
+            members = _read_ensemble_file(run_dir)
         cfg = _load_config(run_dir)
         loaded = []
         for entry in members:
