@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=ppo-tune
+#SBATCH --partition=gpu_h100
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-gpu=24
 #SBATCH --time=72:00:00
