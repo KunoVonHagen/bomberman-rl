@@ -225,11 +225,13 @@ class MaskableDQN:
         grid_codec=None,
         replay_prefetch: bool = True,
         replay_device: str = "host",
+        n_step: int = 1,
         n_envs: int = 1,
         device: str = "cpu",
         inference: bool = False,
     ):
         self.inference = bool(inference)
+        self.n_step = max(1, int(n_step))
         self.observation_space = observation_space
         self.action_space = action_space
         self.n_actions = int(action_space.n)
@@ -482,13 +484,14 @@ class MaskableDQN:
         train_dtype = torch.float16 if self._amp_enabled else torch.float32
         context = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
         with context:
-            batch = self.replay_buffer.sample(self.batch_size, out=staging)
+            batch = self.replay_buffer.sample(self.batch_size, out=staging, n_step=self.n_step, gamma=self.gamma)
             fetched = dict(
                 obs=_obs_to_tensors(batch["obs"], self.device, pinned=pinned_obs, codec=self._codec_tensors, dtype=train_dtype),
                 next_obs=_obs_to_tensors(batch["next_obs"], self.device, pinned=pinned_next, codec=self._codec_tensors, dtype=train_dtype),
                 actions=torch.as_tensor(batch["actions"], device=self.device, dtype=torch.int64),
                 rewards=torch.as_tensor(batch["rewards"], device=self.device, dtype=torch.float32),
                 dones=torch.as_tensor(batch["dones"], device=self.device, dtype=torch.float32),
+                discounts=torch.as_tensor(batch["discounts"], device=self.device, dtype=torch.float32),
                 next_masks=torch.as_tensor(batch["next_action_masks"], device=self.device, dtype=torch.bool),
             )
             if cuda:
@@ -544,6 +547,7 @@ class MaskableDQN:
         fetched = self._take_batch()
         obs, next_obs = fetched["obs"], fetched["next_obs"]
         actions, rewards, dones, next_masks = fetched["actions"], fetched["rewards"], fetched["dones"], fetched["next_masks"]
+        discounts = fetched["discounts"]
         if prof: prof.stop("sample", device=dev)
 
         if self.symmetry_augmentation:
@@ -556,7 +560,7 @@ class MaskableDQN:
             next_q = self.q_net_target(next_obs)
             next_q_max = next_q.masked_fill(~next_masks, float("-inf")).max(dim=1).values
             next_q_max = torch.where(next_masks.any(dim=1), next_q_max, torch.zeros_like(next_q_max))
-            target = rewards + (1.0 - dones) * self.gamma * next_q_max
+            target = rewards + (1.0 - dones) * discounts * next_q_max
         if prof: prof.stop("target_forward", device=dev)
 
         if prof: prof.start("online_forward_backward")
@@ -782,6 +786,7 @@ class MaskableDQN:
             dropout=self.dropout,
             amp=self.amp,
             grid_codec=self.grid_codec,
+            n_step=self.n_step,
         )
 
     def save(self, path) -> None:

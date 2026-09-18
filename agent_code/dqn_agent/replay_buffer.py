@@ -113,7 +113,32 @@ class DictReplayBuffer:
             self._pos = 0
             self._full = True
 
-    def sample(self, batch_size: int, out: Optional[dict] = None) -> dict:
+    def _n_step_targets(self, row_idx: np.ndarray, env_idx: np.ndarray, n_step: int, gamma: float,
+                        rewards: np.ndarray, dones: np.ndarray) -> tuple:
+        batch = row_idx.shape[0]
+        returns = np.zeros(batch, dtype=np.float64)
+        discount = np.ones(batch, dtype=np.float64)
+        terminal = np.zeros(batch, dtype=bool)
+        alive = np.ones(batch, dtype=bool)
+        cur = row_idx.copy()
+        boot = (row_idx + 1) % self.rows
+        for j in range(max(1, int(n_step))):
+            r = rewards[cur, env_idx].astype(np.float64)
+            d = dones[cur, env_idx].astype(bool)
+            returns += np.where(alive, discount * r, 0.0)
+            discount = np.where(alive, discount * gamma, discount)
+            terminal |= alive & d
+            nxt = (cur + 1) % self.rows
+            boot = np.where(alive, nxt, boot)
+            alive &= ~d
+            cont = alive & self._has_next[nxt] & (j + 1 < n_step)
+            cur = np.where(cont, nxt, cur)
+            alive = cont
+            if not alive.any():
+                break
+        return boot, returns.astype(np.float32), terminal.astype(np.float32), discount.astype(np.float32)
+
+    def sample(self, batch_size: int, out: Optional[dict] = None, n_step: int = 1, gamma: float = 0.99) -> dict:
         t0 = time.perf_counter()
 
         rows = np.flatnonzero(self._has_next)
@@ -121,7 +146,8 @@ class DictReplayBuffer:
             raise ValueError("replay buffer holds no transition with a stored successor yet")
         row_idx = rows[np.random.randint(0, len(rows), size=batch_size)]
         env_idx = np.random.randint(0, self.n_envs, size=batch_size)
-        next_row_idx = (row_idx + 1) % self.rows
+        next_row_idx, returns, terminal, discounts = self._n_step_targets(
+            row_idx, env_idx, n_step, gamma, self.rewards, self.dones)
 
         flat = torch.from_numpy(row_idx * self.n_envs + env_idx)
         next_flat = torch.from_numpy(next_row_idx * self.n_envs + env_idx)
@@ -138,8 +164,9 @@ class DictReplayBuffer:
                 "features": self.features[next_row_idx, env_idx],
             },
             actions=self.actions[row_idx, env_idx],
-            rewards=self.rewards[row_idx, env_idx],
-            dones=self.dones[row_idx, env_idx],
+            rewards=returns,
+            dones=terminal,
+            discounts=discounts,
             action_masks=self.action_masks[row_idx, env_idx],
             next_action_masks=self.action_masks[next_row_idx, env_idx],
         )
@@ -291,6 +318,8 @@ class DeviceReplayBuffer(DictReplayBuffer):
         self.dones = torch.zeros(shape, dtype=torch.float32, device=dev)
         self.action_masks = torch.ones(shape + (self.action_dim,), dtype=torch.bool, device=dev)
         self._has_next = np.zeros(self.rows, dtype=bool)
+        self._rewards_host = np.zeros(shape, dtype=np.float32)
+        self._dones_host = np.zeros(shape, dtype=np.float32)
 
         pin = dev.type == "cuda"
         self._stage = {
@@ -325,6 +354,8 @@ class DeviceReplayBuffer(DictReplayBuffer):
         stage["rewards"][:] = rewards
         stage["dones"][:] = dones
         stage["action_masks"][:] = action_masks
+        self._rewards_host[i] = stage["rewards"]
+        self._dones_host[i] = stage["dones"]
         non_blocking = self._stage_event is not None
         for name, tensor in self._stage.items():
             getattr(self, name)[i].copy_(tensor, non_blocking=non_blocking)
@@ -343,14 +374,15 @@ class DeviceReplayBuffer(DictReplayBuffer):
             self._pos = 0
             self._full = True
 
-    def sample(self, batch_size: int, out: Optional[dict] = None) -> dict:
+    def sample(self, batch_size: int, out: Optional[dict] = None, n_step: int = 1, gamma: float = 0.99) -> dict:
         t0 = time.perf_counter()
         rows = np.flatnonzero(self._has_next)
         if len(rows) == 0:
             raise ValueError("replay buffer holds no transition with a stored successor yet")
         row_idx = rows[np.random.randint(0, len(rows), size=batch_size)]
         env_idx = np.random.randint(0, self.n_envs, size=batch_size)
-        next_row_idx = (row_idx + 1) % self.rows
+        next_row_idx, returns, terminal, discounts = self._n_step_targets(
+            row_idx, env_idx, n_step, gamma, self._rewards_host, self._dones_host)
         non_blocking = self.device.type == "cuda"
         flat = torch.from_numpy(row_idx * self.n_envs + env_idx).to(self.device, non_blocking=non_blocking)
         next_flat = torch.from_numpy(next_row_idx * self.n_envs + env_idx).to(self.device, non_blocking=non_blocking)
@@ -367,8 +399,9 @@ class DeviceReplayBuffer(DictReplayBuffer):
                 "features": torch.index_select(features, 0, next_flat),
             },
             actions=torch.index_select(self.actions.view(total), 0, flat),
-            rewards=torch.index_select(self.rewards.view(total), 0, flat),
-            dones=torch.index_select(self.dones.view(total), 0, flat),
+            rewards=torch.from_numpy(returns).to(self.device, non_blocking=non_blocking),
+            dones=torch.from_numpy(terminal).to(self.device, non_blocking=non_blocking),
+            discounts=torch.from_numpy(discounts).to(self.device, non_blocking=non_blocking),
             action_masks=torch.index_select(masks, 0, flat),
             next_action_masks=torch.index_select(masks, 0, next_flat),
         )
@@ -394,6 +427,10 @@ class DeviceReplayBuffer(DictReplayBuffer):
     def _store_rows(self, name: str, rows: np.ndarray) -> None:
         arr = getattr(self, name)
         arr[:rows.shape[0]].copy_(torch.from_numpy(np.ascontiguousarray(rows)).to(arr.dtype))
+        if name == "rewards":
+            self._rewards_host[:rows.shape[0]] = rows
+        elif name == "dones":
+            self._dones_host[:rows.shape[0]] = rows
 
 
 def read_replay_file(path, fields=None) -> dict:

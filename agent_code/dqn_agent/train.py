@@ -804,6 +804,7 @@ def build_model(env, cfg: TrainingConfig, device: str) -> MaskableDQN:
         grid_codec=grid_layer_codes(cfg.env.layer_config),
         replay_prefetch=cfg.dqn.replay_prefetch,
         replay_device=cfg.dqn.replay_device,
+        n_step=cfg.dqn.n_step,
     )
 
 
@@ -814,6 +815,7 @@ def apply_dqn_hyperparams(model: MaskableDQN, dqn_cfg: DQNConfig, total_timestep
         group["lr"] = dqn_cfg.learning_rate
     model.tau = dqn_cfg.tau
     model.gamma = dqn_cfg.gamma
+    model.n_step = max(1, int(dqn_cfg.n_step))
     model.train_freq = max(1, int(dqn_cfg.train_freq))
     model.gradient_steps = dqn_cfg.gradient_steps
     model.target_update_interval = max(1, int(dqn_cfg.target_update_interval))

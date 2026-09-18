@@ -93,6 +93,7 @@ class DQNConfig:
     amp: str = "fp16"
     replay_prefetch: bool = True
     replay_device: str = "host"
+    n_step: int = 5
 
 
 @dataclass(frozen=True)
@@ -238,6 +239,7 @@ class TrainingConfig:
         "dqn.amp",
         "dqn.replay_prefetch",
         "dqn.replay_device",
+        "dqn.n_step",
         "self_play.enabled",
         "self_play.static_opponents",
         "self_play.arrangements",
