@@ -75,7 +75,7 @@ def load_overrides_file(path) -> dict:
 class DQNConfig:
     """Hyperparameters passed directly to the DQN learner."""
     learning_rate: float = 1e-4
-    buffer_size: int = 500_000
+    buffer_size: int = 1_000_000
     learning_starts: int = 50_000
     batch_size: int = 256
     tau: float = 1.0
@@ -154,6 +154,8 @@ class RewardConfig:
     survived_round: float = 0.0
 
     rival_killed_opponent: float = 0.0
+    trapping_bomb: float = 0.5
+    got_killed_time_scaled: bool = True
 
     coin_shaping_coef: float = 0.05
     crate_shaping_coef: float = 0.02
@@ -260,6 +262,8 @@ class TrainingConfig:
         "rewards.opponent_eliminated",
         "rewards.survived_round",
         "rewards.rival_killed_opponent",
+        "rewards.trapping_bomb",
+        "rewards.got_killed_time_scaled",
         "rewards.coin_shaping_coef",
         "rewards.crate_shaping_coef",
         "rewards.danger_penalty_coef",
@@ -353,7 +357,7 @@ DEFAULT_CONFIG = TrainingConfig(
     save_replay_buffer_every=10,
     dqn=DQNConfig(
         learning_rate=1e-4,
-        buffer_size=500_000,
+        buffer_size=1_000_000,
         learning_starts=50_000,
         batch_size=2048,
         tau=1.0,

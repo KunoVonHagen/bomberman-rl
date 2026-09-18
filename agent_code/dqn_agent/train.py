@@ -12,6 +12,8 @@ from multiprocessing import freeze_support
 from typing import Optional
 
 import numpy as np
+
+import events as e
 import torch
 
 from environment import WorldArgs
@@ -486,6 +488,8 @@ class NativeMonitor:
         self._ep_lengths = np.zeros(self.num_envs, dtype=np.int64)
         self._rew_window: deque = deque(maxlen=window)
         self._len_window: deque = deque(maxlen=window)
+        self._score_window: deque = deque(maxlen=2 * window)
+        self._suicide_window: deque = deque(maxlen=2 * window)
 
     def reset(self, seed=None, options=None):
         self._ep_rewards[:] = 0
@@ -507,9 +511,20 @@ class NativeMonitor:
             if done:
                 self._rew_window.append(self._ep_rewards[i])
                 self._len_window.append(self._ep_lengths[i])
+                self._score_window.append(float(infos[i].get("score", 0.0)))
+                self._suicide_window.append(float(e.KILLED_SELF in infos[i].get("events", ())))
                 self._ep_rewards[i] = 0
                 self._ep_lengths[i] = 0
         return obs, rewards, dones, infos
+
+    def gate_stats(self) -> Optional[dict]:
+        if not self._score_window:
+            return None
+        return {
+            "episodes": len(self._score_window),
+            "score_mean": float(np.mean(self._score_window)),
+            "suicide_rate": float(np.mean(self._suicide_window)),
+        }
 
     def action_masks(self):
         return self.venv.action_masks()
@@ -818,6 +833,21 @@ def apply_dqn_hyperparams(model: MaskableDQN, dqn_cfg: DQNConfig, total_timestep
     )
 
 
+def schedule_gate_open(stage: dict, timesteps_done: int, stats: Optional[dict]) -> bool:
+    gate = stage.get("gate")
+    if not gate:
+        return True
+    if timesteps_done >= stage["at_timesteps"] + int(gate.get("max_delay_timesteps", 0)):
+        return True
+    if not stats or stats["episodes"] < int(gate.get("min_episodes", 100)):
+        return False
+    if "min_score" in gate and stats["score_mean"] < float(gate["min_score"]):
+        return False
+    if "max_suicide_rate" in gate and stats["suicide_rate"] > float(gate["max_suicide_rate"]):
+        return False
+    return True
+
+
 def apply_schedule_up_to(
     cfg: TrainingConfig,
     schedule: list[dict],
@@ -831,9 +861,13 @@ def apply_schedule_up_to(
 ) -> int:
     """Apply all schedule stages up to timesteps_done, returning the index of the last one applied."""
     target_idx = applied_idx
+    stats = env.gate_stats() if env is not None and hasattr(env, "gate_stats") else None
     for i, stage in enumerate(schedule):
-        if timesteps_done >= stage["at_timesteps"]:
-            target_idx = i
+        if i <= applied_idx:
+            continue
+        if timesteps_done < stage["at_timesteps"] or not schedule_gate_open(stage, timesteps_done, stats):
+            break
+        target_idx = i
     if target_idx == applied_idx:
         return applied_idx
 

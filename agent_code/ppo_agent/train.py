@@ -6,11 +6,14 @@ import ctypes
 import multiprocessing as mp
 import os
 import pathlib
+from collections import deque
 from datetime import datetime
 from multiprocessing import freeze_support
 from typing import Optional
 
 import numpy as np
+
+import events as e
 import torch
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
@@ -539,6 +542,30 @@ def _sync_learner_inference(env, pool: OpponentPool) -> None:
     env.env_method("set_opponent_model_index", inference.update(pool._checkpoints))
 
 
+class GateStatsVecMonitor(VecMonitor):
+    def __init__(self, venv, window: int = 200):
+        super().__init__(venv, filename=None)
+        self._score_window: deque = deque(maxlen=window)
+        self._suicide_window: deque = deque(maxlen=window)
+
+    def step_wait(self):
+        obs, rewards, dones, infos = super().step_wait()
+        for i, done in enumerate(dones):
+            if done:
+                self._score_window.append(float(infos[i].get("score", 0.0)))
+                self._suicide_window.append(float(e.KILLED_SELF in infos[i].get("events", ())))
+        return obs, rewards, dones, infos
+
+    def gate_stats(self) -> Optional[dict]:
+        if not self._score_window:
+            return None
+        return {
+            "episodes": len(self._score_window),
+            "score_mean": float(np.mean(self._score_window)),
+            "suicide_rate": float(np.mean(self._suicide_window)),
+        }
+
+
 def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
     if cfg.n_shards > 1:
         vec_env = ShardedNativeBatchedVecEnv(cfg, opponents, log_dir, n_shards=cfg.n_shards)
@@ -554,7 +581,7 @@ def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
         )
         vec_env = NativeBatchedVecEnv(env)
 
-    return VecMonitor(vec_env, filename=None)
+    return GateStatsVecMonitor(vec_env)
 
 
 def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str | None) -> NativeBatchedVecEnv:
@@ -713,6 +740,21 @@ class OpponentResampleCallback(BaseCallback):
             print(f"[scenario] rollout {self._rollout_count}: distribution: {scenario_str}")
 
 
+def schedule_gate_open(stage: dict, timesteps_done: int, stats: Optional[dict]) -> bool:
+    gate = stage.get("gate")
+    if not gate:
+        return True
+    if timesteps_done >= stage["at_timesteps"] + int(gate.get("max_delay_timesteps", 0)):
+        return True
+    if not stats or stats["episodes"] < int(gate.get("min_episodes", 100)):
+        return False
+    if "min_score" in gate and stats["score_mean"] < float(gate["min_score"]):
+        return False
+    if "max_suicide_rate" in gate and stats["suicide_rate"] > float(gate["max_suicide_rate"]):
+        return False
+    return True
+
+
 def apply_schedule_up_to(
     cfg: TrainingConfig,
     schedule: list[dict],
@@ -729,9 +771,13 @@ def apply_schedule_up_to(
     Returns the index of the last stage that was applied.
     """
     target_idx = applied_idx
+    stats = env.gate_stats() if env is not None and hasattr(env, "gate_stats") else None
     for i, stage in enumerate(schedule):
-        if timesteps_done >= stage["at_timesteps"]:
-            target_idx = i
+        if i <= applied_idx:
+            continue
+        if timesteps_done < stage["at_timesteps"] or not schedule_gate_open(stage, timesteps_done, stats):
+            break
+        target_idx = i
     if target_idx == applied_idx:
         return applied_idx
 

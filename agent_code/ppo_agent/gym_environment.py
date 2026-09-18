@@ -463,6 +463,58 @@ def _own_bomb_escape_kernel(ax, ay, blast_tensor, occ, danger, W, H, T, bomb_tim
 
 
 @njit(cache=True)
+def _escape_possible_kernel(sx, sy, occ, danger, W, H, T, visited, qx, qy, qt, envs, out):
+    for ei in range(envs.shape[0]):
+        env = envs[ei]
+        x0 = sx[env]
+        y0 = sy[env]
+        out[env] = False
+        vis = visited[env]
+        vis[:, :, :] = False
+        vis[x0, y0, 0] = True
+        qx[env, 0] = x0
+        qy[env, 0] = y0
+        qt[env, 0] = 0
+        head = 0
+        tail = 1
+        while head < tail:
+            x = qx[env, head]
+            y = qy[env, head]
+            t = qt[env, head]
+            head += 1
+            if t >= T:
+                out[env] = True
+                break
+            ta = t
+            for k in range(5):
+                if k == 0:
+                    nx, ny = x - 1, y
+                elif k == 1:
+                    nx, ny = x + 1, y
+                elif k == 2:
+                    nx, ny = x, y - 1
+                elif k == 3:
+                    nx, ny = x, y + 1
+                else:
+                    nx, ny = x, y
+                if nx < 0 or nx >= W or ny < 0 or ny >= H:
+                    continue
+                if k < 4:
+                    if occ[env, ta, nx, ny] > 0:
+                        continue
+                elif danger[env, ta, nx, ny] > 0:
+                    continue
+                if vis[nx, ny, t + 1]:
+                    continue
+                vis[nx, ny, t + 1] = True
+                qx[env, tail] = nx
+                qy[env, tail] = ny
+                qt[env, tail] = t + 1
+                tail += 1
+    return out
+
+
+@njit(cache=True)
 def _forecast_kernel(bomb_x, bomb_y, bomb_timer, bomb_counts, blast_tensor,
                      exp_x, exp_y, exp_timer, exp_counts,
                      wall, crate, T, ET, danger_out, occ_out, fixes, envs):
@@ -954,6 +1006,9 @@ class BombermanGymEnv(gym.Env):
         self._ta_starts = np.zeros((E, 1 + MAX_OPPONENTS, 2), dtype=np.int64)
         self._ta_start_counts = np.zeros(E, dtype=np.int64)
         self._escape_visited = np.zeros((E, W, H, T_bfs + 1), dtype=np.bool_)
+        self._trap_sx = np.zeros(E, dtype=np.int64)
+        self._trap_sy = np.zeros(E, dtype=np.int64)
+        self._trap_out = np.zeros(E, dtype=np.bool_)
 
         max_nodes_ms = W * H
         self._ms_bfs_qx = np.empty((E, max_nodes_ms), dtype=np.int32)
@@ -1410,6 +1465,8 @@ class BombermanGymEnv(gym.Env):
             self._danger_penalty_coef = DANGER_PENALTY_COEF
             self._escape_bonus_coef = ESCAPE_BONUS_COEF
             self._trap_shaping_coef = TRAP_SHAPING_COEF
+            self._trapping_bomb_reward = 0.0
+            self._got_killed_time_scaled = False
         else:
             self._event_rewards = build_event_rewards(reward_config)
             self._coin_shaping_coef = reward_config.coin_shaping_coef
@@ -1417,6 +1474,8 @@ class BombermanGymEnv(gym.Env):
             self._danger_penalty_coef = reward_config.danger_penalty_coef
             self._escape_bonus_coef = reward_config.escape_bonus_coef
             self._trap_shaping_coef = reward_config.trap_shaping_coef
+            self._trapping_bomb_reward = float(getattr(reward_config, "trapping_bomb", 0.0))
+            self._got_killed_time_scaled = bool(getattr(reward_config, "got_killed_time_scaled", False))
 
     def set_opponents(self, opponents):
         """
@@ -2114,7 +2173,12 @@ class BombermanGymEnv(gym.Env):
         agent = self.agents[env]
         total = 0.0
         for ev in agent.events:
-            total += self._event_rewards.get(ev, 0.0)
+            value = self._event_rewards.get(ev, 0.0)
+            if ev == e.GOT_KILLED and self._got_killed_time_scaled:
+                value *= max(0.0, float(s.MAX_STEPS - self.step_counts[env])) / float(s.MAX_STEPS)
+            total += value
+        if self._trapping_bomb_reward and e.BOMB_DROPPED in agent.events and self._bomb_traps_opponent(env):
+            total += self._trapping_bomb_reward
 
         terminal = bool(self._episode_over[env])
         coin_now = 0.0 if terminal else self._coin_distance_now(env)
@@ -2142,6 +2206,25 @@ class BombermanGymEnv(gym.Env):
                  + self._crate_shaping_coef * self._crate_distance_now(env)
                  + self._escape_bonus_coef * self._bomb_danger_now(env)
                  + self._trap_shaping_coef * self._trapped_opponent_distance_now(env))
+
+    def _bomb_traps_opponent(self, env: int) -> bool:
+        agent = self.agents[env]
+        blast = self._blast_tensor[agent.x, agent.y]
+        gt = self.grid_tensor
+        envs = self._all_envs[env:env + 1]
+        for handle in self.opponent_handles[env]:
+            if handle.dead or blast[handle.x, handle.y] <= 0:
+                continue
+            self._trap_sx[env] = handle.x
+            self._trap_sy[env] = handle.y
+            _escape_possible_kernel(
+                self._trap_sx, self._trap_sy, gt[:, _OCC_SLICE], gt[:, _DANGER_SLICE],
+                self.width, self.height, self._BT + self._ET,
+                self._escape_visited, self._ta_bfs_qx, self._ta_bfs_qy, self._ta_bfs_qt, envs, self._trap_out,
+            )
+            if not self._trap_out[env]:
+                return True
+        return False
 
     def _coin_distance_now(self, env: int) -> float:
         a = self.agents[env]

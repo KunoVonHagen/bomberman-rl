@@ -22,6 +22,7 @@ DEFAULT_SCHEDULE = [
             "ppo.batch_size": 4096,
             "rewards.coin_collected": 1.0,
             "rewards.killed_opponent": 5.0,
+            "rewards.trapping_bomb": 0.5,
             "rewards.waited": 0.0,
             "rewards.invalid_action": -0.05,
             "rewards.crate_destroyed": 0.3,
@@ -45,7 +46,9 @@ DEFAULT_SCHEDULE = [
     },
     {
         "at_timesteps": 30_000_000,
+        "gate": {"min_score": 2.0, "max_suicide_rate": 0.35, "max_delay_timesteps": 10_000_000},
         "overrides": {
+            "rewards.trapping_bomb": 0.25,
             "rewards.waited": 0.0,
             "rewards.invalid_action": -0.025,
             "rewards.crate_destroyed": 0.15,
@@ -70,6 +73,7 @@ DEFAULT_SCHEDULE = [
     {
         "at_timesteps": 50_000_000,
         "overrides": {
+            "rewards.trapping_bomb": 0.1,
             "rewards.waited": 0.0,
             "rewards.invalid_action": -0.01,
             "rewards.crate_destroyed": 0.06,
@@ -85,13 +89,14 @@ DEFAULT_SCHEDULE = [
     {
         "at_timesteps": 60_000_000,
         "overrides": {
-            "self_play.arrangements": "0,3,3.0;1,2,3.0;2,1,1.5;3,0,0.5",
+            "self_play.arrangements": "0,3,3.0;1,2,3.0;2,1,1.5;3,0,2.0",
             "ppo.learning_rate": 1e-6,
         },
     },
     {
         "at_timesteps": 70_000_000,
         "overrides": {
+            "rewards.trapping_bomb": 0.0,
             "rewards.waited": 0.0,
             "rewards.invalid_action": 0.0,
             "rewards.crate_destroyed": 0.0,
@@ -107,7 +112,7 @@ DEFAULT_SCHEDULE = [
     {
         "at_timesteps": 80_000_000,
         "overrides": {
-            "self_play.arrangements": "0,3,1.0;1,2,2.0;2,1,2.0;3,0,1.0",
+            "self_play.arrangements": "0,3,1.0;1,2,2.0;2,1,2.0;3,0,2.0",
             "total_timesteps": 100_000_000,
             "ppo.learning_rate": 3e-7,
         },
