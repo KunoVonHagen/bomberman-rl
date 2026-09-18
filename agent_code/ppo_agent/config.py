@@ -187,7 +187,7 @@ class RewardConfig:
     opponent_eliminated: float = 0.0
     survived_round: float = 0.0
 
-    rival_killed_opponent: float = -2.0
+    rival_killed_opponent: float = 0.0
 
     coin_shaping_coef: float = 0.05
     crate_shaping_coef: float = 0.02
