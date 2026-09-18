@@ -1,5 +1,5 @@
 {
-  "name": "ppo_default",
+  "name": "ppo_batch_size",
   "agent": "ppo_agent",
   "train": [
     "python",
@@ -24,41 +24,16 @@
   },
   "parameters": [
     {
-      "name": "ppo.learning_rate",
-      "values": [
-        1e-03,
-        1e-04,
-        1e-05,
-        1e-06,
-      ],
-      "log": true
+      "name": "ppo.batch_size",
+      "values": [128, 256, 512]
     },
     {
-      "name": "ppo.gamma",
-      "values": [
-        0.95,
-        0.98,
-        0.99,
-        0.995
-      ]
+      "name": "ppo.gae_lambda",
+      "values": [0.95, 0.97, 0.99]
     },
     {
-      "name": "ppo.ent_coef",
-      "values": [
-        0.003,
-        0.01,
-        0.03,
-        0.1
-      ],
-      "log": true
-    },
-    {
-      "name": "ppo.clip_range",
-      "values": [
-        0.1,
-        0.2,
-        0.3
-      ]
+      "name": "ppo.n_epochs",
+      "values": [4, 8]
     }
   ],
   "validation": {
