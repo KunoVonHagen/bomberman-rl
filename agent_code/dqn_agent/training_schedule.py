@@ -20,6 +20,7 @@ DEFAULT_SCHEDULE = [
             "env.scenario_mix": "classic,0.85;coin-heaven,0.15",
             "dqn.learning_rate": 3e-5,
             "dqn.exploration_final_eps": 0.05,
+            "dqn.softmax_beta_final": 20.0,
             "rewards.bomb_dropped": 0.01,
             "rewards.coin_found": 0.02,
             "rewards.coin_collected": 1.0,
@@ -45,6 +46,7 @@ DEFAULT_SCHEDULE = [
             "rewards.bomb_dropped": 0.0,
             "rewards.coin_found": 0.01,
             "dqn.exploration_final_eps": 0.04,
+            "dqn.softmax_beta_final": 25.0,
         },
     },
     {
@@ -78,6 +80,7 @@ DEFAULT_SCHEDULE = [
         "overrides": {
             "self_play.arrangements": "0,0,0.5;0,1,0.75;0,2,1.5;1,2,1.25;2,1,2.25;3,0,2.0",
             "dqn.exploration_final_eps": 0.03,
+            "dqn.softmax_beta_final": 33.0,
         },
     },
     {
@@ -102,6 +105,7 @@ DEFAULT_SCHEDULE = [
         "overrides": {
             "self_play.arrangements": "0,0,0.4;0,2,1.0;2,1,1.5;3,0,2.0",
             "dqn.exploration_final_eps": 0.02,
+            "dqn.softmax_beta_final": 50.0,
         },
     },
     {
@@ -127,6 +131,7 @@ DEFAULT_SCHEDULE = [
             "self_play.arrangements": "0,1,0.4;0,2,0.6;1,2,1.0;2,1,1.0;3,0,2.0",
             "env.scenario_mix": "classic,0.95;coin-heaven,0.05",
             "dqn.exploration_final_eps": 0.01,
+            "dqn.softmax_beta_final": 100.0,
         },
     },
     {
@@ -134,6 +139,7 @@ DEFAULT_SCHEDULE = [
         "overrides": {
             "dqn.learning_rate": 3e-6,
             "dqn.exploration_final_eps": 0.005,
+            "dqn.softmax_beta_final": 200.0,
             "rewards.waited": 0.0,
             "rewards.invalid_action": 0.0,
             "rewards.crate_destroyed": 0.0,

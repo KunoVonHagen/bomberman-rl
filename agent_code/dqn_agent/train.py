@@ -24,7 +24,7 @@ from .checkpoint_manager import CheckpointManager
 from .gym_environment import ACTIONS, MAX_OPPONENTS, BombermanGymEnv, grid_layer_codes, observation_shapes
 from .model import BombermanFeatureExtractor, MaskableDQN
 from .opponent_pool import LearnerOpponentInference, OpponentPool, OpponentSampler, set_inference_device
-from .schedules import LinearSchedule
+from .schedules import GeometricSchedule, LinearSchedule
 from .training_schedule import DEFAULT_SCHEDULE, load_schedule
 
 
@@ -684,7 +684,10 @@ class ProgressLoggingCallback:
             rollout["ep_len_mean"] = ep_len_mean
         if ep_rew_mean is not None:
             rollout["ep_rew_mean"] = ep_rew_mean
-        rollout["exploration_rate"] = model.exploration_rate
+        if getattr(model, "exploration_mode", "epsilon") == "softmax":
+            rollout["softmax_beta"] = model.softmax_beta
+        else:
+            rollout["exploration_rate"] = model.exploration_rate
 
         time_stats: dict[str, object] = {
             "fps": fps,
@@ -799,6 +802,9 @@ def build_model(env, cfg: TrainingConfig, device: str) -> MaskableDQN:
         exploration_fraction=cfg.dqn.exploration_fraction,
         exploration_initial_eps=cfg.dqn.exploration_initial_eps,
         exploration_final_eps=cfg.dqn.exploration_final_eps,
+        exploration_mode=cfg.dqn.exploration_mode,
+        softmax_beta_initial=cfg.dqn.softmax_beta_initial,
+        softmax_beta_final=cfg.dqn.softmax_beta_final,
         max_grad_norm=cfg.dqn.max_grad_norm,
         exploration_duration=exploration_duration,
         symmetry_augmentation=cfg.dqn.symmetry_augmentation,
@@ -839,6 +845,13 @@ def apply_dqn_hyperparams(model: MaskableDQN, dqn_cfg: DQNConfig, total_timestep
     model.exploration_duration = max(1, int(dqn_cfg.exploration_fraction * total_timesteps))
     model.exploration_schedule = LinearSchedule(
         dqn_cfg.exploration_initial_eps, dqn_cfg.exploration_final_eps, model.exploration_duration,
+    )
+    dqn_cfg.validate()
+    model.exploration_mode = dqn_cfg.exploration_mode
+    model.softmax_beta_initial = float(dqn_cfg.softmax_beta_initial)
+    model.softmax_beta_final = float(dqn_cfg.softmax_beta_final)
+    model.softmax_beta_schedule = GeometricSchedule(
+        model.softmax_beta_initial, model.softmax_beta_final, model.exploration_duration,
     )
 
 
@@ -1071,7 +1084,10 @@ def run(
             print(f"  ep_len_mean: {ep_len_mean:.1f}")
         if model.last_loss_mean is not None:
             print(f"  loss_mean: {model.last_loss_mean:.5f}")
-        print(f"  exploration_rate: {model.exploration_rate:.4f}")
+        if model.exploration_mode == "softmax":
+            print(f"  softmax_beta: {model.softmax_beta:.3f}")
+        else:
+            print(f"  exploration_rate: {model.exploration_rate:.4f}")
 
         ckpt_dir = ckman.save_checkpoint(
             model,

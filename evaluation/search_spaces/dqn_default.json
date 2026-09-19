@@ -70,6 +70,22 @@
         0.0,
         0.6
       ]
+    },
+    {
+      "name": "dqn.exploration_mode",
+      "values": [
+        "epsilon",
+        "softmax"
+      ]
+    },
+    {
+      "name": "dqn.softmax_beta_final",
+      "values": [
+        5.0,
+        8.0,
+        20.0
+      ],
+      "log": true
     }
   ],
   "validation": {

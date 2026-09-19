@@ -11,8 +11,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import gymnasium as gym
 
+from .config import EXPLORATION_MODES
 from .replay_buffer import GRID_SENTINEL_CODE, DeviceReplayBuffer, DictReplayBuffer
-from .schedules import LinearSchedule
+from .schedules import GeometricSchedule, LinearSchedule
 from .symmetry import TensorAugmenter
 
 __all__ = ["BombermanFeatureExtractor", "QNetwork", "MaskableDQN"]
@@ -215,6 +216,9 @@ class MaskableDQN:
         exploration_fraction: float = 0.3,
         exploration_initial_eps: float = 1.0,
         exploration_final_eps: float = 0.05,
+        exploration_mode: str = "epsilon",
+        softmax_beta_initial: float = 1.0,
+        softmax_beta_final: float = 20.0,
         max_grad_norm: float = 10.0,
         features_dim: int = 256,
         exploration_duration: int = 300_000,
@@ -281,6 +285,15 @@ class MaskableDQN:
             exploration_initial_eps, exploration_final_eps, self.exploration_duration,
         )
         self.exploration_rate = exploration_initial_eps
+        if exploration_mode not in EXPLORATION_MODES:
+            raise ValueError(f"exploration_mode must be one of {EXPLORATION_MODES}, got {exploration_mode!r}")
+        self.exploration_mode = exploration_mode
+        self.softmax_beta_initial = float(softmax_beta_initial)
+        self.softmax_beta_final = float(softmax_beta_final)
+        self.softmax_beta_schedule = GeometricSchedule(
+            self.softmax_beta_initial, self.softmax_beta_final, self.exploration_duration,
+        )
+        self.softmax_beta = self.softmax_beta_initial
 
         self.q_net = QNetwork(observation_space, self.n_actions, features_dim, self.dropout).to(self.device)
         self.q_net.eval()
@@ -341,6 +354,26 @@ class MaskableDQN:
         empty = ~action_masks.any(axis=1)
         if empty.any():
             actions[empty] = np.random.randint(self.n_actions, size=int(empty.sum()))
+        return actions
+
+    def _sample_softmax_actions(self, q_values: np.ndarray, action_masks: np.ndarray, beta: float) -> np.ndarray:
+        masks = np.asarray(action_masks, dtype=bool)
+        if masks.ndim == 1:
+            masks = masks[None, :]
+        valid = masks.any(axis=1)
+        z = np.where(masks, float(beta) * np.asarray(q_values, dtype=np.float64), -np.inf)
+        z[~valid] = 0.0
+        z -= z.max(axis=1, keepdims=True)
+        p = np.exp(z)
+        cdf = np.cumsum(p, axis=1)
+        u = np.random.rand(masks.shape[0], 1) * cdf[:, -1:]
+        hit = cdf > u
+        actions = hit.argmax(axis=1)
+        none = ~hit.any(axis=1)
+        if none.any():
+            actions[none] = masks.shape[1] - 1 - masks[none, ::-1].argmax(axis=1)
+        if (~valid).any():
+            actions[~valid] = np.random.randint(self.n_actions, size=int((~valid).sum()))
         return actions
 
     def _predict_tensors(self, observation: dict) -> dict:
@@ -408,6 +441,11 @@ class MaskableDQN:
 
         if deterministic:
             action = self._predict_masked(obs_batch, masks)
+        elif self.exploration_mode == "softmax":
+            action = self._sample_softmax_actions(self.q_values(obs_batch), masks, self.softmax_beta)
+            explore = np.random.rand(masks.shape[0]) < self.exploration_final_eps
+            if explore.any():
+                action[explore] = self._sample_masked_actions(masks[explore])
         else:
             explore = np.random.rand(masks.shape[0]) < self.exploration_rate
             if explore.all():
@@ -714,6 +752,7 @@ class MaskableDQN:
                 cb.on_rollout_start(self, env)
 
             self.exploration_rate = self.exploration_schedule.value(self.num_timesteps)
+            self.softmax_beta = self.softmax_beta_schedule.value(self.num_timesteps)
 
             if prof: prof.start("action_select")
             if wall: wall.start("action_select")
@@ -828,6 +867,9 @@ class MaskableDQN:
             exploration_fraction=self.exploration_fraction,
             exploration_initial_eps=self.exploration_initial_eps,
             exploration_final_eps=self.exploration_final_eps,
+            exploration_mode=self.exploration_mode,
+            softmax_beta_initial=self.softmax_beta_initial,
+            softmax_beta_final=self.softmax_beta_final,
             max_grad_norm=self.max_grad_norm,
             features_dim=self.features_dim,
             exploration_duration=self.exploration_duration,
@@ -852,6 +894,7 @@ class MaskableDQN:
             "hyperparams": self._hyperparams(),
             "num_timesteps": self.num_timesteps,
             "exploration_rate": self.exploration_rate,
+            "softmax_beta": self.softmax_beta,
             "n_updates": self.n_updates,
             "q_net_state_dict": self.q_net.state_dict(),
             "q_net_target_state_dict": self.q_net_target.state_dict(),
@@ -878,6 +921,7 @@ class MaskableDQN:
         if inference:
             model.num_timesteps = checkpoint.get("num_timesteps", 0)
             model.exploration_rate = checkpoint.get("exploration_rate", model.exploration_initial_eps)
+            model.softmax_beta = checkpoint.get("softmax_beta", model.softmax_beta_final)
             model.n_updates = checkpoint.get("n_updates", 0)
             return model
         model.q_net_target.load_state_dict(checkpoint["q_net_target_state_dict"])
@@ -899,5 +943,6 @@ class MaskableDQN:
 
         model.num_timesteps = checkpoint.get("num_timesteps", 0)
         model.exploration_rate = checkpoint.get("exploration_rate", model.exploration_initial_eps)
+        model.softmax_beta = checkpoint.get("softmax_beta", model.softmax_beta_final)
         model.n_updates = checkpoint.get("n_updates", 0)
         return model

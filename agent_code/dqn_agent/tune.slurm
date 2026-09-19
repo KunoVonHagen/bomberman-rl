@@ -37,8 +37,9 @@ DELETE_RUNS="${DELETE_RUNS:-1}"
 #
 # Search 2: dqn_default
 #   5 learning_rate * 5 gamma * 4 target_update_interval
-#     * 4 exploration_fraction
-#   = 400 possible trials
+#     * 4 exploration_fraction * 2 priority_alpha
+#     * 2 exploration_mode * 3 softmax_beta_final
+#   = 4800 possible trials, sampled at random
 #
 #   Default budget: 100 trials
 #   ~16h40m
@@ -99,7 +100,7 @@ run_search() {
 
     SEARCH_ARGS=(
         --space "$SPACE"
-        --strategy grid
+        --strategy random
         --max-trials "$MAX_TRIALS"
         --parallel "$PARALLEL"
         --seed "$SEED"
@@ -190,8 +191,11 @@ REG_RC=$?
 #   gamma                  = [0.9, 0.95, 0.98, 0.99, 0.995]
 #   target_update_interval = [1000, 3000, 10000, 30000]
 #   exploration_fraction   = [0.05, 0.1, 0.2, 0.4]
+#   priority_alpha         = [0.0, 0.6]
+#   exploration_mode       = [epsilon, softmax]
+#   softmax_beta_final     = [5, 8, 20]
 #
-# 5 * 5 * 4 * 4 = 400 possible combinations.
+# 5 * 5 * 4 * 4 * 2 * 2 * 3 = 4800 possible combinations, sampled at random.
 #
 # Default to 100 trials to stay comfortably within the allocation.
 # ---------------------------------------------------------------------------

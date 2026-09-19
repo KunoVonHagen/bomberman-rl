@@ -4,6 +4,8 @@ from dataclasses import dataclass, field, asdict, is_dataclass, fields as datacl
 from typing import Optional, List, Literal, ClassVar
 import json
 
+EXPLORATION_MODES = ("epsilon", "softmax")
+
 
 def coerce_dataclass_list(cls, raw: str) -> list:
     """Convert raw config text into dataclass instances."""
@@ -86,6 +88,9 @@ class DQNConfig:
     exploration_fraction: float = 0.3
     exploration_initial_eps: float = 1.0
     exploration_final_eps: float = 0.05
+    exploration_mode: str = "softmax"
+    softmax_beta_initial: float = 1.0
+    softmax_beta_final: float = 20.0
     max_grad_norm: float = 10.0
     symmetry_augmentation: bool = True
     weight_decay: float = 0.0
@@ -96,6 +101,16 @@ class DQNConfig:
     n_step: int = 5
     priority_alpha: float = 0.6
     priority_eps: float = 0.01
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if self.exploration_mode not in EXPLORATION_MODES:
+            raise ValueError(f"dqn.exploration_mode must be one of {EXPLORATION_MODES}, got {self.exploration_mode!r}")
+        if not (float(self.softmax_beta_initial) > 0.0 and float(self.softmax_beta_final) > 0.0):
+            raise ValueError("dqn.softmax_beta_initial and dqn.softmax_beta_final must be positive, got "
+                             f"{self.softmax_beta_initial!r} and {self.softmax_beta_final!r}")
 
 
 @dataclass(frozen=True)
@@ -231,6 +246,9 @@ class TrainingConfig:
         "dqn.exploration_fraction",
         "dqn.exploration_initial_eps",
         "dqn.exploration_final_eps",
+        "dqn.exploration_mode",
+        "dqn.softmax_beta_initial",
+        "dqn.softmax_beta_final",
         "dqn.target_update_interval",
         "dqn.train_freq",
         "dqn.gradient_steps",
@@ -300,6 +318,7 @@ class TrainingConfig:
             new_value = coerce_value(current, raw_value)
             setattr(obj, leaf, new_value)
             applied.append((dotted_key, current, new_value))
+        self.dqn.validate()
         return applied
 
     def to_dict(self) -> dict:
@@ -318,6 +337,7 @@ class TrainingConfig:
     def _migrate_dqn_dict(dqn: dict) -> dict:
         dqn = dict(dqn)
         dqn.setdefault("priority_alpha", 0.0)
+        dqn.setdefault("exploration_mode", "epsilon")
         return dqn
 
     @staticmethod

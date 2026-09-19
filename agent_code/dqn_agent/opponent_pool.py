@@ -58,6 +58,7 @@ class LearnerOpponentInference:
             if path not in self.models:
                 model = MaskableDQN.load(path, device=self.device, inference=True)
                 model.exploration_rate = model.exploration_final_eps
+                model.exploration_mode = "epsilon"
                 self.models[path] = model
         for path in [p for p in self.models if p not in current and p in self.stale]:
             del self.models[path]
@@ -140,6 +141,7 @@ class _CheckpointOpponent:
             if self._model is None:
                 self._model = MaskableDQN.load(self.model_path, device=str(_INFERENCE_DEVICE), inference=True)
                 self._model.exploration_rate = self._model.exploration_final_eps
+                self._model.exploration_mode = "epsilon"
                 _MODEL_CACHE[self.model_path] = self._model
         elif self.model_path not in _MODEL_CACHE:
             _MODEL_CACHE[self.model_path] = self._model
