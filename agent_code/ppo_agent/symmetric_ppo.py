@@ -35,7 +35,7 @@ class SymmetricMaskablePPO(MaskablePPO):
         dist.apply_masking(masks)
         return dist, pol.value_net(latent_vf)
 
-    def _symmetry_terms(self, rollout_data, dist):
+    def _symmetry_terms(self, rollout_data, logp):
         obs = rollout_data.observations
         masks = rollout_data.action_masks
         valid = masks.bool() if masks.dtype != th.bool else masks
@@ -47,7 +47,6 @@ class SymmetricMaskablePPO(MaskablePPO):
         obs_t["features"] = transform_features_torch(obs["features"], ks)
         dist_t, values_t = self._dist_and_values(obs_t, transform_masks_torch(valid, ks))
 
-        logp = dist.distribution.logits
         logp_back = th.gather(dist_t.distribution.logits, 1, action_perm_torch(ks))
         diff = logp - logp_back
         zero = th.zeros_like(diff)
@@ -81,6 +80,7 @@ class SymmetricMaskablePPO(MaskablePPO):
                 dist, values = self._dist_and_values(rollout_data.observations, rollout_data.action_masks)
                 log_prob = dist.log_prob(actions)
                 entropy = dist.entropy()
+                logp_all = dist.distribution.logits
 
                 values = values.flatten()
                 advantages = rollout_data.advantages
@@ -124,7 +124,7 @@ class SymmetricMaskablePPO(MaskablePPO):
                     break
 
                 if use_sym:
-                    sym_kl, sym_value_loss = self._symmetry_terms(rollout_data, dist)
+                    sym_kl, sym_value_loss = self._symmetry_terms(rollout_data, logp_all)
                     loss = (loss
                             + self.symmetry_coef * sym_kl
                             + self.symmetry_value_coef * self.vf_coef * sym_value_loss)
