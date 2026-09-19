@@ -549,6 +549,7 @@ class GateStatsVecMonitor(VecMonitor):
         super().__init__(venv, filename=None)
         self._score_window: deque = deque(maxlen=window)
         self._suicide_window: deque = deque(maxlen=window)
+        self._survival_window: deque = deque(maxlen=window)
 
     def step_wait(self):
         obs, rewards, dones, infos = super().step_wait()
@@ -556,6 +557,7 @@ class GateStatsVecMonitor(VecMonitor):
             if done:
                 self._score_window.append(float(infos[i].get("score", 0.0)))
                 self._suicide_window.append(float(e.KILLED_SELF in infos[i].get("events", ())))
+                self._survival_window.append(float(infos[i].get("alive", False)))
         return obs, rewards, dones, infos
 
     def gate_stats(self) -> Optional[dict]:
@@ -565,7 +567,22 @@ class GateStatsVecMonitor(VecMonitor):
             "episodes": len(self._score_window),
             "score_mean": float(np.mean(self._score_window)),
             "suicide_rate": float(np.mean(self._suicide_window)),
+            "survival_rate": float(np.mean(self._survival_window)),
         }
+
+
+class EpisodeStatsCallback(BaseCallback):
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        gate_stats = getattr(self.training_env, "gate_stats", None)
+        stats = gate_stats() if callable(gate_stats) else None
+        if not stats:
+            return
+        self.logger.record("rollout/score_mean", stats["score_mean"])
+        self.logger.record("rollout/survival_rate", stats["survival_rate"])
+        self.logger.record("rollout/suicide_rate", stats["suicide_rate"])
 
 
 def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
@@ -1225,7 +1242,7 @@ def run(
         cfg, ckman, pool, schedule or [], applied_idx=schedule_applied_idx, verbose=1,
     )
     learn_callback = CallbackList([
-        opponent_callback, max_rollouts_callback, schedule_callback,
+        opponent_callback, max_rollouts_callback, schedule_callback, EpisodeStatsCallback(),
     ])
     evaluator = BackgroundEvaluator(cfg, ckman)
 
