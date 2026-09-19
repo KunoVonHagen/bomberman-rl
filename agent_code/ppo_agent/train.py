@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import ctypes
+import json
 import multiprocessing as mp
 import os
 import pathlib
@@ -397,7 +398,7 @@ class ShardedNativeBatchedVecEnv(VecEnv):
             p = ctx.Process(
                 target=_shard_worker,
                 args=(work_remote, remote, world_args_kwargs, opponents, e.layer_config,
-                      self.shard_size, cfg.rewards, e.env_version, self._shared, i),
+                      self.shard_size, cfg.effective_rewards(), e.env_version, self._shared, i),
                 daemon=True,
             )
             _start_single_threaded(p)
@@ -578,7 +579,7 @@ def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
             layer_config=cfg.env.layer_config,
             env_version=cfg.env.env_version,
             n_envs=cfg.n_envs,
-            reward_config=cfg.rewards,
+            reward_config=cfg.effective_rewards(),
         )
         vec_env = NativeBatchedVecEnv(env)
 
@@ -594,7 +595,7 @@ def make_test_env(cfg: TrainingConfig, opponents, log_dir: str, replay_path: str
         layer_config=cfg.env.layer_config,
         env_version=cfg.env.env_version,
         n_envs=1,
-        reward_config=cfg.rewards,
+        reward_config=cfg.effective_rewards(),
     )
 
     return NativeBatchedVecEnv(env)
@@ -793,11 +794,18 @@ def apply_schedule_up_to(
         if model is not None:
             apply_ppo_hyperparams(model, cfg.ppo, defer_n_steps_resize=True)
         if env is not None:
-            env.env_method("set_reward_config", cfg.rewards)
+            env.env_method("set_reward_config", cfg.effective_rewards())
         if ckman is not None:
             ckman.update_manifest_config()
+        warn_shaping_gamma(cfg)
 
     return target_idx
+
+
+def warn_shaping_gamma(cfg: TrainingConfig) -> None:
+    if cfg.rewards.shaping_gamma is not None and abs(float(cfg.rewards.shaping_gamma) - float(cfg.ppo.gamma)) > 1e-9:
+        print(f"[rewards] shaping_gamma {cfg.rewards.shaping_gamma} differs from ppo.gamma {cfg.ppo.gamma}: "
+              "the potential-based shaping terms are only unbiased when the two agree")
 
 
 class ScheduleCallback(BaseCallback):
@@ -1118,6 +1126,12 @@ def run(
     if resume_from:
         ckman = CheckpointManager.resume(resume_from, runs_dir=cfg.runs_dir)
         cfg = ckman.config
+        stored_rewards = json.loads((ckman.run_dir / "run_manifest.json").read_text()).get("config", {}).get("rewards", {})
+        switches = [st for st in (schedule or []) if "rewards.crate_potential_coef" in st.get("overrides", {})]
+        if switches and "crate_potential_coef" not in stored_rewards:
+            print("[rewards] this run predates the potential-based crate term; the schedule switches it to "
+                  f"crate_potential_coef {switches[0]['overrides']['rewards.crate_potential_coef']} "
+                  "(pass --no-schedule or a schedule file without the key to keep the flat crate bonus)")
 
         merged: dict = {}
         auto_path = ckman.run_dir / "config_overrides.json"
@@ -1203,6 +1217,7 @@ def run(
             cfg, schedule, timesteps_done, schedule_applied_idx,
             model=model, env=env, ckman=ckman, verbose=True,
         )
+    warn_shaping_gamma(cfg)
 
     schedule_callback = ScheduleCallback(
         cfg, ckman, pool, schedule or [], applied_idx=schedule_applied_idx, verbose=1,

@@ -7,7 +7,7 @@ import json
 import os
 import pathlib
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from multiprocessing import freeze_support
 
@@ -143,16 +143,18 @@ def resolve_n_shards(n_envs: int, n_shards: int) -> int:
 
 def make_env(cfg: FQIConfig, n_envs: int, n_shards: int, log_dir: str):
     opponents = resolve_opponents(cfg.opponents)
+    rewards = replace(DQN_DEFAULT_CONFIG.rewards, shaping_gamma=float(cfg.gamma))
     if n_shards > 1:
         from ..dqn_agent.train import ShardedNativeBatchedVecEnv
 
         dqn_cfg = copy.deepcopy(DQN_DEFAULT_CONFIG)
         dqn_cfg.n_envs, dqn_cfg.n_shards = n_envs, n_shards
         dqn_cfg.env.env_version, dqn_cfg.env.scenario = cfg.env_version, cfg.scenario
+        dqn_cfg.rewards = rewards
         return ShardedNativeBatchedVecEnv(dqn_cfg, opponents, log_dir, n_shards=n_shards)
     env = BombermanGymEnv(
         build_world_args(cfg, log_dir), opponents=opponents, layer_config=DQN_DEFAULT_CONFIG.env.layer_config,
-        env_version=cfg.env_version, n_envs=n_envs, reward_config=DQN_DEFAULT_CONFIG.rewards,
+        env_version=cfg.env_version, n_envs=n_envs, reward_config=rewards,
     )
     return SingleShardVecEnv(env)
 

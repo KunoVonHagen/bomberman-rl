@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict, is_dataclass, fields as dataclass_fields
+from dataclasses import dataclass, field, asdict, is_dataclass, replace, fields as dataclass_fields
 from typing import Optional, List, Literal, ClassVar
 import json
 
@@ -180,7 +180,7 @@ class RewardConfig:
     invalid_action: float = -0.05
     bomb_dropped: float = 0.0
     bomb_exploded: float = 0.0
-    crate_destroyed: float = 0.3
+    crate_destroyed: float = 0.0
     coin_found: float = 0.0
     coin_collected: float = 1.0
     killed_opponent: float = 5.0
@@ -198,6 +198,8 @@ class RewardConfig:
     danger_penalty_coef: float = 0.05
     escape_bonus_coef: float = 0.05
     trap_shaping_coef: float = 0.03
+    crate_potential_coef: float = 0.05
+    shaping_gamma: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -320,6 +322,8 @@ class TrainingConfig:
         "rewards.danger_penalty_coef",
         "rewards.escape_bonus_coef",
         "rewards.trap_shaping_coef",
+        "rewards.crate_potential_coef",
+        "rewards.shaping_gamma",
     }
 
     def apply_overrides(self, overrides: dict, *, restrict_to: set | None = None) -> list:
@@ -351,6 +355,11 @@ class TrainingConfig:
             applied.append((dotted_key, current, new_value))
         return applied
 
+    def effective_rewards(self) -> RewardConfig:
+        if self.rewards.shaping_gamma is None:
+            return replace(self.rewards, shaping_gamma=float(self.ppo.gamma))
+        return self.rewards
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -360,8 +369,15 @@ class TrainingConfig:
         d["ppo"] = PPOConfig(**d.get("ppo", {}))
         d["env"] = EnvConfig(**cls._migrate_env_dict(d.get("env", {})))
         d["self_play"] = SelfPlayConfig(**cls._migrate_self_play_dict(d.get("self_play", {})))
-        d["rewards"] = RewardConfig(**d.get("rewards", {}))
+        d["rewards"] = RewardConfig(**cls._migrate_rewards_dict(d.get("rewards", {})))
         return cls(**d)
+
+    @staticmethod
+    def _migrate_rewards_dict(rewards: dict) -> dict:
+        rewards = dict(rewards)
+        rewards.setdefault("crate_potential_coef", 0.0)
+        rewards.setdefault("shaping_gamma", None)
+        return rewards
 
     @staticmethod
     def _migrate_env_dict(env: dict) -> dict:

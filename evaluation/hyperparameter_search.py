@@ -225,6 +225,9 @@ def run_search(space: SearchSpace, strategy: str, max_trials: Optional[int], ini
     out_path = STATS_DIR / f"{tag}.json"
     state = json.loads(out_path.read_text(encoding="utf-8")) if out_path.exists() else dict(trials=[])
     trials: List[Dict[str, Any]] = state["trials"]
+    old_names = [p["name"] for p in state.get("space", {}).get("parameters", [])]
+    if trials and old_names != space.names:
+        raise SystemExit(f"{out_path} sweeps {old_names} but the space now sweeps {space.names}; pass a new --tag")
     tried = {trial_key(t["params"]) for t in trials}
     grid = space.grid()
     rng = np.random.default_rng(seed)

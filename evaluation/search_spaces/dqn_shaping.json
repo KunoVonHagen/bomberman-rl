@@ -63,6 +63,15 @@
         0.2,
         0.4
       ]
+    },
+    {
+      "name": "rewards.crate_potential_coef",
+      "values": [
+        0.0,
+        0.02,
+        0.05,
+        0.1
+      ]
     }
   ],
   "validation": {

@@ -1078,6 +1078,8 @@ class BombermanGymEnv(gym.Env):
         self._prev_crate_dist = np.zeros(E)
         self._prev_bomb_danger = np.zeros(E)
         self._prev_trap_dist = np.zeros(E)
+        self._prev_crates = np.zeros(E)
+        self._crates_at_start = np.zeros(E)
         self._episode_over = np.zeros(E, dtype=bool)
 
         self.agent_actions: List[Dict[Any, str]] = [{} for _ in range(E)]
@@ -1319,6 +1321,8 @@ class BombermanGymEnv(gym.Env):
             self._prev_crate_dist[env] = self._crate_distance_now(env)
             self._prev_bomb_danger[env] = self._bomb_danger_now(env)
             self._prev_trap_dist[env] = self._trapped_opponent_distance_now(env)
+            self._crates_at_start[env] = self._crate_count_now(env)
+            self._prev_crates[env] = 0.0
 
 
     def _pack_bombs_and_explosions(self, envs=None) -> None:
@@ -1564,6 +1568,8 @@ class BombermanGymEnv(gym.Env):
             self._danger_penalty_coef = DANGER_PENALTY_COEF
             self._escape_bonus_coef = ESCAPE_BONUS_COEF
             self._trap_shaping_coef = TRAP_SHAPING_COEF
+            self._crate_potential_coef = 0.0
+            self._shaping_gamma = 1.0
             self._trapping_bomb_reward = 0.0
             self._got_killed_time_scaled = False
         else:
@@ -1573,6 +1579,9 @@ class BombermanGymEnv(gym.Env):
             self._danger_penalty_coef = reward_config.danger_penalty_coef
             self._escape_bonus_coef = reward_config.escape_bonus_coef
             self._trap_shaping_coef = reward_config.trap_shaping_coef
+            self._crate_potential_coef = float(getattr(reward_config, "crate_potential_coef", 0.0))
+            shaping_gamma = getattr(reward_config, "shaping_gamma", 1.0)
+            self._shaping_gamma = 1.0 if shaping_gamma is None else float(shaping_gamma)
             self._trapping_bomb_reward = float(getattr(reward_config, "trapping_bomb", 0.0))
             self._got_killed_time_scaled = bool(getattr(reward_config, "got_killed_time_scaled", False))
 
@@ -2280,31 +2289,40 @@ class BombermanGymEnv(gym.Env):
             total += self._trapping_bomb_reward
 
         terminal = bool(self._episode_over[env])
+        g = self._shaping_gamma
         coin_now = 0.0 if terminal else self._coin_distance_now(env)
-        total += self._coin_shaping_coef * (self._prev_coin_dist[env] - coin_now)
+        total += self._coin_shaping_coef * (self._prev_coin_dist[env] - g * coin_now)
         self._prev_coin_dist[env] = coin_now
 
         crate_now = 0.0 if terminal else self._crate_distance_now(env)
-        total += self._crate_shaping_coef * (self._prev_crate_dist[env] - crate_now)
+        total += self._crate_shaping_coef * (self._prev_crate_dist[env] - g * crate_now)
         self._prev_crate_dist[env] = crate_now
 
         danger_now = 0.0 if terminal else self._bomb_danger_now(env)
-        total += self._escape_bonus_coef * (self._prev_bomb_danger[env] - danger_now)
+        total += self._escape_bonus_coef * (self._prev_bomb_danger[env] - g * danger_now)
         total -= self._danger_penalty_coef * danger_now
         self._prev_bomb_danger[env] = danger_now
 
         trap_now = 0.0 if terminal else self._trapped_opponent_distance_now(env)
-        total += self._trap_shaping_coef * (self._prev_trap_dist[env] - trap_now)
+        total += self._trap_shaping_coef * (self._prev_trap_dist[env] - g * trap_now)
         self._prev_trap_dist[env] = trap_now
+
+        destroyed_now = 0.0 if terminal else self._crates_at_start[env] - float(self._crates_left[env])
+        total += self._crate_potential_coef * (g * destroyed_now - self._prev_crates[env])
+        self._prev_crates[env] = destroyed_now
         return total
 
     def potential(self, env: int) -> float:
         if self._episode_over[env]:
             return 0.0
-        return -(self._coin_shaping_coef * self._coin_distance_now(env)
-                 + self._crate_shaping_coef * self._crate_distance_now(env)
-                 + self._escape_bonus_coef * self._bomb_danger_now(env)
-                 + self._trap_shaping_coef * self._trapped_opponent_distance_now(env))
+        return (self._crate_potential_coef * (self._crates_at_start[env] - self._crate_count_now(env))
+                - self._coin_shaping_coef * self._coin_distance_now(env)
+                - self._crate_shaping_coef * self._crate_distance_now(env)
+                - self._escape_bonus_coef * self._bomb_danger_now(env)
+                - self._trap_shaping_coef * self._trapped_opponent_distance_now(env))
+
+    def _crate_count_now(self, env: int) -> float:
+        return float(np.count_nonzero(self.arena[env] == 1))
 
     def _bomb_traps_opponent(self, env: int) -> bool:
         agent = self.agents[env]

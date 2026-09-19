@@ -15,7 +15,8 @@
       "rewards.killed_opponent": 5.0,
       "rewards.waited": -0.01,
       "rewards.invalid_action": -0.2,
-      "rewards.crate_destroyed": 0.3,
+      "rewards.crate_destroyed": 0.0,
+      "rewards.crate_potential_coef": 0.05,
       "rewards.killed_self": -1.0,
       "rewards.got_killed": -5.0,
       "rewards.coin_shaping_coef": 0.05,
@@ -38,7 +39,7 @@
     "overrides": {
       "rewards.waited": -0.005,
       "rewards.invalid_action": -0.1,
-      "rewards.crate_destroyed": 0.15,
+      "rewards.crate_destroyed": 0.0,
       "rewards.killed_self": -0.5,
       "rewards.got_killed": -2.5,
       "rewards.coin_shaping_coef": 0.025,
@@ -60,7 +61,7 @@
     "overrides": {
       "rewards.waited": -0.002,
       "rewards.invalid_action": -0.04,
-      "rewards.crate_destroyed": 0.06,
+      "rewards.crate_destroyed": 0.0,
       "rewards.killed_self": -0.2,
       "rewards.got_killed": -1.0,
       "rewards.coin_shaping_coef": 0.01,

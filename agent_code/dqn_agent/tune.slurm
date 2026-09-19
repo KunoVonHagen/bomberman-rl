@@ -45,8 +45,8 @@ DELETE_RUNS="${DELETE_RUNS:-1}"
 #   ~16h40m
 #
 # Search 3: dqn_shaping
-#   5 coin * 5 crate * 5 danger * 5 trap
-#   = 625 possible trials
+#   5 coin * 5 crate * 5 danger * 5 trap * 4 crate_potential
+#   = 2500 possible trials, sampled at random
 #
 #   Default budget: 100 trials
 #   ~16h40m
@@ -63,7 +63,7 @@ SHAPING_MAX_TRIALS="${SHAPING_MAX_TRIALS:-100}"
 
 REG_TAG="${REG_TAG:-tune__dqn_regularisation}"
 DEFAULT_TAG="${DEFAULT_TAG:-tune__dqn_default}"
-SHAPING_TAG="${SHAPING_TAG:-tune__dqn_shaping}"
+SHAPING_TAG="${SHAPING_TAG:-tune__dqn_shaping_v2}"
 
 echo "============================================================"
 echo " DQN hyperparameter tuning"
@@ -216,8 +216,9 @@ DEFAULT_RC=$?
 #   crate_shaping_coef  = [0, 0.01, 0.02, 0.05, 0.1]
 #   danger_penalty_coef = [0, 0.02, 0.05, 0.1, 0.2]
 #   trap_shaping_coef   = [0, 0.05, 0.1, 0.2, 0.4]
+#   crate_potential_coef = [0, 0.02, 0.05, 0.1]
 #
-# 5 * 5 * 5 * 5 = 625 possible combinations.
+# 5 * 5 * 5 * 5 * 4 = 2500 possible combinations, sampled at random.
 #
 # Default to 100 trials.
 # ---------------------------------------------------------------------------
