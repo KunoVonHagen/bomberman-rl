@@ -63,6 +63,13 @@
         0.4
       ],
       "log": true
+    },
+    {
+      "name": "dqn.priority_alpha",
+      "values": [
+        0.0,
+        0.6
+      ]
     }
   ],
   "validation": {

@@ -226,12 +226,19 @@ class MaskableDQN:
         replay_prefetch: bool = True,
         replay_device: str = "host",
         n_step: int = 1,
+        priority_alpha: float = 0.0,
+        priority_eps: float = 0.01,
         n_envs: int = 1,
         device: str = "cpu",
         inference: bool = False,
     ):
         self.inference = bool(inference)
         self.n_step = max(1, int(n_step))
+        self.priority_alpha = max(0.0, float(priority_alpha))
+        self.priority_eps = max(0.0, float(priority_eps))
+        self._pending_priorities: deque = deque()
+        self._priority_staging: Optional[list] = None
+        self._priority_stage_next = 0
         self.observation_space = observation_space
         self.action_space = action_space
         self.n_actions = int(action_space.n)
@@ -419,15 +426,52 @@ class MaskableDQN:
         if self.replay_buffer is None or self.n_envs != n_envs:
             self.n_envs = n_envs
             self._prefetched = None
+            self._pending_priorities.clear()
             if self.replay_device == "device":
                 self.replay_buffer = DeviceReplayBuffer(
                     self.buffer_size, n_envs, self.observation_space, self.n_actions, self.device,
-                    grid_codec=self.grid_codec,
+                    grid_codec=self.grid_codec, priority_alpha=self.priority_alpha, priority_eps=self.priority_eps,
+                    priority_n_step=self.n_step,
                 )
             else:
                 self.replay_buffer = DictReplayBuffer(
                     self.buffer_size, n_envs, self.observation_space, self.n_actions, grid_codec=self.grid_codec,
+                    priority_alpha=self.priority_alpha, priority_eps=self.priority_eps, priority_n_step=self.n_step,
                 )
+
+    def set_priority_options(self, alpha: float, eps: float) -> None:
+        self.priority_alpha = max(0.0, float(alpha))
+        self.priority_eps = max(0.0, float(eps))
+        if self.replay_buffer is not None:
+            self.replay_buffer.set_priority_alpha(self.priority_alpha, self.priority_eps, self.n_step)
+
+    def _flush_priority_updates(self, force: bool = False) -> None:
+        while self._pending_priorities:
+            indices, versions, td_abs, event = self._pending_priorities[0]
+            if event is not None:
+                if not (force or event.query()):
+                    break
+                event.synchronize()
+                force = False
+            self._pending_priorities.popleft()
+            self.replay_buffer.update_priorities(indices, versions, td_abs.numpy())
+
+    def _queue_priority_update(self, indices: np.ndarray, versions: np.ndarray, td_abs: torch.Tensor) -> None:
+        if self.device.type != "cuda":
+            self.replay_buffer.update_priorities(indices, versions, td_abs.cpu().numpy())
+            return
+        n_slots = 4
+        if self._priority_staging is None or self._priority_staging[0].shape[0] != td_abs.shape[0]:
+            self._priority_staging = [torch.empty(td_abs.shape[0], dtype=torch.float32, pin_memory=True) for _ in range(n_slots)]
+            self._priority_stage_next = 0
+        if len(self._pending_priorities) >= n_slots:
+            self._flush_priority_updates(force=True)
+        host = self._priority_staging[self._priority_stage_next]
+        self._priority_stage_next = (self._priority_stage_next + 1) % n_slots
+        host.copy_(td_abs, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self.device))
+        self._pending_priorities.append((indices, versions, host, event))
 
     def save_replay_buffer(self, path, max_transitions: Optional[int] = None) -> int:
         """
@@ -484,6 +528,7 @@ class MaskableDQN:
         train_dtype = torch.float16 if self._amp_enabled else torch.float32
         context = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
         with context:
+            self._flush_priority_updates()
             batch = self.replay_buffer.sample(self.batch_size, out=staging, n_step=self.n_step, gamma=self.gamma)
             fetched = dict(
                 obs=_obs_to_tensors(batch["obs"], self.device, pinned=pinned_obs, codec=self._codec_tensors, dtype=train_dtype),
@@ -493,6 +538,8 @@ class MaskableDQN:
                 dones=torch.as_tensor(batch["dones"], device=self.device, dtype=torch.float32),
                 discounts=torch.as_tensor(batch["discounts"], device=self.device, dtype=torch.float32),
                 next_masks=torch.as_tensor(batch["next_action_masks"], device=self.device, dtype=torch.bool),
+                indices=batch["indices"],
+                versions=batch["versions"],
             )
             if cuda:
                 event = torch.cuda.Event()
@@ -588,8 +635,11 @@ class MaskableDQN:
             if prof: prof.stop("prefetch")
 
         with torch.no_grad():
-            td_error = (target - q_values).abs().mean()
+            td_abs = (target - q_values).abs()
+            td_error = td_abs.mean()
             mean_q = q_values_all.mean()
+            if self.replay_buffer.priority_alpha > 0.0:
+                self._queue_priority_update(fetched["indices"], fetched["versions"], td_abs.float())
 
         if prof:
             self._last_profile = prof.summary()
@@ -787,6 +837,8 @@ class MaskableDQN:
             amp=self.amp,
             grid_codec=self.grid_codec,
             n_step=self.n_step,
+            priority_alpha=self.priority_alpha,
+            priority_eps=self.priority_eps,
         )
 
     def save(self, path) -> None:

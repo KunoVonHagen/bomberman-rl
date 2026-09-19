@@ -34,6 +34,40 @@ def _encode_grid_kernel(src, den, sentinel, out):
                         elif code > GRID_MAX_CODE:
                             code = GRID_MAX_CODE
                         out[e, l, i, j] = code
+
+
+@njit(cache=True)
+def _tree_set_kernel(tree, capacity, idx, values):
+    for k in range(idx.shape[0]):
+        node = idx[k] + capacity
+        tree[node] = values[k]
+        node >>= 1
+        while node >= 1:
+            tree[node] = tree[2 * node] + tree[2 * node + 1]
+            node >>= 1
+
+
+@njit(cache=True)
+def _tree_build_kernel(tree, capacity):
+    for node in range(capacity - 1, 0, -1):
+        tree[node] = tree[2 * node] + tree[2 * node + 1]
+
+
+@njit(cache=True)
+def _tree_sample_kernel(tree, capacity, draws, out):
+    for k in range(draws.shape[0]):
+        node = 1
+        s = draws[k]
+        while node < capacity:
+            left = 2 * node
+            if s < tree[left]:
+                node = left
+            else:
+                s -= tree[left]
+                node = left + 1
+        out[k] = node - capacity
+
+
 REPLAY_FIELDS = ("grid", "features", "actions", "rewards", "dones", "action_masks")
 
 
@@ -41,7 +75,8 @@ class DictReplayBuffer:
     """Circular buffer for dict observations with action masks."""
 
     def __init__(self, buffer_size: int, n_envs: int, observation_space, action_dim: int,
-                 grid_dtype=np.float16, grid_codec=None):
+                 grid_dtype=np.float16, grid_codec=None, priority_alpha: float = 0.0, priority_eps: float = 0.01,
+                 priority_n_step: int = 1):
         self.n_envs = max(1, int(n_envs))
         self.rows = max(2, int(buffer_size) // self.n_envs)
         self.action_dim = int(action_dim)
@@ -74,6 +109,139 @@ class DictReplayBuffer:
 
         self.last_sample_time_s: Optional[float] = None
         self.num_timesteps: int = 0
+        self._init_priorities(priority_alpha, priority_eps, priority_n_step)
+
+    def _init_priorities(self, alpha: float, eps: float, n_step: int = 1) -> None:
+        self.priority_alpha = 0.0
+        self.priority_eps = max(0.0, float(eps))
+        self._td_raw = np.ones((self.rows, self.n_envs), dtype=np.float32)
+        self._max_td = 1.0
+        self.priorities = np.ones((self.rows, self.n_envs), dtype=np.float64)
+        self._max_priority = 1.0
+        self._row_version = np.zeros(self.rows, dtype=np.int64)
+        self._tree = None
+        self._tree_capacity = 0
+        self._tree_n_step = 1
+        self.set_priority_alpha(alpha, eps, n_step)
+
+    def _priority_of(self, td):
+        return np.maximum((np.asarray(td, dtype=np.float64) + self.priority_eps) ** self.priority_alpha, 1e-12)
+
+    def set_priority_alpha(self, alpha: float, eps: Optional[float] = None, n_step: Optional[int] = None) -> None:
+        alpha = max(0.0, float(alpha))
+        eps = self.priority_eps if eps is None else max(0.0, float(eps))
+        n_step = self._tree_n_step if n_step is None else max(1, int(n_step))
+        rescale = alpha != self.priority_alpha or eps != self.priority_eps
+        regate = n_step != self._tree_n_step
+        self.priority_alpha = alpha
+        self.priority_eps = eps
+        self._tree_n_step = n_step
+        if alpha <= 0.0:
+            self._tree = None
+            self._tree_capacity = 0
+            return
+        if rescale:
+            self.priorities[:] = self._priority_of(self._td_raw)
+            self._max_priority = float(self._priority_of(self._max_td))
+        if self._tree is None or rescale or regate:
+            self._rebuild_tree()
+
+    def _tree_ready(self, rows) -> np.ndarray:
+        rows = np.asarray(rows, dtype=np.int64)
+        chain = (rows[:, None] + np.arange(self._tree_n_step, dtype=np.int64)[None, :]) % self.rows
+        return self._has_next[chain].all(axis=1)
+
+    def priority_stats(self) -> Optional[dict]:
+        if self._tree is None:
+            return None
+        active = int(self._tree_ready(np.arange(self.rows)).sum()) * self.n_envs
+        return {
+            "priority_max": float(self._max_priority),
+            "priority_mean": float(self._tree[1] / active) if active else 0.0,
+        }
+
+    def _rebuild_tree(self) -> None:
+        capacity = 1
+        while capacity < self.rows * self.n_envs:
+            capacity *= 2
+        tree = np.zeros(2 * capacity, dtype=np.float64)
+        leaves = self.priorities * self._tree_ready(np.arange(self.rows))[:, None]
+        tree[capacity:capacity + self.rows * self.n_envs] = leaves.reshape(-1)
+        _tree_build_kernel(tree, capacity)
+        self._tree = tree
+        self._tree_capacity = capacity
+
+    def _set_row_leaves(self, row: int, active: bool) -> None:
+        if self._tree is None:
+            return
+        idx = row * self.n_envs + np.arange(self.n_envs, dtype=np.int64)
+        values = self.priorities[row] if active else np.zeros(self.n_envs, dtype=np.float64)
+        _tree_set_kernel(self._tree, self._tree_capacity, idx, np.ascontiguousarray(values, dtype=np.float64))
+
+    def _after_write(self, i: int) -> None:
+        self._row_version[i] += 1
+        self._td_raw[i] = self._max_td
+        self.priorities[i] = self._max_priority
+        self._has_next[i] = False
+        self._set_row_leaves(i, False)
+        if i == self._seam_row:
+            self._seam_row = None
+        prev = (i - 1) % self.rows
+        if (i > 0 or self._full) and prev != self._seam_row:
+            self._has_next[prev] = True
+            old = (i - self._tree_n_step) % self.rows
+            if self._tree is not None and self._tree_ready(np.array([old]))[0]:
+                self._set_row_leaves(old, True)
+
+        self._pos += 1
+        if self._pos == self.rows:
+            self._pos = 0
+            self._full = True
+
+    def _draw_uniform(self, batch_size: int) -> tuple:
+        rows = np.flatnonzero(self._has_next)
+        if len(rows) == 0:
+            raise ValueError("replay buffer holds no transition with a stored successor yet")
+        row_idx = rows[np.random.randint(0, len(rows), size=batch_size)]
+        env_idx = np.random.randint(0, self.n_envs, size=batch_size)
+        return row_idx, env_idx
+
+    def _draw_indices(self, batch_size: int) -> tuple:
+        if self._tree is None or self._tree[1] <= 0.0:
+            return self._draw_uniform(batch_size)
+        total = self._tree[1]
+        draws = (np.arange(batch_size, dtype=np.float64) + np.random.random(batch_size)) * (total / batch_size)
+        flat = np.empty(batch_size, dtype=np.int64)
+        _tree_sample_kernel(self._tree, self._tree_capacity, draws, flat)
+        row_idx = flat // self.n_envs
+        env_idx = flat - row_idx * self.n_envs
+        bad = (flat >= self.rows * self.n_envs) | ~self._has_next[np.minimum(row_idx, self.rows - 1)]
+        if bad.any():
+            fix_rows, fix_envs = self._draw_uniform(int(bad.sum()))
+            row_idx[bad] = fix_rows
+            env_idx[bad] = fix_envs
+        return row_idx, env_idx
+
+    def update_priorities(self, indices: np.ndarray, versions: np.ndarray, td_abs: np.ndarray) -> None:
+        if self._tree is None:
+            return
+        indices = np.asarray(indices, dtype=np.int64)
+        rows = indices // self.n_envs
+        fresh = np.asarray(versions, dtype=np.int64) == self._row_version[rows]
+        if not fresh.any():
+            return
+        indices, rows = indices[fresh], rows[fresh]
+        td = np.nan_to_num(np.asarray(td_abs, dtype=np.float64)[fresh], nan=0.0, posinf=0.0, neginf=0.0)
+        values = self._priority_of(td)
+        self._td_raw.reshape(-1)[indices] = td
+        self.priorities.reshape(-1)[indices] = values
+        if float(td.max()) > self._max_td:
+            self._max_td = float(td.max())
+            self._max_priority = float(self._priority_of(self._max_td))
+        active = self._tree_ready(rows)
+        if active.any():
+            _tree_set_kernel(self._tree, self._tree_capacity, np.ascontiguousarray(indices[active]),
+                             np.ascontiguousarray(values[active]))
 
     @property
     def capacity(self) -> int:
@@ -100,18 +268,7 @@ class DictReplayBuffer:
         self.rewards[i] = rewards
         self.dones[i] = dones
         self.action_masks[i] = action_masks
-
-        self._has_next[i] = False
-        if i == self._seam_row:
-            self._seam_row = None
-        prev = (i - 1) % self.rows
-        if (i > 0 or self._full) and prev != self._seam_row:
-            self._has_next[prev] = True
-
-        self._pos += 1
-        if self._pos == self.rows:
-            self._pos = 0
-            self._full = True
+        self._after_write(i)
 
     def _n_step_targets(self, row_idx: np.ndarray, env_idx: np.ndarray, n_step: int, gamma: float,
                         rewards: np.ndarray, dones: np.ndarray) -> tuple:
@@ -141,15 +298,12 @@ class DictReplayBuffer:
     def sample(self, batch_size: int, out: Optional[dict] = None, n_step: int = 1, gamma: float = 0.99) -> dict:
         t0 = time.perf_counter()
 
-        rows = np.flatnonzero(self._has_next)
-        if len(rows) == 0:
-            raise ValueError("replay buffer holds no transition with a stored successor yet")
-        row_idx = rows[np.random.randint(0, len(rows), size=batch_size)]
-        env_idx = np.random.randint(0, self.n_envs, size=batch_size)
+        row_idx, env_idx = self._draw_indices(batch_size)
         next_row_idx, returns, terminal, discounts = self._n_step_targets(
             row_idx, env_idx, n_step, gamma, self.rewards, self.dones)
 
-        flat = torch.from_numpy(row_idx * self.n_envs + env_idx)
+        flat_np = row_idx * self.n_envs + env_idx
+        flat = torch.from_numpy(flat_np)
         next_flat = torch.from_numpy(next_row_idx * self.n_envs + env_idx)
         grid = torch.index_select(self._grid_flat, 0, flat, out=None if out is None else out["grid"])
         next_grid = torch.index_select(self._grid_flat, 0, next_flat, out=None if out is None else out["next_grid"])
@@ -169,6 +323,8 @@ class DictReplayBuffer:
             discounts=discounts,
             action_masks=self.action_masks[row_idx, env_idx],
             next_action_masks=self.action_masks[next_row_idx, env_idx],
+            indices=flat_np,
+            versions=self._row_version[row_idx],
         )
 
         self.last_sample_time_s = time.perf_counter() - t0
@@ -253,6 +409,11 @@ class DictReplayBuffer:
         self._seam_row = keep - 1 if keep > 0 else None
         self._pos = keep % self.rows
         self._full = keep == self.rows
+        self._td_raw[:] = self._max_td
+        self.priorities[:] = self._max_priority
+        self._row_version += 1
+        if self._tree is not None:
+            self._rebuild_tree()
         return keep
 
     def load(self, path) -> int:
@@ -291,7 +452,7 @@ class DictReplayBuffer:
 
 class DeviceReplayBuffer(DictReplayBuffer):
     def __init__(self, buffer_size: int, n_envs: int, observation_space, action_dim: int, device,
-                 grid_codec=None):
+                 grid_codec=None, priority_alpha: float = 0.0, priority_eps: float = 0.01, priority_n_step: int = 1):
         self.device = torch.device(device)
         self.n_envs = max(1, int(n_envs))
         self.rows = max(2, int(buffer_size) // self.n_envs)
@@ -338,6 +499,7 @@ class DeviceReplayBuffer(DictReplayBuffer):
         self._seam_row: Optional[int] = None
         self.last_sample_time_s: Optional[float] = None
         self.num_timesteps: int = 0
+        self._init_priorities(priority_alpha, priority_eps, priority_n_step)
 
     def add(self, obs, next_obs, actions, rewards, dones, action_masks, next_action_masks) -> None:
         i = self._pos
@@ -361,30 +523,16 @@ class DeviceReplayBuffer(DictReplayBuffer):
             getattr(self, name)[i].copy_(tensor, non_blocking=non_blocking)
         if self._stage_event is not None:
             self._stage_event.record()
-
-        self._has_next[i] = False
-        if i == self._seam_row:
-            self._seam_row = None
-        prev = (i - 1) % self.rows
-        if (i > 0 or self._full) and prev != self._seam_row:
-            self._has_next[prev] = True
-
-        self._pos += 1
-        if self._pos == self.rows:
-            self._pos = 0
-            self._full = True
+        self._after_write(i)
 
     def sample(self, batch_size: int, out: Optional[dict] = None, n_step: int = 1, gamma: float = 0.99) -> dict:
         t0 = time.perf_counter()
-        rows = np.flatnonzero(self._has_next)
-        if len(rows) == 0:
-            raise ValueError("replay buffer holds no transition with a stored successor yet")
-        row_idx = rows[np.random.randint(0, len(rows), size=batch_size)]
-        env_idx = np.random.randint(0, self.n_envs, size=batch_size)
+        row_idx, env_idx = self._draw_indices(batch_size)
         next_row_idx, returns, terminal, discounts = self._n_step_targets(
             row_idx, env_idx, n_step, gamma, self._rewards_host, self._dones_host)
         non_blocking = self.device.type == "cuda"
-        flat = torch.from_numpy(row_idx * self.n_envs + env_idx).to(self.device, non_blocking=non_blocking)
+        flat_np = row_idx * self.n_envs + env_idx
+        flat = torch.from_numpy(flat_np).to(self.device, non_blocking=non_blocking)
         next_flat = torch.from_numpy(next_row_idx * self.n_envs + env_idx).to(self.device, non_blocking=non_blocking)
         total = self.rows * self.n_envs
         features = self.features.view(total, -1)
@@ -404,6 +552,8 @@ class DeviceReplayBuffer(DictReplayBuffer):
             discounts=torch.from_numpy(discounts).to(self.device, non_blocking=non_blocking),
             action_masks=torch.index_select(masks, 0, flat),
             next_action_masks=torch.index_select(masks, 0, next_flat),
+            indices=flat_np,
+            versions=self._row_version[row_idx],
         )
         self.last_sample_time_s = time.perf_counter() - t0
         return batch

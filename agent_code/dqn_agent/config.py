@@ -94,6 +94,8 @@ class DQNConfig:
     replay_prefetch: bool = True
     replay_device: str = "host"
     n_step: int = 5
+    priority_alpha: float = 0.6
+    priority_eps: float = 0.01
 
 
 @dataclass(frozen=True)
@@ -241,6 +243,8 @@ class TrainingConfig:
         "dqn.replay_prefetch",
         "dqn.replay_device",
         "dqn.n_step",
+        "dqn.priority_alpha",
+        "dqn.priority_eps",
         "self_play.enabled",
         "self_play.static_opponents",
         "self_play.arrangements",
@@ -304,11 +308,17 @@ class TrainingConfig:
     @classmethod
     def from_dict(cls, d: dict) -> "TrainingConfig":
         d = dict(d)
-        d["dqn"] = DQNConfig(**d.get("dqn", {}))
+        d["dqn"] = DQNConfig(**cls._migrate_dqn_dict(d.get("dqn", {})))
         d["env"] = EnvConfig(**cls._migrate_env_dict(d.get("env", {})))
         d["self_play"] = SelfPlayConfig(**cls._migrate_self_play_dict(d.get("self_play", {})))
         d["rewards"] = RewardConfig(**d.get("rewards", {}))
         return cls(**d)
+
+    @staticmethod
+    def _migrate_dqn_dict(dqn: dict) -> dict:
+        dqn = dict(dqn)
+        dqn.setdefault("priority_alpha", 0.0)
+        return dqn
 
     @staticmethod
     def _migrate_env_dict(env: dict) -> dict:

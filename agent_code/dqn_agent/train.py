@@ -722,6 +722,9 @@ class ProgressLoggingCallback:
                 train["buffer_fill"] = len(replay_buffer) / buffer_size
             except TypeError:
                 pass
+        priority_stats = getattr(replay_buffer, "priority_stats", lambda: None)()
+        if priority_stats:
+            train.update(priority_stats)
 
         profile_stats = getattr(model, "get_profile_stats", lambda: None)()
         if profile_stats:
@@ -806,6 +809,8 @@ def build_model(env, cfg: TrainingConfig, device: str) -> MaskableDQN:
         replay_prefetch=cfg.dqn.replay_prefetch,
         replay_device=cfg.dqn.replay_device,
         n_step=cfg.dqn.n_step,
+        priority_alpha=cfg.dqn.priority_alpha,
+        priority_eps=cfg.dqn.priority_eps,
     )
 
 
@@ -817,6 +822,7 @@ def apply_dqn_hyperparams(model: MaskableDQN, dqn_cfg: DQNConfig, total_timestep
     model.tau = dqn_cfg.tau
     model.gamma = dqn_cfg.gamma
     model.n_step = max(1, int(dqn_cfg.n_step))
+    model.set_priority_options(dqn_cfg.priority_alpha, dqn_cfg.priority_eps)
     model.train_freq = max(1, int(dqn_cfg.train_freq))
     model.gradient_steps = dqn_cfg.gradient_steps
     model.target_update_interval = max(1, int(dqn_cfg.target_update_interval))
