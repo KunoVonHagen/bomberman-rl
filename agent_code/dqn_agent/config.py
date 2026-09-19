@@ -406,7 +406,7 @@ DEFAULT_CONFIG = TrainingConfig(
         weight_decay=1e-5,
         dropout=0.0,
     ),
-    env=EnvConfig(env_version=3),
+    env=EnvConfig(env_version=4),
     self_play=SelfPlayConfig(
         enabled=True,
         static_opponents=[

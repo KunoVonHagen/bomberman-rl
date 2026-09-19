@@ -190,7 +190,8 @@ ALL_LAYER_GROUPS: Tuple[str, ...] = tuple(LAYER_GROUPS.keys())
     FEATURE_CRATE_DIR_RIGHT,
     FEATURE_CRATE_DIR_DOWN,
     FEATURE_CRATE_DIR_LEFT,
-) = range(30)
+    FEATURE_TRAP_NOW,
+) = range(31)
 
 FEATURE_NAMES: Tuple[str, ...] = (
     "self_x",
@@ -223,8 +224,10 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "crate_dir_right",
     "crate_dir_down",
     "crate_dir_left",
+    "trap_now",
 )
 NUM_FEATURES = len(FEATURE_NAMES)
+NUM_FEATURES_V3 = FEATURE_TRAP_NOW
 NUM_FEATURES_V2 = 20
 COIN_DIRECTION_FEATURES = (FEATURE_COIN_DIR_UP, FEATURE_COIN_DIR_RIGHT, FEATURE_COIN_DIR_DOWN, FEATURE_COIN_DIR_LEFT)
 CRATE_DIRECTION_FEATURES = (FEATURE_CRATE_DIR_UP, FEATURE_CRATE_DIR_RIGHT, FEATURE_CRATE_DIR_DOWN, FEATURE_CRATE_DIR_LEFT)
@@ -284,7 +287,8 @@ def grid_layer_codes(layer_config: Optional[Iterable[str]]) -> Tuple[np.ndarray,
 def observation_shapes(layer_config: Optional[Iterable[str]], env_version: int) -> Tuple[Tuple[int, int, int], int]:
     groups = resolve_layer_groups(layer_config)
     n_layers = len(sorted(idx for g in groups for idx in LAYER_GROUPS[g]))
-    n_features = NUM_FEATURES if int(env_version) >= 3 else NUM_FEATURES_V2
+    version = int(env_version)
+    n_features = NUM_FEATURES if version >= 4 else NUM_FEATURES_V3 if version >= 3 else NUM_FEATURES_V2
     return (n_layers, s.COLS, s.ROWS), n_features
 
 
@@ -469,12 +473,83 @@ def _own_bomb_escape_kernel(ax, ay, blast_tensor, occ, danger, W, H, T, bomb_tim
 
 
 @njit(cache=True)
-def _escape_possible_kernel(sx, sy, occ, danger, W, H, T, visited, qx, qy, qt, envs, out):
+def _trap_now_kernel(ax, ay, bombs_left, opp_x, opp_y, opp_alive, blast_tensor, occ, danger, W, H, T, bomb_timer, ET,
+                     visited, qx, qy, qt, envs, out):
+    for ei in range(envs.shape[0]):
+        env = envs[ei]
+        out[env] = np.float32(0.0)
+        if not bombs_left[env]:
+            continue
+        x0 = ax[env]
+        y0 = ay[env]
+        blast = blast_tensor[x0, y0]
+        for k in range(opp_x.shape[1]):
+            if not opp_alive[env, k]:
+                continue
+            hx = opp_x[env, k]
+            hy = opp_y[env, k]
+            if blast[hx, hy] <= 0:
+                continue
+            vis = visited[env]
+            vis[:, :, :] = False
+            vis[hx, hy, 0] = True
+            qx[env, 0] = hx
+            qy[env, 0] = hy
+            qt[env, 0] = 0
+            head = 0
+            tail = 1
+            escaped = False
+            alive_at_onset = False
+            while head < tail:
+                x = qx[env, head]
+                y = qy[env, head]
+                t = qt[env, head]
+                head += 1
+                if t >= T:
+                    escaped = True
+                    break
+                if t >= bomb_timer:
+                    alive_at_onset = True
+                for m in range(5):
+                    if m == 0:
+                        nx, ny = x - 1, y
+                    elif m == 1:
+                        nx, ny = x + 1, y
+                    elif m == 2:
+                        nx, ny = x, y - 1
+                    elif m == 3:
+                        nx, ny = x, y + 1
+                    else:
+                        nx, ny = x, y
+                    if nx < 0 or nx >= W or ny < 0 or ny >= H:
+                        continue
+                    own_blast = blast[nx, ny] > 0 and bomb_timer <= t < bomb_timer + ET
+                    if m < 4:
+                        own_bomb = nx == x0 and ny == y0 and t <= bomb_timer
+                        if occ[env, t, nx, ny] > 0 or own_bomb or own_blast:
+                            continue
+                    elif danger[env, t, nx, ny] > 0 or own_blast:
+                        continue
+                    if vis[nx, ny, t + 1]:
+                        continue
+                    vis[nx, ny, t + 1] = True
+                    qx[env, tail] = nx
+                    qy[env, tail] = ny
+                    qt[env, tail] = t + 1
+                    tail += 1
+            if alive_at_onset and not escaped:
+                out[env] = np.float32(1.0)
+                break
+
+
+@njit(cache=True)
+def _escape_possible_kernel(sx, sy, occ, danger, W, H, T, onset, visited, qx, qy, qt, envs, out, alive_out):
     for ei in range(envs.shape[0]):
         env = envs[ei]
         x0 = sx[env]
         y0 = sy[env]
         out[env] = False
+        alive_out[env] = False
         vis = visited[env]
         vis[:, :, :] = False
         vis[x0, y0, 0] = True
@@ -491,6 +566,8 @@ def _escape_possible_kernel(sx, sy, occ, danger, W, H, T, visited, qx, qy, qt, e
             if t >= T:
                 out[env] = True
                 break
+            if t >= onset:
+                alive_out[env] = True
             ta = t
             for k in range(5):
                 if k == 0:
@@ -714,8 +791,8 @@ def _center_normalize_kernel(gt, ax, ay, layers, envs, cx, cy, W, H, T_HORIZON, 
 
 @njit(cache=True)
 def _features_masks_kernel(gt, ax, ay, bombs_left, step_counts, opp_x, opp_y, opp_alive, coins_collectable, total_coins,
-                           init_coins, init_crates, arena, blast_tensor, escape,
-                           W, H, DIST_MAX, T_HORIZON, CP_MAX, ESC_MAX, MAX_STEPS, MAX_OPP, fixes, extra,
+                           init_coins, init_crates, arena, blast_tensor, escape, trap_now,
+                           W, H, DIST_MAX, T_HORIZON, CP_MAX, ESC_MAX, MAX_STEPS, MAX_OPP, fixes, extra, trap_feature,
                            L_COIN_D, L_CRATE_D, L_OPP_D, L_ONSET, L_MOB, L_CP, L_SELF_D, L_OCC1, L_DNG1, L_OCC0, L_DNG0,
                            f, masks, crates_left_out, coins_left_out, envs):
     f32_dist_max = np.float32(DIST_MAX)
@@ -849,6 +926,8 @@ def _features_masks_kernel(gt, ax, ay, bombs_left, step_counts, opp_x, opp_y, op
                     there = g[layer, min(max(tx, 0), W - 1), min(max(ty, 0), H - 1)]
                     toward = valid and here >= 0 and there >= 0 and there < here
                     f[e, base + d] = np.float32(1.0) if toward else np.float32(0.0)
+            if trap_feature:
+                f[e, FEATURE_TRAP_NOW] = trap_now[e]
         else:
             f[e, FEATURE_SAFE_BOMB] = safe_any * bl
 
@@ -879,7 +958,8 @@ class BombermanGymEnv(gym.Env):
         self.env_version = int(env_version)
         self._fixes = self.env_version >= 2
         self._extra_features = self.env_version >= 3
-        self.n_features = NUM_FEATURES if self._extra_features else NUM_FEATURES_V2
+        self._trap_feature = self.env_version >= 4
+        self.n_features = NUM_FEATURES if self._trap_feature else NUM_FEATURES_V3 if self._extra_features else NUM_FEATURES_V2
         if self.n_envs < 1:
             raise ValueError("n_envs must be >= 1")
         self.auto_reset = auto_reset
@@ -959,6 +1039,7 @@ class BombermanGymEnv(gym.Env):
         self._opp_alive = np.zeros((E, MAX_OPPONENTS), dtype=np.bool_)
         self._total_coins = np.zeros(E, dtype=np.float32)
         self._escape_dummy = np.zeros(E, dtype=np.float32)
+        self._trap_now = np.zeros(E, dtype=np.float32)
         self._opp_bombs_left = np.zeros((E, MAX_OPPONENTS), dtype=np.bool_)
         self._action_masks = np.ones((E, len(ACTIONS)), dtype=np.bool_)
         self._masks_valid = False
@@ -1015,6 +1096,7 @@ class BombermanGymEnv(gym.Env):
         self._trap_sx = np.zeros(E, dtype=np.int64)
         self._trap_sy = np.zeros(E, dtype=np.int64)
         self._trap_out = np.zeros(E, dtype=np.bool_)
+        self._trap_alive = np.zeros(E, dtype=np.bool_)
 
         max_nodes_ms = W * H
         self._ms_bfs_qx = np.empty((E, max_nodes_ms), dtype=np.int32)
@@ -1409,13 +1491,15 @@ class BombermanGymEnv(gym.Env):
         envs = self._env_index(envs)
         ax, ay = self._ax, self._ay
         escape = self._own_bomb_escape_tiles(ax, ay, envs) if self._extra_features else self._escape_dummy
+        if self._trap_feature:
+            self._trap_now_feature(ax, ay, envs)
         step_idx = 0 if self._fixes else 1
         _features_masks_kernel(
             self.grid_tensor, ax, ay, self._bombs_left, self.step_counts, self._opp_x, self._opp_y, self._opp_alive,
             self.coins_collectable, self._total_coins, self._initial_coin_count, self._initial_crate_count,
-            self.arena, self._blast_tensor, escape,
+            self.arena, self._blast_tensor, escape, self._trap_now,
             self.width, self.height, self._DIST_MAX, self._T_HORIZON, self._CRATE_POTENTIAL_MAX, self._ESCAPE_TILES_MAX,
-            float(s.MAX_STEPS), MAX_OPPONENTS, self._fixes, self._extra_features,
+            float(s.MAX_STEPS), MAX_OPPONENTS, self._fixes, self._extra_features, self._trap_feature,
             COIN_DISTANCE_LAYER, CRATE_DISTANCE_LAYER, OPPONENTS_LEAST_DISTANCE_LAYER, DANGER_ONSET_LAYER, MOBILITY_LAYER,
             CRATE_POTENTIAL_LAYER, SELF_DISTANCE_LAYER,
             OCCUPIED_MAP_LAYERS[step_idx], DANGER_MAP_LAYERS[step_idx], OCCUPIED_MAP_LAYERS[0], DANGER_MAP_LAYERS[0],
@@ -1423,6 +1507,15 @@ class BombermanGymEnv(gym.Env):
         )
         self._masks_valid = True
         return self._features
+
+    def _trap_now_feature(self, ax: np.ndarray, ay: np.ndarray, envs) -> np.ndarray:
+        gt = self.grid_tensor
+        _trap_now_kernel(
+            ax, ay, self._bombs_left, self._opp_x, self._opp_y, self._opp_alive, self._blast_tensor,
+            gt[:, _OCC_SLICE], gt[:, _DANGER_SLICE], self.width, self.height, self._BT + self._ET, self._BT, self._ET,
+            self._escape_visited, self._ta_bfs_qx, self._ta_bfs_qy, self._ta_bfs_qt, envs, self._trap_now,
+        )
+        return self._trap_now
 
     def _own_bomb_escape_tiles(self, ax: np.ndarray, ay: np.ndarray, envs) -> np.ndarray:
         gt = self.grid_tensor
@@ -2225,10 +2318,11 @@ class BombermanGymEnv(gym.Env):
             self._trap_sy[env] = handle.y
             _escape_possible_kernel(
                 self._trap_sx, self._trap_sy, gt[:, _OCC_SLICE], gt[:, _DANGER_SLICE],
-                self.width, self.height, self._BT + self._ET,
+                self.width, self.height, self._BT + self._ET, self._BT - 1,
                 self._escape_visited, self._ta_bfs_qx, self._ta_bfs_qy, self._ta_bfs_qt, envs, self._trap_out,
+                self._trap_alive,
             )
-            if not self._trap_out[env]:
+            if self._trap_alive[env] and not self._trap_out[env]:
                 return True
         return False
 

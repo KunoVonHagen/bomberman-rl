@@ -46,7 +46,7 @@ class FQIConfig:
     max_features: int = 10
     opponents: list[str] = field(default_factory=lambda: list(DEFAULT_OPPONENTS))
     scenario: str = "classic"
-    env_version: int = 3
+    env_version: int = 4
     eval_every: int = 5
     seed: int = 0
     replay: str | None = None

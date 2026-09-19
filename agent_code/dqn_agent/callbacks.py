@@ -229,7 +229,12 @@ def setup(self):
                 raise ValueError(f"ensemble member {checkpoint_dir} has a different observation space than {members[0]}")
             loaded.append(model)
             self.logger.info(f"dqn_agent.setup: loaded {checkpoint_dir}")
-        self._dqn_obs_env = _get_dummy_env(cfg)
+        obs_env = _get_dummy_env(cfg)
+        n_model = int(loaded[0].observation_space["features"].shape[0])
+        if n_model != obs_env.n_features:
+            raise ValueError(f"{members[0]} expects {n_model} features, run {run} (env_version {cfg.env.env_version}) "
+                             f"produces {obs_env.n_features}")
+        self._dqn_obs_env = obs_env
         self._dqn_models = loaded
         self._dqn_model = loaded[0]
         if len(loaded) > 1 or self._dqn_mc_samples:
