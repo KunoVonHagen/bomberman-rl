@@ -35,7 +35,7 @@ from .config import (
 )
 from .checkpoint_manager import CheckpointManager
 from .rollout_buffer import PinnedMaskableDictRolloutBuffer
-from .symmetry import augment_rollout_buffer
+from .symmetric_ppo import SymmetricMaskablePPO
 from .opponent_pool import (LearnerOpponentInference, OpponentPool, OpponentSampler, load_inference_model,
                             set_inference_device)
 from .training_schedule import DEFAULT_SCHEDULE, load_schedule
@@ -612,13 +612,19 @@ def architecture_info(cfg: TrainingConfig) -> dict:
     }
 
 
-def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str, device: str) -> MaskablePPO:
+def apply_symmetry_hparams(model: MaskablePPO, ppo_cfg: PPOConfig) -> None:
+    model.symmetry_enabled = bool(ppo_cfg.symmetry_augmentation)
+    model.symmetry_coef = float(ppo_cfg.symmetry_coef)
+    model.symmetry_value_coef = float(ppo_cfg.symmetry_value_coef)
+
+
+def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str, device: str) -> SymmetricMaskablePPO:
     policy_kwargs = dict(
         features_extractor_class=BombermanFeatureExtractor,
         features_extractor_kwargs=dict(dropout=cfg.ppo.dropout),
         optimizer_kwargs=dict(weight_decay=cfg.ppo.weight_decay),
     )
-    return MaskablePPO(
+    model = SymmetricMaskablePPO(
         "MultiInputPolicy",
         env,
         policy_kwargs=policy_kwargs,
@@ -638,6 +644,8 @@ def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str, device: 
         vf_coef=cfg.ppo.vf_coef,
         target_kl=cfg.ppo.target_kl,
     )
+    apply_symmetry_hparams(model, cfg.ppo)
+    return model
 
 
 def _resize_rollout_buffer(model: MaskablePPO, new_n_steps: int) -> None:
@@ -679,6 +687,7 @@ def apply_ppo_hyperparams(
     model.n_epochs = ppo_cfg.n_epochs
     model.target_kl = ppo_cfg.target_kl
     model.batch_size = ppo_cfg.batch_size
+    apply_symmetry_hparams(model, ppo_cfg)
     for group in model.policy.optimizer.param_groups:
         group["weight_decay"] = float(ppo_cfg.weight_decay)
 
@@ -690,20 +699,6 @@ def apply_ppo_hyperparams(
         return
 
     model._pending_n_steps = ppo_cfg.n_steps
-
-
-class SymmetryAugmentationCallback(BaseCallback):
-    def __init__(self, cfg: TrainingConfig, verbose: int = 0):
-        super().__init__(verbose)
-        self.cfg = cfg
-
-    def _on_step(self) -> bool:
-        return True
-
-    def _on_rollout_end(self) -> None:
-        if not self.cfg.ppo.symmetry_augmentation:
-            return
-        augment_rollout_buffer(self.model.rollout_buffer, self.model.policy, self.model.batch_size)
 
 
 class OpponentResampleCallback(BaseCallback):
@@ -1193,7 +1188,7 @@ def run(
             else ckman.latest_checkpoint()
         )
         if checkpoint_dir is not None:
-            loaded_model = ckman.load_model(MaskablePPO, checkpoint_dir, env=env, device=device,
+            loaded_model = ckman.load_model(SymmetricMaskablePPO, checkpoint_dir, env=env, device=device,
                                             custom_objects={"rollout_buffer_class": PinnedMaskableDictRolloutBuffer})
             model = loaded_model
             timesteps_done = ckman.resolved_timesteps(checkpoint_dir)
@@ -1213,7 +1208,7 @@ def run(
         cfg, ckman, pool, schedule or [], applied_idx=schedule_applied_idx, verbose=1,
     )
     learn_callback = CallbackList([
-        opponent_callback, SymmetryAugmentationCallback(cfg), max_rollouts_callback, schedule_callback,
+        opponent_callback, max_rollouts_callback, schedule_callback,
     ])
     evaluator = BackgroundEvaluator(cfg, ckman)
 

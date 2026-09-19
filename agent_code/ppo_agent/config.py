@@ -114,6 +114,8 @@ class PPOConfig:
     vf_coef: float = 0.7
     target_kl: float | None = 0.02
     symmetry_augmentation: bool = True
+    symmetry_coef: float = 0.5
+    symmetry_value_coef: float = 0.5
     weight_decay: float = 0.0
     dropout: float = 0.0
 
@@ -284,6 +286,8 @@ class TrainingConfig:
         "ppo.vf_coef",
         "ppo.target_kl",
         "ppo.symmetry_augmentation",
+        "ppo.symmetry_coef",
+        "ppo.symmetry_value_coef",
         "ppo.weight_decay",
         "self_play.enabled",
         "self_play.static_opponents",
@@ -422,6 +426,8 @@ DEFAULT_CONFIG = TrainingConfig(
         vf_coef=0.7,
         target_kl=0.02,
         symmetry_augmentation=True,
+        symmetry_coef=0.5,
+        symmetry_value_coef=0.5,
         weight_decay=1e-5,
         dropout=0.0,
     ),

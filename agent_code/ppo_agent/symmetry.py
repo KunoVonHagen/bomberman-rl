@@ -189,3 +189,97 @@ def augment_rollout_buffer(buffer, policy, batch_size: int) -> None:
             log_probs[start:end] = lp.cpu().numpy()
     buffer.log_probs[:] = log_probs.reshape(n_steps, n_envs)
     buffer.values[:] = values.reshape(n_steps, n_envs)
+
+_DEVICE_TABLES: dict = {}
+
+
+def _tables(device) -> dict:
+    key = str(device)
+    tables = _DEVICE_TABLES.get(key)
+    if tables is None:
+        tables = {
+            "spatial": _SPATIAL_PERM.to(device),
+            "position": torch.from_numpy(POSITION).to(device),
+            "perm": torch.from_numpy(ACTION_PERM.astype(np.int64)).to(device),
+            "inv": torch.from_numpy(ACTION_PERM_INV.astype(np.int64)).to(device),
+            "groups": [
+                torch.as_tensor(g, dtype=torch.long, device=device)
+                for g in DIRECTION_FEATURES
+            ],
+        }
+        _DEVICE_TABLES[key] = tables
+    return tables
+
+
+def action_perm_torch(ks: torch.Tensor) -> torch.Tensor:
+    """(B, A) index tensor; row i maps an action `a` in the original frame to its index in the
+    transformed frame (ACTION_PERM[k_i][a])."""
+    return _tables(ks.device)["perm"][ks]
+
+
+def transform_grid_torch(grid: torch.Tensor, ks: torch.Tensor) -> torch.Tensor:
+    """grid: (B, C, W, H); ks: (B,) ints in [0, 8). Same result as transform_array per sample."""
+    b, c = grid.shape[0], grid.shape[1]
+    if grid.shape[-1] * grid.shape[-2] != _W * _H:
+        raise ValueError(f"grid spatial shape {tuple(grid.shape[-2:])} != ({_W}, {_H})")
+    flat = grid.reshape(b, c, _W * _H)
+    index = _tables(grid.device)["spatial"][ks].unsqueeze(1).expand(b, c, _W * _H)
+    return torch.gather(flat, 2, index).reshape(grid.shape)
+
+
+def transform_features_torch(features: torch.Tensor, ks: torch.Tensor) -> torch.Tensor:
+    """features: (B, F); ks: (B,). Same result as transform_features per sample."""
+    t = _tables(features.device)
+    out = features.clone()
+    xs = torch.round((features[:, FEATURE_SELF_X] + 1.0) * (_W - 1) / 2.0).long().clamp_(0, _W - 1)
+    ys = torch.round((features[:, FEATURE_SELF_Y] + 1.0) * (_H - 1) / 2.0).long().clamp_(0, _H - 1)
+    moved = t["position"][ks, xs, ys]  # (B, 2)
+    out[:, FEATURE_SELF_X] = moved[:, 0].to(out.dtype) * (2.0 / (_W - 1)) - 1.0
+    out[:, FEATURE_SELF_Y] = moved[:, 1].to(out.dtype) * (2.0 / (_H - 1)) - 1.0
+    move_inv = t["inv"][ks][:, :4]  # (B, 4)
+    for group, cols in zip(DIRECTION_FEATURES, t["groups"]):
+        if max(group) < features.shape[-1]:
+            out[:, cols] = torch.gather(features[:, cols], 1, move_inv)
+    return out
+
+
+def transform_masks_torch(masks: torch.Tensor, ks: torch.Tensor) -> torch.Tensor:
+    """masks: (B, A) bool/float. Returns a bool mask in the transformed frame."""
+    inv = _tables(masks.device)["inv"][ks]
+    return torch.gather(masks.to(torch.float32), 1, inv) > 0.5
+
+
+def selftest(n: int = 512) -> None:
+    """Checks the torch transforms against the numpy ones. Run from the repo root:
+        python -m agent_code.ppo_agent.symmetry
+    """
+    rng = np.random.default_rng(0)
+    ks = rng.integers(0, N_SYMMETRIES, size=n)
+    ks_t = torch.from_numpy(ks)
+
+    grid = rng.normal(size=(n, 5, _W, _H)).astype(np.float32)
+    ref = np.stack([transform_array(grid[i], int(ks[i])) for i in range(n)])
+    assert np.array_equal(transform_grid_torch(torch.from_numpy(grid), ks_t).numpy(), ref), "grid"
+
+    n_feat = max(FEATURE_SELF_X, FEATURE_SELF_Y, *(i for g in DIRECTION_FEATURES for i in g)) + 3
+    feats = rng.normal(size=(n, n_feat)).astype(np.float32)
+    px, py = rng.integers(0, _W, n), rng.integers(0, _H, n)
+    feats[:, FEATURE_SELF_X] = px * (2.0 / (_W - 1)) - 1.0
+    feats[:, FEATURE_SELF_Y] = py * (2.0 / (_H - 1)) - 1.0
+    ref = np.stack([transform_features(feats[i], int(ks[i])) for i in range(n)])
+    got = transform_features_torch(torch.from_numpy(feats), ks_t).numpy()
+    assert np.allclose(got, ref, atol=1e-6), "features"
+
+    masks = (rng.random((n, len(ACTIONS))) > 0.3)
+    ref = np.stack([transform_masks(masks[i], int(ks[i])) for i in range(n)])
+    assert np.array_equal(transform_masks_torch(torch.from_numpy(masks), ks_t).numpy(), ref), "masks"
+
+    perm = action_perm_torch(ks_t).numpy()
+    acts = rng.integers(0, len(ACTIONS), n)
+    ref = np.array([transform_actions(acts[i], int(ks[i])) for i in range(n)])
+    assert np.array_equal(perm[np.arange(n), acts], ref), "actions"
+    print("symmetry selftest OK")
+
+
+if __name__ == "__main__":
+    selftest()
