@@ -122,6 +122,7 @@ def _load_model(checkpoint_dir: pathlib.Path, cfg: TrainingConfig) -> MaskablePP
             "policy_kwargs": dict(
                 features_extractor_class=BombermanFeatureExtractor,
                 features_extractor_kwargs=dict(dropout=cfg.ppo.dropout),
+                share_features_extractor=cfg.ppo.share_features_extractor,
                 optimizer_class=InferenceOptimizer,
             ),
         },

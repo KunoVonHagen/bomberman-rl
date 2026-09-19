@@ -116,6 +116,7 @@ class PPOConfig:
     symmetry_augmentation: bool = True
     symmetry_coef: float = 0.5
     symmetry_value_coef: float = 0.5
+    share_features_extractor: bool = False
     weight_decay: float = 0.0
     dropout: float = 0.0
 
@@ -366,11 +367,17 @@ class TrainingConfig:
     @classmethod
     def from_dict(cls, d: dict) -> "TrainingConfig":
         d = dict(d)
-        d["ppo"] = PPOConfig(**d.get("ppo", {}))
+        d["ppo"] = PPOConfig(**cls._migrate_ppo_dict(d.get("ppo", {})))
         d["env"] = EnvConfig(**cls._migrate_env_dict(d.get("env", {})))
         d["self_play"] = SelfPlayConfig(**cls._migrate_self_play_dict(d.get("self_play", {})))
         d["rewards"] = RewardConfig(**cls._migrate_rewards_dict(d.get("rewards", {})))
         return cls(**d)
+
+    @staticmethod
+    def _migrate_ppo_dict(ppo: dict) -> dict:
+        ppo = dict(ppo)
+        ppo.setdefault("share_features_extractor", True)
+        return ppo
 
     @staticmethod
     def _migrate_rewards_dict(rewards: dict) -> dict:
@@ -444,6 +451,7 @@ DEFAULT_CONFIG = TrainingConfig(
         symmetry_augmentation=True,
         symmetry_coef=0.5,
         symmetry_value_coef=0.5,
+        share_features_extractor=False,
         weight_decay=1e-5,
         dropout=0.0,
     ),

@@ -608,6 +608,7 @@ def architecture_info(cfg: TrainingConfig) -> dict:
         "policy": "MultiInputPolicy",
         "algorithm": "MaskablePPO",
         "features_extractor_class": BombermanFeatureExtractor.__name__,
+        "share_features_extractor": cfg.ppo.share_features_extractor,
         "dropout": cfg.ppo.dropout,
         "layer_config": cfg.env.layer_config,
     }
@@ -623,6 +624,7 @@ def build_model(env: VecEnv, cfg: TrainingConfig, tensorboard_log: str, device: 
     policy_kwargs = dict(
         features_extractor_class=BombermanFeatureExtractor,
         features_extractor_kwargs=dict(dropout=cfg.ppo.dropout),
+        share_features_extractor=cfg.ppo.share_features_extractor,
         optimizer_kwargs=dict(weight_decay=cfg.ppo.weight_decay),
     )
     model = SymmetricMaskablePPO(
