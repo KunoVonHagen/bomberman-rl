@@ -527,6 +527,8 @@ class DeviceReplayBuffer(DictReplayBuffer):
 
     def sample(self, batch_size: int, out: Optional[dict] = None, n_step: int = 1, gamma: float = 0.99) -> dict:
         t0 = time.perf_counter()
+        if self._stage_event is not None:
+            torch.cuda.current_stream(self.device).wait_event(self._stage_event)
         row_idx, env_idx = self._draw_indices(batch_size)
         next_row_idx, returns, terminal, discounts = self._n_step_targets(
             row_idx, env_idx, n_step, gamma, self._rewards_host, self._dones_host)
