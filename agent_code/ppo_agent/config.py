@@ -215,6 +215,15 @@ class OpponentArrangement:
     weight: float = 1.0
 
 
+@dataclass(frozen=True)
+class StaticTierWeight:
+    """
+    Represents a weight for a specific tier of static opponents in self-play.
+    """
+    tier: str = "default"
+    weight: float = 1.0
+
+
 @dataclass
 class SelfPlayConfig:
     """
@@ -234,8 +243,20 @@ class SelfPlayConfig:
     pool_size: int = 8
     add_checkpoint_every_epochs: int = 1
     opponent_inference: str = "shard"
-    sample_strategy: Literal["uniform", "latest_biased"] = "latest_biased"
+    sample_strategy: Literal["uniform", "latest_biased", "league"] = "latest_biased"
     latest_bias: float = 0.5
+
+    static_tier_weights: List[StaticTierWeight] = field(default_factory=list)
+
+    hall_of_fame_every_timesteps: int = 10_000_000
+    hall_of_fame_max: int = 8
+    hall_of_fame_prob: float = 0.15
+    thin_recent_checkpoints: bool = True
+
+    pfsp_enabled: bool = False
+    pfsp_ema: float = 0.2
+    pfsp_floor: float = 0.2
+    pfsp_power: float = 1.5
 
 
 @dataclass
@@ -255,6 +276,15 @@ class TrainingConfig:
     eval_suite_workers: int = 1
     eval_suite_background: bool = True
     eval_suite_replays: bool = False
+
+    league_eval_enabled: bool = True
+    league_eval_episodes: int = 10
+
+    tournament_eval_enabled: bool = True
+    tournament_pool: Optional[List[str]] = None
+    tournament_lineups: int = 40
+    tournament_episodes_per_lineup: int = 3
+    tournament_replays: bool = False
 
     resume_from: Optional[str] = None
     resume_checkpoint: Optional[str] = None
@@ -276,6 +306,13 @@ class TrainingConfig:
         "n_envs",
         "n_shards",
         "n_demonstration_episodes",
+        "league_eval_enabled",
+        "league_eval_episodes",
+        "tournament_eval_enabled",
+        "tournament_pool",
+        "tournament_lineups",
+        "tournament_episodes_per_lineup",
+        "tournament_replays",
         "env.scenario_mix",
         "ppo.learning_rate",
         "ppo.n_steps",
@@ -303,6 +340,15 @@ class TrainingConfig:
         "self_play.opponent_inference",
         "self_play.sample_strategy",
         "self_play.latest_bias",
+        "self_play.static_tier_weights",
+        "self_play.hall_of_fame_every_timesteps",
+        "self_play.hall_of_fame_max",
+        "self_play.hall_of_fame_prob",
+        "self_play.thin_recent_checkpoints",
+        "self_play.pfsp_enabled",
+        "self_play.pfsp_ema",
+        "self_play.pfsp_floor",
+        "self_play.pfsp_power",
         "rewards.waited",
         "rewards.invalid_action",
         "rewards.bomb_dropped",
@@ -418,6 +464,11 @@ class TrainingConfig:
                 a if isinstance(a, OpponentArrangement) else OpponentArrangement(**a)
                 for a in sp["arrangements"]
             ]
+        if "static_tier_weights" in sp:
+            sp["static_tier_weights"] = [
+                t if isinstance(t, StaticTierWeight) else StaticTierWeight(**t)
+                for t in sp["static_tier_weights"]
+            ]
         return sp
 
     def save(self, path: str) -> None:
@@ -459,20 +510,41 @@ DEFAULT_CONFIG = TrainingConfig(
     self_play=SelfPlayConfig(
         enabled=True,
         static_opponents=[
-            "agent_code.my_agent.callbacks",
-            "agent_code.simple_agent.callbacks",
-            "agent_code.rule_based_agent.callbacks",
-            "agent_code.coin_collector_agent.callbacks",
+            "agent_code.my_agent.callbacks#strong",
+            "agent_code.simple_agent.callbacks#strong",
+            "agent_code.rule_based_agent.callbacks#strong",
+            "agent_code.rule_based_agent.callbacks@eps=0.15#medium",
+            "agent_code.coin_collector_agent.callbacks#medium",
+            "agent_code.coin_collector_agent.callbacks@bomb=0.4#weak",
+            "builtin:peaceful#weak",
+            "builtin:random#weak",
+            "agent_code.league_bots.bomber#medium",
+            "agent_code.league_bots.bomber@eps=0.2#weak",
+            "agent_code.league_bots.hunter#medium",
+            "agent_code.league_bots.hunter@eps=0.25#weak",
         ],
         arrangements=[
             OpponentArrangement(n_static=0, n_self_play=3, weight=1.0),
         ],
-        allow_repeat_static_opponents=True,
+        allow_repeat_static_opponents=False,
         shuffle_opponent_order=True,
         resample_every_n_rollouts=1,
         pool_size=32,
         add_checkpoint_every_epochs=1,
-        sample_strategy="latest_biased",
+        sample_strategy="league",
         latest_bias=0.1,
+        static_tier_weights=[
+            StaticTierWeight(tier="strong", weight=2.0),
+            StaticTierWeight(tier="medium", weight=1.0),
+            StaticTierWeight(tier="weak", weight=0.5),
+        ],
+        hall_of_fame_every_timesteps=10_000_000,
+        hall_of_fame_max=8,
+        hall_of_fame_prob=0.15,
+        thin_recent_checkpoints=True,
+        pfsp_enabled=True,
+        pfsp_ema=0.2,
+        pfsp_floor=0.2,
+        pfsp_power=1.5,
     ),
 )

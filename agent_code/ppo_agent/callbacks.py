@@ -19,8 +19,8 @@ from .gym_environment import ACTION_INDICES, BombermanGymEnv, WorldArgs
 from .symmetry import ACTION_PERM, N_SYMMETRIES, transform_masks, transform_observation
 from .model import BombermanFeatureExtractor, InferenceOptimizer
 
-RUN: str = "bomberman_ppo_20260917_173456"
-CHECKPOINT: Optional[str] = "checkpoint_0065011712"
+RUN: str = "bomberman_ppo_20260919_021721"
+CHECKPOINT: Optional[str] = "checkpoint_0090177536"
 ENSEMBLE: list = []
 TTA_SYMMETRIES: int = N_SYMMETRIES
 DETERMINISTIC: bool = True

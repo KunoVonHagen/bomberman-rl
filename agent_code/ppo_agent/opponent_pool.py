@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import importlib
+import json
 import pathlib
 import random
 import zipfile
@@ -14,6 +14,10 @@ from stable_baselines3.common.save_util import json_to_data
 
 from .config import EnvConfig, SelfPlayConfig, OpponentArrangement, ScenarioArrangement
 from .checkpoint_manager import CheckpointManager
+from .opponent_league import (
+    ema, hardness_from_summary, priority_from_hardness, resolve_static_spec, sample_static_specs,
+    select_hall_of_fame, spec_label, thin_geometric, validate_static_specs,
+)
 from .model import InferenceOptimizer
 from .grouped_forward import (EXTRACTOR_KEYS, EXTRACTOR_PREFIX, grouped_extractor_forward, grouped_linear,
                               model_indices, observation_tensors, stack_state_dicts)
@@ -284,16 +288,63 @@ class OpponentPool:
         self.cfg = cfg
         self.env_cfg: EnvConfig = ckman.config.env
         self._checkpoints: List[pathlib.Path] = []
+        self._hall_of_fame: List[pathlib.Path] = []
         self._opponent_cache: Dict[str, OpponentPair] = {}
         self._last_descriptions: List[str] = []
+        self._hardness: Dict[str, float] = {}
+        self._priorities: Dict[str, float] = {}
+        self._hardness_source: Dict[str, str] = {}
 
         if cfg.enabled:
             self._checkpoints = list(ckman.list_checkpoints())[-cfg.pool_size:]
+            self._rebuild_hall_of_fame()
+        if cfg.static_opponents:
+            validate_static_specs(cfg.static_opponents, known_tiers=self._tier_weights().keys())
+        self.refresh_priorities()
 
     @property
     def num_checkpoints(self) -> int:
         """Number of self-play checkpoints currently in this pool's window."""
         return len(self._checkpoints)
+
+    @property
+    def num_hall_of_fame(self) -> int:
+        return len(self._hall_of_fame)
+
+    def _league_mode(self) -> bool:
+        return self.cfg.sample_strategy == "league"
+
+    def _rebuild_hall_of_fame(self) -> None:
+        """Milestone checkpoints, derived deterministically from what is on disk (so it survives --resume)."""
+        if not self.cfg.enabled:
+            self._hall_of_fame = []
+            return
+        entries = [(CheckpointManager.resolved_timesteps(c), c) for c in self.ckman.list_checkpoints()]
+        self._hall_of_fame = select_hall_of_fame(
+            entries, self.cfg.hall_of_fame_every_timesteps, self.cfg.hall_of_fame_max)
+
+    def _recent_candidates(self) -> List[pathlib.Path]:
+        if self._league_mode() and self.cfg.thin_recent_checkpoints:
+            return thin_geometric(self._checkpoints)
+        return list(self._checkpoints)
+
+    def all_checkpoints(self) -> List[pathlib.Path]:
+        """
+        Every checkpoint that `_sample_checkpoint` can return (recent candidates + latest + hall of fame),
+        deduplicated. This is what must be loaded for opponent inference.
+        """
+        if not self._checkpoints:
+            return []
+        wanted = self._recent_candidates() + [self._checkpoints[-1]]
+        if self._league_mode():
+            wanted += self._hall_of_fame
+        seen, unique = set(), []
+        for ckpt in wanted:
+            key = str(ckpt.resolve())
+            if key not in seen:
+                seen.add(key)
+                unique.append(ckpt)
+        return unique
 
     def maybe_add_checkpoint(self, checkpoint_dir: Optional[pathlib.Path], _timesteps: int) -> None:
         """Call this after every saved checkpoint; it decides whether to add
@@ -306,12 +357,13 @@ class OpponentPool:
         if saved_count % every == 0:
             self._checkpoints.append(checkpoint_dir)
             self._checkpoints = self._checkpoints[-self.cfg.pool_size:]
-            self._prune_opponent_cache()
+        self._rebuild_hall_of_fame()
+        self._prune_opponent_cache()
 
     def _prune_opponent_cache(self) -> None:
         """Drop cached opponent pairs for checkpoints that fell out of the
         active pool."""
-        active_keys = {str(p.resolve()) for p in self._checkpoints}
+        active_keys = {str(p.resolve()) for p in self.all_checkpoints()}
         for key in list(self._opponent_cache):
             if key not in active_keys:
                 del self._opponent_cache[key]
@@ -319,9 +371,61 @@ class OpponentPool:
     def _sample_checkpoint(self) -> Optional[pathlib.Path]:
         if not self._checkpoints:
             return None
-        if self.cfg.sample_strategy == "latest_biased" and random.random() < self.cfg.latest_bias:
+        strategy = self.cfg.sample_strategy
+        if strategy in ("latest_biased", "league") and random.random() < self.cfg.latest_bias:
             return self._checkpoints[-1]
-        return random.choice(self._checkpoints)
+        if strategy == "league" and self._hall_of_fame and random.random() < self.cfg.hall_of_fame_prob:
+            return random.choice(self._hall_of_fame)
+        return random.choice(self._recent_candidates())
+
+    def _tier_weights(self) -> Dict[str, float]:
+        return {t.tier: t.weight for t in getattr(self.cfg, "static_tier_weights", [])}
+
+    def refresh(self) -> None:
+        """Re-derive league state from disk. Call in the main process before the pool is sent to the shards."""
+        if self.cfg.enabled:
+            self._rebuild_hall_of_fame()
+        self.refresh_priorities()
+
+    def refresh_priorities(self, scan: int = 8) -> None:
+        """
+        Fold the newest eval result of every static opponent (checkpoint metadata written by the
+        background evaluator) into an EMA-smoothed hardness, then into a sampling priority.
+        """
+        if not self.cfg.pfsp_enabled or not self.cfg.static_opponents:
+            self._priorities = {}
+            return
+        wanted = set(self.cfg.static_opponents)
+        found = set()
+        for ckpt in reversed(list(self.ckman.list_checkpoints())[-scan:]):
+            if found == wanted:
+                break
+            try:
+                metadata = json.loads((pathlib.Path(ckpt) / "metadata.json").read_text())
+            except (OSError, ValueError):
+                continue
+            for block_name in ("league_eval", "eval_suite"):
+                block = metadata.get(block_name) or {}
+                for spec in wanted - found:
+                    summary = block.get(spec)
+                    if not isinstance(summary, dict):
+                        continue
+                    found.add(spec)
+                    if self._hardness_source.get(spec) == ckpt.name:
+                        continue  # this measurement is already folded in
+                    hardness = hardness_from_summary(summary)
+                    if hardness is None:
+                        continue
+                    self._hardness[spec] = ema(self._hardness.get(spec), hardness, self.cfg.pfsp_ema)
+                    self._hardness_source[spec] = ckpt.name
+        self._priorities = {
+            spec: priority_from_hardness(h, self.cfg.pfsp_floor, self.cfg.pfsp_power)
+            for spec, h in self._hardness.items() if spec in wanted
+        }
+
+    def priority_snapshot(self) -> Dict[str, float]:
+        """label -> current sampling priority of each static bot (for logging)."""
+        return {spec_label(spec): self._priorities.get(spec, 1.0) for spec in self.cfg.static_opponents}
 
     def _checkpoint_opponent(self, checkpoint_dir: pathlib.Path) -> OpponentPair:
         key = str(checkpoint_dir.resolve())
@@ -332,8 +436,8 @@ class OpponentPool:
 
     @staticmethod
     def _resolve_static(module_path: str) -> OpponentPair:
-        module = importlib.import_module(module_path)
-        return (module.setup, module.act)
+        """Spec string (module path, optionally with @eps/@bomb/@safe and #tier) -> (setup, act)."""
+        return resolve_static_spec(module_path)
 
     def _choose_arrangement(self) -> OpponentArrangement:
         """
@@ -387,9 +491,12 @@ class OpponentPool:
                 "self_play.static_opponents is empty. Add at least one static "
                 "opponent module path to config.self_play.static_opponents."
             )
-        if self.cfg.allow_repeat_static_opponents or k > len(pool):
-            return [random.choice(pool) for _ in range(k)]
-        return random.sample(pool, k=k)
+        return sample_static_specs(
+            pool, k,
+            tier_weights=self._tier_weights(),
+            priorities=self._priorities,
+            allow_repeat=self.cfg.allow_repeat_static_opponents,
+        )
 
     def current_opponents(self) -> List[OpponentPair]:
         """
@@ -487,7 +594,7 @@ class OpponentSampler:
 
     def preload(self, in_use=()) -> None:
         keep = set()
-        for checkpoint in list(self.pool._checkpoints):
+        for checkpoint in self.pool.all_checkpoints():
             _setup_fn, act_fn = self.pool._checkpoint_opponent(checkpoint)
             owner = getattr(act_fn, "__self__", None)
             if owner is not None and hasattr(owner, "_ensure_model"):

@@ -10,7 +10,7 @@ import pathlib
 from collections import deque
 from datetime import datetime
 from multiprocessing import freeze_support
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import random
@@ -37,6 +37,7 @@ from .config import (
 from .checkpoint_manager import CheckpointManager
 from .rollout_buffer import PinnedMaskableDictRolloutBuffer
 from .symmetric_ppo import SymmetricMaskablePPO
+from .opponent_league import (DEFAULT_HELDOUT_POOL, make_tournament_lineups, merge_case_summaries, spec_label)
 from .opponent_pool import (LearnerOpponentInference, OpponentPool, OpponentSampler, load_inference_model,
                             set_inference_device)
 from .training_schedule import DEFAULT_SCHEDULE, load_schedule
@@ -541,23 +542,37 @@ def _sync_learner_inference(env, pool: OpponentPool) -> None:
     inference = getattr(getattr(env, "venv", env), "_opponent_evaluator", None)
     if inference is None:
         return
-    env.env_method("set_opponent_model_index", inference.update(pool._checkpoints))
+    env.env_method("set_opponent_model_index", inference.update(pool.all_checkpoints()))
 
 
 class GateStatsVecMonitor(VecMonitor):
-    def __init__(self, venv, window: int = 200):
+    def __init__(self, venv, window: int = 200, per_opponent_window: int = 400):
         super().__init__(venv, filename=None)
         self._score_window: deque = deque(maxlen=window)
         self._suicide_window: deque = deque(maxlen=window)
         self._survival_window: deque = deque(maxlen=window)
+        self._per_opponent: Dict[str, deque] = {}
+        self._per_opponent_window = per_opponent_window
 
     def step_wait(self):
         obs, rewards, dones, infos = super().step_wait()
         for i, done in enumerate(dones):
-            if done:
-                self._score_window.append(float(infos[i].get("score", 0.0)))
-                self._suicide_window.append(float(e.KILLED_SELF in infos[i].get("events", ())))
-                self._survival_window.append(float(infos[i].get("alive", False)))
+            if not done:
+                continue
+            info = infos[i]
+            score = float(info.get("score", 0.0))
+            suicide = float(e.KILLED_SELF in info.get("events", ()))
+            alive = float(info.get("alive", False))
+            self._score_window.append(score)
+            self._suicide_window.append(suicide)
+            self._survival_window.append(alive)
+
+            for label in info.get("opponent_descriptions") or ():
+                bucket = self._per_opponent.setdefault(label, deque(maxlen=self._per_opponent_window))
+                bucket.append(dict(
+                    score=score, suicide=suicide, alive=alive,
+                    kills=float(info.get("kills", 0.0)), coins=float(info.get("coins", 0.0)),
+                ))
         return obs, rewards, dones, infos
 
     def gate_stats(self) -> Optional[dict]:
@@ -570,6 +585,22 @@ class GateStatsVecMonitor(VecMonitor):
             "survival_rate": float(np.mean(self._survival_window)),
         }
 
+    def per_opponent_stats(self) -> Dict[str, dict]:
+        """label -> mean score/kills/coins/suicide-rate/survival-rate over the recent window."""
+        out = {}
+        for label, bucket in self._per_opponent.items():
+            if not bucket:
+                continue
+            out[label] = {
+                "episodes": len(bucket),
+                "score_mean": float(np.mean([b["score"] for b in bucket])),
+                "kills_mean": float(np.mean([b["kills"] for b in bucket])),
+                "coins_mean": float(np.mean([b["coins"] for b in bucket])),
+                "suicide_rate": float(np.mean([b["suicide"] for b in bucket])),
+                "survival_rate": float(np.mean([b["alive"] for b in bucket])),
+            }
+        return out
+
 
 class EpisodeStatsCallback(BaseCallback):
     def _on_step(self) -> bool:
@@ -578,11 +609,20 @@ class EpisodeStatsCallback(BaseCallback):
     def _on_rollout_end(self) -> None:
         gate_stats = getattr(self.training_env, "gate_stats", None)
         stats = gate_stats() if callable(gate_stats) else None
-        if not stats:
-            return
-        self.logger.record("rollout/score_mean", stats["score_mean"])
-        self.logger.record("rollout/survival_rate", stats["survival_rate"])
-        self.logger.record("rollout/suicide_rate", stats["suicide_rate"])
+        if stats:
+            self.logger.record("rollout/score_mean", stats["score_mean"])
+            self.logger.record("rollout/survival_rate", stats["survival_rate"])
+            self.logger.record("rollout/suicide_rate", stats["suicide_rate"])
+
+        per_opponent = getattr(self.training_env, "per_opponent_stats", None)
+        breakdown = per_opponent() if callable(per_opponent) else None
+        for label, s in (breakdown or {}).items():
+            safe_label = label.replace("/", "_").replace(":", "_")
+            self.logger.record(f"opponents/{safe_label}/score_mean", s["score_mean"])
+            self.logger.record(f"opponents/{safe_label}/kills_mean", s["kills_mean"])
+            self.logger.record(f"opponents/{safe_label}/coins_mean", s["coins_mean"])
+            self.logger.record(f"opponents/{safe_label}/suicide_rate", s["suicide_rate"])
+            self.logger.record(f"opponents/{safe_label}/survival_rate", s["survival_rate"])
 
 
 def make_train_env(cfg: TrainingConfig, opponents, log_dir: str) -> VecMonitor:
@@ -735,13 +775,18 @@ class OpponentResampleCallback(BaseCallback):
     def _on_step(self) -> bool:
         return True
 
+    def _log_league_state(self) -> None:
+        _log_league_state_impl(self)
+
     def _on_rollout_start(self) -> None:
         self._rollout_count += 1
         if (self._rollout_count - 1) % self.every_n_rollouts != 0:
             return
 
+        self.pool.refresh()
         self.training_env.env_method("set_opponent_resampler", OpponentSampler(self.pool))
         _sync_learner_inference(self.training_env, self.pool)
+        self._log_league_state()
 
         if self.verbose:
             arrangement_str = ", ".join(
@@ -751,9 +796,18 @@ class OpponentResampleCallback(BaseCallback):
                 f"{scenario} {p:.0%}" for scenario, p in self.pool.scenario_distribution()
             )
             print(f"[opponents] rollout {self._rollout_count}: resynced self-play pool "
-                  f"({self.pool.num_checkpoints} checkpoint(s)) to training env "
+                  f"({self.pool.num_checkpoints} checkpoint(s), {self.pool.num_hall_of_fame} hall-of-fame, "
+                  f"{len(self.pool.all_checkpoints())} loaded) to training env "
                   f"-- distribution: {arrangement_str}")
             print(f"[scenario] rollout {self._rollout_count}: distribution: {scenario_str}")
+
+
+def _log_league_state_impl(callback: "OpponentResampleCallback") -> None:
+    pool = callback.pool
+    callback.logger.record("league/hall_of_fame_size", pool.num_hall_of_fame)
+    callback.logger.record("league/loaded_checkpoints", len(pool.all_checkpoints()))
+    for label, priority in pool.priority_snapshot().items():
+        callback.logger.record(f"league/priority/{label}", priority)
 
 
 def schedule_gate_open(stage: dict, timesteps_done: int, stats: Optional[dict]) -> bool:
@@ -1015,6 +1069,112 @@ def _print_eval_case(case: dict, summary: dict, timesteps_done: int, n_episodes:
     print(f"  eval {case['label']}: {_format_eval_summary(summary)} (n={n_episodes})", flush=True)
 
 
+def run_static_pool_eval(
+    model,
+    cfg: TrainingConfig,
+    specs: list[str],
+    replays_dir: pathlib.Path,
+    logs_dir: pathlib.Path,
+    timesteps_done: int,
+    n_episodes: int | None = None,
+    save_replays: bool = False,
+) -> dict[str, dict[str, float | None]]:
+    """
+Run evaluation against a static pool of opponent specs, returning a summary per spec.
+    """
+    n_episodes = n_episodes if n_episodes is not None else getattr(cfg, "league_eval_episodes", 10)
+    results: dict[str, dict[str, float | None]] = {}
+    for spec in specs:
+        case = dict(key=spec, opponent=spec, n_opponents=3, scenario=cfg.env.scenario,
+                    tag=spec_label(spec), label=f"vs {spec_label(spec)} (league)")
+        summary = run_eval_case(model, cfg, case, replays_dir, logs_dir, timesteps_done, n_episodes, save_replays)
+        results[spec] = summary
+        _print_eval_case(case, summary, timesteps_done, n_episodes)
+    return results
+
+
+def run_tournament_case(
+    model,
+    cfg: TrainingConfig,
+    lineup: list[str],
+    replays_dir: pathlib.Path,
+    logs_dir: pathlib.Path,
+    timesteps_done: int,
+    n_episodes: int,
+    save_replays: bool,
+    tag: str,
+) -> list[dict[str, float | list]]:
+    """Play `n_episodes` games of the learner against one fixed 3-opponent `lineup`, one record per game."""
+    opponents = [OpponentPool._resolve_static(spec) for spec in lineup]
+    records: list[dict[str, float | list]] = []
+    for i in range(n_episodes):
+        replay_path = None
+        if save_replays:
+            replay_path = str(pathlib.Path(replays_dir) / f"tourney_{tag}_{timesteps_done:010d}_{i}.pkl")
+        test_env = make_test_env(cfg, opponents, str(logs_dir), replay_path)
+        obs = test_env.reset()
+        done = False
+        episode_reward = 0.0
+        while not done:
+            action_masks = get_action_masks(test_env)
+            action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
+            obs, reward, dones, info = test_env.step(action)
+            episode_reward += float(reward[0])
+            done = bool(dones[0])
+        test_env.close()
+        final = info[0]
+        records.append(dict(
+            score=float(final["score"]), survived=float(final["alive"]), length=float(final["step"]),
+            reward=episode_reward, opponent_scores=[float(s) for s in final.get("opponent_scores", [])],
+        ))
+    return records
+
+
+def run_tournament_eval(
+    model,
+    cfg: TrainingConfig,
+    replays_dir: pathlib.Path,
+    logs_dir: pathlib.Path,
+    timesteps_done: int,
+    pool: list[str] | None = None,
+    n_lineups: int | None = None,
+    n_episodes_per_lineup: int | None = None,
+    save_replays: bool | None = None,
+) -> dict[str, dict[str, float | None]]:
+    """
+    Run a tournament evaluation of the learner against a set of lineups drawn from a pool of opponents,
+    returning a summary of results per opponent spec and overall.
+    """
+    pool = pool if pool is not None else (getattr(cfg, "tournament_pool", None) or DEFAULT_HELDOUT_POOL)
+    n_lineups = n_lineups if n_lineups is not None else getattr(cfg, "tournament_lineups", 40)
+    n_episodes_per_lineup = (
+        n_episodes_per_lineup if n_episodes_per_lineup is not None
+        else getattr(cfg, "tournament_episodes_per_lineup", 3)
+    )
+    save_replays = save_replays if save_replays is not None else getattr(cfg, "tournament_replays", False)
+
+    lineups = make_tournament_lineups(pool, n_opponents=3, n_lineups=n_lineups)
+    all_records: list[dict] = []
+    record_lineups: list[list[str]] = []
+    for i, lineup in enumerate(lineups):
+        records = run_tournament_case(
+            model, cfg, lineup, replays_dir, logs_dir, timesteps_done,
+            n_episodes_per_lineup, save_replays, tag=f"{i:03d}",
+        )
+        all_records.extend(records)
+        record_lineups.extend([lineup] * len(records))
+
+    results = merge_case_summaries(all_records, record_lineups)
+    overall = results["overall"]
+    print(f"  tournament eval ({len(lineups)} lineups x {n_episodes_per_lineup} games): "
+          f"{_format_eval_summary(overall)}", flush=True)
+    for spec in pool:
+        summary = results.get(spec)
+        if summary and summary["episodes"]:
+            print(f"    vs {spec_label(spec)}: {_format_eval_summary(summary)} (n={summary['episodes']})", flush=True)
+    return results
+
+
 _EVAL_POOL_MODEL = None
 
 
@@ -1090,6 +1250,18 @@ def evaluate_checkpoint(
         workers=cfg.eval_suite_workers, model_path=model_path,
     )
     CheckpointManager.update_metadata(pathlib.Path(ckpt_dir), {"eval_suite": results})
+
+    self_play_cfg = getattr(cfg, "self_play", None)
+    if self_play_cfg is not None and getattr(self_play_cfg, "static_opponents", None) \
+            and getattr(cfg, "league_eval_enabled", True):
+        league_results = run_static_pool_eval(
+            model, cfg, self_play_cfg.static_opponents, replays_dir, logs_dir, timesteps_done)
+        CheckpointManager.update_metadata(pathlib.Path(ckpt_dir), {"league_eval": league_results})
+
+    if getattr(cfg, "tournament_eval_enabled", True):
+        tournament_results = run_tournament_eval(model, cfg, replays_dir, logs_dir, timesteps_done)
+        CheckpointManager.update_metadata(pathlib.Path(ckpt_dir), {"tournament_eval": tournament_results})
+
     seconds = (datetime.now() - started).total_seconds()
     print(f"  eval suite for {timesteps_done} timesteps finished in {seconds:.0f}s "
           f"-> {pathlib.Path(ckpt_dir).name}/metadata.json", flush=True)
