@@ -115,6 +115,10 @@ results/
 # Training runs
 **/runs/**
 
+# Tournament runs
+**/tournament_out/**
+
 # Logs
 **/logs/**
-/final-project-agent-code.zip
+
+**/final-project-agent-code.zip
