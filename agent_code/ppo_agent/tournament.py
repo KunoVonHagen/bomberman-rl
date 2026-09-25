@@ -1,21 +1,3 @@
-"""
-Checkpoint tournament: pick the checkpoint to submit.
-
-Every candidate is a checkpoint of one of your runs. Games are 4-player (like the final), scored with the game's
-own points (1 per coin, 5 per kill). Candidates are evaluated exactly the way callbacks.py plays them
-(same model loading, same observation env, same symmetry-TTA / argmax), so the ranking transfers to the submission.
-
-With many candidates a full round robin over all 4-subsets is impossible, so this is a *sampled* round robin run as
-successive halving: stage 0 gives every candidate a few games against random lineups of other candidates, the worst
-are dropped, the survivors play more games, ... The last stage is the ranking.
-
-Place next to train.py / callbacks.py and run from the repo root the same way you launch train.py, e.g.
-
-    python -m agent_code.ppo_agent.tournament --runs-dir runs --out tourney_1 --dry-run
-    python -m agent_code.ppo_agent.tournament --runs-dir runs --out tourney_1 --workers 24 --every 4
-
-Re-running with the same --out resumes (finished games are skipped).
-"""
 from __future__ import annotations
 
 import argparse

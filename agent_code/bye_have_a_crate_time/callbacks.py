@@ -20,12 +20,8 @@ from .symmetry import ACTION_PERM, N_SYMMETRIES, transform_masks, transform_obse
 from .model import BombermanFeatureExtractor, InferenceOptimizer
 
 RUN: str = "bomberman_ppo_20260919_021721"
-CHECKPOINT: Optional[str] = None
-ENSEMBLE: list = [
-    "bomberman_ppo_20260919_021721/checkpoint_0100139008",
-    "bomberman_ppo_20260919_021721/checkpoint_0096468992",
-    "bomberman_ppo_20260919_021721/checkpoint_0098566144"
-]
+CHECKPOINT: Optional[str] = "checkpoint_0139984896"
+ENSEMBLE: list = []
 TTA_SYMMETRIES: int = N_SYMMETRIES
 DETERMINISTIC: bool = True
 ENSEMBLE_FILE = "ensemble.txt"

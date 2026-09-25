@@ -1,0 +1,175 @@
+{
+  "run_name": "bomberman_ppo_20260919_021721",
+  "created_at": "2026-09-20T18:27:37.543219",
+  "config": {
+    "run_name": "bomberman_ppo_20260919_021721",
+    "seed": null,
+    "runs_dir": "runs",
+    "n_envs": 256,
+    "n_shards": 32,
+    "total_timesteps": 160000000,
+    "device": "cuda",
+    "n_demonstration_episodes": 50,
+    "save_every_timesteps": 2097152,
+    "eval_every_save": true,
+    "eval_suite_episodes": 10,
+    "eval_suite_workers": 1,
+    "eval_suite_background": true,
+    "eval_suite_replays": false,
+    "league_eval_enabled": true,
+    "league_eval_episodes": 10,
+    "tournament_eval_enabled": true,
+    "tournament_pool": null,
+    "tournament_lineups": 40,
+    "tournament_episodes_per_lineup": 3,
+    "tournament_replays": false,
+    "resume_from": null,
+    "resume_checkpoint": null,
+    "ppo": {
+      "learning_rate": 2e-05,
+      "n_steps": 1024,
+      "batch_size": 4096,
+      "n_epochs": 8,
+      "gamma": 0.99,
+      "gae_lambda": 0.97,
+      "clip_range": 0.2,
+      "clip_range_vf": null,
+      "ent_coef": 0.025,
+      "vf_coef": 0.5,
+      "target_kl": 0.02,
+      "symmetry_augmentation": false,
+      "symmetry_coef": 0.5,
+      "symmetry_value_coef": 0.5,
+      "share_features_extractor": true,
+      "weight_decay": 1e-05,
+      "dropout": 0.0
+    },
+    "env": {
+      "scenario": "classic",
+      "seed": null,
+      "silence_errors": true,
+      "no_gui": true,
+      "make_video": false,
+      "save_replay": false,
+      "save_stats": true,
+      "turn_based": false,
+      "update_interval": 0.1,
+      "match_name": null,
+      "fps": 60,
+      "replay": null,
+      "continue_without_training": false,
+      "env_version": 3,
+      "scenario_mix": [
+        {
+          "scenario": "classic",
+          "weight": 1.0
+        }
+      ],
+      "layer_config": [
+        "base",
+        "timer_channels",
+        "forecast",
+        "self_distance",
+        "opponent_distance",
+        "crate_potential",
+        "danger_summary",
+        "mobility",
+        "crate_distance",
+        "coin_distance"
+      ]
+    },
+    "self_play": {
+      "enabled": true,
+      "static_opponents": [
+        "agent_code.my_agent.callbacks",
+        "agent_code.simple_agent.callbacks",
+        "agent_code.rule_based_agent.callbacks",
+        "agent_code.coin_collector_agent.callbacks",
+        "agent_code.hunter_bot.callbacks",
+        "agent_code.test_bot.callbacks",
+        "agent_code.bomber_bot.callbacks"
+      ],
+      "arrangements": [
+        {
+          "n_static": 3,
+          "n_self_play": 0,
+          "weight": 2.5
+        },
+        {
+          "n_static": 2,
+          "n_self_play": 1,
+          "weight": 2.5
+        },
+        {
+          "n_static": 1,
+          "n_self_play": 2,
+          "weight": 2.5
+        },
+        {
+          "n_static": 0,
+          "n_self_play": 3,
+          "weight": 2.5
+        }
+      ],
+      "allow_repeat_static_opponents": true,
+      "shuffle_opponent_order": true,
+      "resample_every_n_rollouts": 1,
+      "pool_size": 32,
+      "add_checkpoint_every_epochs": 1,
+      "opponent_inference": "shard",
+      "sample_strategy": "latest_biased",
+      "latest_bias": 0.3,
+      "static_tier_weights": [],
+      "hall_of_fame_every_timesteps": 10000000,
+      "hall_of_fame_max": 8,
+      "hall_of_fame_prob": 0.15,
+      "thin_recent_checkpoints": true,
+      "pfsp_enabled": false,
+      "pfsp_ema": 0.2,
+      "pfsp_floor": 0.2,
+      "pfsp_power": 1.5
+    },
+    "rewards": {
+      "waited": 0.0,
+      "invalid_action": 0.0,
+      "bomb_dropped": 0.0,
+      "bomb_exploded": 0.0,
+      "crate_destroyed": 0.0,
+      "coin_found": 0.0,
+      "coin_collected": 1.0,
+      "killed_opponent": 5.0,
+      "killed_self": 0.0,
+      "got_killed": 0.0,
+      "opponent_eliminated": 0.0,
+      "survived_round": 0.0,
+      "rival_killed_opponent": 0.0,
+      "trapping_bomb": 0.0,
+      "got_killed_time_scaled": true,
+      "coin_shaping_coef": 0.0,
+      "crate_shaping_coef": 0.0,
+      "danger_penalty_coef": 0.0,
+      "escape_bonus_coef": 0.0,
+      "trap_shaping_coef": 0.0,
+      "crate_potential_coef": 0.0,
+      "shaping_gamma": null
+    }
+  },
+  "architecture": {
+    "policy": "MultiInputPolicy",
+    "algorithm": "MaskablePPO",
+    "features_extractor_class": "BombermanFeatureExtractor",
+    "dropout": 0.0,
+    "layer_config": [
+      "base",
+      "timer_channels",
+      "forecast",
+      "self_distance",
+      "opponent_distance",
+      "crate_potential",
+      "danger_summary",
+      "mobility",
+      "crate_distance",
+      "coin_distance"
+    ]
+  }
+}

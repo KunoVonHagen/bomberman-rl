@@ -1,0 +1,204 @@
+{
+  "timesteps": 139984896,
+  "saved_at": "2026-09-21T04:47:22.757302",
+  "ep_rew_mean": null,
+  "ep_len_mean": null,
+  "opponents": [
+    "arrangement=(static:2,self_play:1)",
+    "agent_code.coin_collector_agent.callbacks",
+    "checkpoint:bomberman_ppo_20260919_021721/checkpoint_0135790592",
+    "agent_code.bomber_bot.callbacks"
+  ],
+  "eval_suite": {
+    "agent_code.rule_based_agent.callbacks": {
+      "score": 5.9,
+      "win": 0.4,
+      "survived": 0.5,
+      "length": 271.0,
+      "reward": 5.9
+    },
+    "agent_code.coin_collector_agent.callbacks": {
+      "score": 5.6,
+      "win": 0.6,
+      "survived": 0.9,
+      "length": 366.2,
+      "reward": 5.6
+    },
+    "agent_code.peaceful_agent.callbacks": {
+      "score": 19.5,
+      "win": 1.0,
+      "survived": 1.0,
+      "length": 395.2,
+      "reward": 19.5
+    },
+    "gen_coin-heaven_0opp": {
+      "score": 25.6,
+      "win": null,
+      "survived": 1.0,
+      "length": 378.0,
+      "reward": 25.6
+    },
+    "gen_empty_0opp": {
+      "score": 0.0,
+      "win": null,
+      "survived": 1.0,
+      "length": 3.4,
+      "reward": 0.0
+    },
+    "gen_classic_1opp": {
+      "score": 7.3,
+      "win": 0.9,
+      "survived": 1.0,
+      "length": 400.0,
+      "reward": 7.3
+    },
+    "gen_classic_2opp": {
+      "score": 8.8,
+      "win": 0.7,
+      "survived": 0.9,
+      "length": 370.8,
+      "reward": 8.8
+    }
+  },
+  "league_eval": {
+    "agent_code.my_agent.callbacks": {
+      "score": 10.4,
+      "win": 0.9,
+      "survived": 1.0,
+      "length": 400.0,
+      "reward": 10.4
+    },
+    "agent_code.simple_agent.callbacks": {
+      "score": 10.8,
+      "win": 0.7,
+      "survived": 0.9,
+      "length": 362.9,
+      "reward": 10.8
+    },
+    "agent_code.rule_based_agent.callbacks": {
+      "score": 10.2,
+      "win": 0.9,
+      "survived": 0.9,
+      "length": 369.7,
+      "reward": 10.2
+    },
+    "agent_code.coin_collector_agent.callbacks": {
+      "score": 4.3,
+      "win": 0.4,
+      "survived": 1.0,
+      "length": 400.0,
+      "reward": 4.3
+    },
+    "agent_code.hunter_bot.callbacks": {
+      "score": 4.2,
+      "win": 0.4,
+      "survived": 0.4,
+      "length": 209.5,
+      "reward": 4.2
+    },
+    "agent_code.test_bot.callbacks": {
+      "score": 3.1,
+      "win": 0.5,
+      "survived": 0.8,
+      "length": 384.9,
+      "reward": 3.1
+    },
+    "agent_code.bomber_bot.callbacks": {
+      "score": 11.0,
+      "win": 0.8,
+      "survived": 1.0,
+      "length": 400.0,
+      "reward": 11.0
+    }
+  },
+  "tournament_eval": {
+    "overall": {
+      "score": 6.991666666666666,
+      "win": 0.7166666666666667,
+      "survived": 0.85,
+      "length": 354.2916666666667,
+      "reward": 6.991666666666666,
+      "episodes": 120
+    },
+    "agent_code.coin_collector_agent.callbacks#medium": {
+      "score": 6.888888888888889,
+      "win": 0.6666666666666666,
+      "survived": 0.8333333333333334,
+      "length": 351.69444444444446,
+      "reward": 6.888888888888889,
+      "episodes": 36
+    },
+    "agent_code.peaceful_agent.callbacks#weak": {
+      "score": 6.111111111111111,
+      "win": 0.5,
+      "survived": 0.75,
+      "length": 325.1111111111111,
+      "reward": 6.111111111111111,
+      "episodes": 36
+    },
+    "agent_code.league_bots.hunter#medium": {
+      "score": 4.694444444444445,
+      "win": 0.4722222222222222,
+      "survived": 0.6388888888888888,
+      "length": 291.22222222222223,
+      "reward": 4.694444444444445,
+      "episodes": 36
+    },
+    "agent_code.league_bots.bomber@eps=0.3#weak": {
+      "score": 6.777777777777778,
+      "win": 0.7777777777777778,
+      "survived": 0.8611111111111112,
+      "length": 357.44444444444446,
+      "reward": 6.777777777777778,
+      "episodes": 36
+    },
+    "agent_code.league_bots.bomber#medium": {
+      "score": 8.222222222222221,
+      "win": 0.75,
+      "survived": 0.9166666666666666,
+      "length": 374.69444444444446,
+      "reward": 8.222222222222221,
+      "episodes": 36
+    },
+    "agent_code.rule_based_agent.callbacks@eps=0.2#medium": {
+      "score": 6.861111111111111,
+      "win": 0.6666666666666666,
+      "survived": 0.7777777777777778,
+      "length": 330.27777777777777,
+      "reward": 6.861111111111111,
+      "episodes": 36
+    },
+    "agent_code.rule_based_agent.callbacks#strong": {
+      "score": 8.805555555555555,
+      "win": 0.8055555555555556,
+      "survived": 0.8888888888888888,
+      "length": 364.8888888888889,
+      "reward": 8.805555555555555,
+      "episodes": 36
+    },
+    "builtin:random#weak": {
+      "score": 6.444444444444445,
+      "win": 0.8611111111111112,
+      "survived": 0.9444444444444444,
+      "length": 382.0,
+      "reward": 6.444444444444445,
+      "episodes": 36
+    },
+    "agent_code.coin_collector_agent.callbacks@bomb=0.5#weak": {
+      "score": 8.63888888888889,
+      "win": 0.8055555555555556,
+      "survived": 0.9444444444444444,
+      "length": 383.3333333333333,
+      "reward": 8.63888888888889,
+      "episodes": 36
+    },
+    "agent_code.league_bots.hunter@eps=0.3#weak": {
+      "score": 6.472222222222222,
+      "win": 0.8611111111111112,
+      "survived": 0.9444444444444444,
+      "length": 382.25,
+      "reward": 6.472222222222222,
+      "episodes": 36
+    }
+  }
+}

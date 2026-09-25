@@ -24,9 +24,12 @@ CHECKPOINT: Optional[str] = None
 ENSEMBLE: list = [
     "bomberman_ppo_20260919_021721/checkpoint_0100139008",
     "bomberman_ppo_20260919_021721/checkpoint_0096468992",
-    "bomberman_ppo_20260919_021721/checkpoint_0098566144"
+    "bomberman_ppo_20260919_021721/checkpoint_0098566144",
+    "bomberman_ppo_20260919_021721/checkpoint_0081788928",
+    "bomberman_ppo_20260919_021721/checkpoint_0088080384",
+    "bomberman_ppo_20260919_021721/checkpoint_0094371840",
 ]
-TTA_SYMMETRIES: int = N_SYMMETRIES
+TTA_SYMMETRIES: int = 1 # N_SYMMETRIES
 DETERMINISTIC: bool = True
 ENSEMBLE_FILE = "ensemble.txt"
 

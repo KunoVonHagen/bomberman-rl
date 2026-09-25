@@ -122,3 +122,6 @@ results/
 **/logs/**
 
 **/final-project-agent-code.zip
+
+# Final agent run
+!agent_code/bye_have_a_crate_time/runs/**

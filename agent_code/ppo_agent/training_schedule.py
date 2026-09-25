@@ -8,12 +8,16 @@ STATIC_OPPONENT_POOL = [
     "agent_code.simple_agent.callbacks",
     "agent_code.rule_based_agent.callbacks",
     "agent_code.coin_collector_agent.callbacks",
+    "agent_code.hunter_bot.callbacks",
+    "agent_code.test_bot.callbacks",
+    "agent_code.bomber_bot.callbacks",
 ]
 
 DEFAULT_SCHEDULE = [
     {
         "at_timesteps": 0,
         "overrides": {
+            "total_timesteps": 160_000_000,
             "self_play.static_opponents": STATIC_OPPONENT_POOL,
             "self_play.arrangements": "3,0,2.0;2,1,2.0;1,2,3.0;0,3,3.0",
             "env.scenario_mix": "classic,1.0",
@@ -28,8 +32,8 @@ DEFAULT_SCHEDULE = [
             "rewards.trapping_bomb": 0.5,
             "rewards.waited": 0.0,
             "rewards.invalid_action": -0.05,
-            "rewards.crate_destroyed": 0.0,
-            "rewards.crate_potential_coef": 0.05,
+            "rewards.crate_destroyed": 0.3,
+            "rewards.crate_potential_coef": 0.00,
             "rewards.killed_self": -1.0,
             "rewards.got_killed": -5.0,
             "rewards.coin_shaping_coef": 0.05,
@@ -58,7 +62,7 @@ DEFAULT_SCHEDULE = [
         "at_timesteps": 15_000_000,
         "overrides": {
             "self_play.arrangements": "3,0,2.0;2,1,2.0;1,2,3.0;0,3,3.0",
-            "ppo.learning_rate": 6e-5,
+            "ppo.learning_rate": 4e-5,
         },
     },
     {
@@ -68,13 +72,13 @@ DEFAULT_SCHEDULE = [
         },
     },
     {
-        "at_timesteps": 30_000_000,
+        "at_timesteps": 35_000_000,
         "gate": {"min_score": 2.0, "max_suicide_rate": 0.35, "max_delay_timesteps": 10_000_000},
         "overrides": {
             "rewards.trapping_bomb": 0.25,
             "rewards.waited": 0.0,
             "rewards.invalid_action": -0.025,
-            "rewards.crate_destroyed": 0.0,
+            "rewards.crate_destroyed": 0.15,
             "rewards.killed_self": -0.5,
             "rewards.got_killed": -2.5,
             "rewards.coin_shaping_coef": 0.025,
@@ -86,12 +90,12 @@ DEFAULT_SCHEDULE = [
         },
     },
     {
-        "at_timesteps": 50_000_000,
+        "at_timesteps": 65_000_000,
         "overrides": {
             "rewards.trapping_bomb": 0.1,
             "rewards.waited": 0.0,
             "rewards.invalid_action": -0.01,
-            "rewards.crate_destroyed": 0.0,
+            "rewards.crate_destroyed": 0.06,
             "rewards.killed_self": -0.2,
             "rewards.got_killed": -1.0,
             "rewards.coin_shaping_coef": 0.01,
@@ -99,18 +103,18 @@ DEFAULT_SCHEDULE = [
             "rewards.danger_penalty_coef": 0.01,
             "rewards.escape_bonus_coef": 0.01,
             "rewards.trap_shaping_coef": 0.006,
-            "ppo.learning_rate": 5e-5,
+            "ppo.learning_rate": 2e-5,
         },
     },
     {
-        "at_timesteps": 60_000_000,
+        "at_timesteps": 80_000_000,
         "overrides": {
             "self_play.arrangements": "3,0,2.5;2,1,2.5;1,2,2.5;0,3,2.5",
             "self_play.latest_bias": 0.3,
         },
     },
     {
-        "at_timesteps": 70_000_000,
+        "at_timesteps": 100_000_000,
         "overrides": {
             "rewards.trapping_bomb": 0.0,
             "rewards.waited": 0.0,
@@ -127,11 +131,11 @@ DEFAULT_SCHEDULE = [
         },
     },
     {
-        "at_timesteps": 80_000_000,
+        "at_timesteps": 120_000_000,
         "overrides": {
             "self_play.arrangements": "3,0,4.0;2,1,4.0;1,2,1.0;0,3,1.0",
-            "total_timesteps": 100_000_000,
-            "ppo.learning_rate": 3e-5,
+            "total_timesteps": 160_000_000,
+            "ppo.learning_rate": 1e-5,
             "ppo.ent_coef": 0.015,
         },
     },
